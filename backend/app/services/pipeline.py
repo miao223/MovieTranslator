@@ -1,0 +1,212 @@
+"""Job orchestration: state machine, background execution, SSE progress.
+
+Whisper is CPU-bound, so only one job runs at a time (global semaphore).
+Intermediate artifacts are written to the per-job cache dir for debugging
+and are wiped on the next application startup.
+"""
+
+from __future__ import annotations
+
+import json
+import queue
+import threading
+import traceback
+import uuid
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional
+
+from app.core import config
+from app.core.cache import job_dir
+from app.models.schemas import (
+    JobRequest,
+    JobStatus,
+    ProgressEvent,
+    SubtitleLine,
+)
+from app.services import asr, audio, segmenter, subtitle
+from app.services.translator import Translator
+
+# overall progress ranges per stage: (start%, end%)
+STAGE_RANGES = {
+    "extracting": (0.0, 10.0),
+    "transcribing": (10.0, 60.0),
+    "translating": (60.0, 95.0),
+    "composing": (95.0, 100.0),
+}
+
+_run_slot = threading.Semaphore(1)  # one CPU-heavy job at a time
+
+
+class Job:
+    def __init__(self, request: JobRequest):
+        self.id = uuid.uuid4().hex[:12]
+        self.request = request
+        self.status = JobStatus(id=self.id, video_path=request.video_path)
+        self.cancel_event = threading.Event()
+        self.events: List[ProgressEvent] = []
+        self.subscribers: List[queue.Queue] = []
+        self.lock = threading.Lock()
+        self.srt_path: Optional[Path] = None
+
+    # -------------------------------------------------------- events
+
+    def publish(self, stage: str, progress: float, message: str = "", log: str = ""):
+        self.status.stage = stage  # type: ignore[assignment]
+        self.status.progress = round(progress, 1)
+        if message:
+            self.status.message = message
+        event = ProgressEvent(
+            stage=stage, progress=self.status.progress, message=message, log=log
+        )
+        with self.lock:
+            self.events.append(event)
+            for q in self.subscribers:
+                q.put(event)
+
+    def subscribe(self) -> Iterator[ProgressEvent]:
+        q: queue.Queue = queue.Queue()
+        with self.lock:
+            history = list(self.events)
+            self.subscribers.append(q)
+        try:
+            yield from history
+            if self.status.stage in ("done", "failed", "cancelled"):
+                return
+            while True:
+                event = q.get()
+                yield event
+                if event.stage in ("done", "failed", "cancelled"):
+                    return
+        finally:
+            with self.lock:
+                if q in self.subscribers:
+                    self.subscribers.remove(q)
+
+
+class JobManager:
+    def __init__(self):
+        self.jobs: Dict[str, Job] = {}
+
+    def create(self, request: JobRequest) -> Job:
+        video = Path(request.video_path)
+        if not video.is_file():
+            raise FileNotFoundError(f"视频文件不存在: {video}")
+        job = Job(request)
+        self.jobs[job.id] = job
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return job
+
+    def get(self, job_id: str) -> Job:
+        if job_id not in self.jobs:
+            raise KeyError(job_id)
+        return self.jobs[job_id]
+
+    def cancel(self, job_id: str) -> None:
+        self.get(job_id).cancel_event.set()
+
+    # ---------------------------------------------------------- pipeline
+
+    def _stage_progress(self, job: Job, stage: str):
+        lo, hi = STAGE_RANGES[stage]
+
+        def cb(fraction: float, log: str = ""):
+            job.publish(stage, lo + (hi - lo) * min(max(fraction, 0.0), 1.0), log=log)
+
+        return cb
+
+    def _run(self, job: Job) -> None:
+        req = job.request
+        workdir = job_dir(job.id)
+        job.publish("pending", 0, message="排队中…")
+        with _run_slot:
+            try:
+                self._execute(job, req, workdir)
+            except InterruptedError:
+                job.publish("cancelled", job.status.progress, message="任务已取消")
+            except Exception as exc:  # noqa: BLE001 — surface anything to the UI
+                job.status.error = str(exc)
+                tb = traceback.format_exc()
+                print(tb)
+                job.publish("failed", job.status.progress,
+                            message=f"失败: {exc}", log=tb)
+
+    def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
+        settings = config.load_settings()
+
+        def check_cancel():
+            if job.cancel_event.is_set():
+                raise InterruptedError
+
+        # 1. extract audio ------------------------------------------------
+        job.publish("extracting", 0, message="提取音频…")
+        wav = workdir / "audio.wav"
+        extract_cb = self._stage_progress(job, "extracting")
+
+        def extract_progress(fraction: float):
+            check_cancel()
+            extract_cb(fraction)
+
+        audio.extract_audio(req.video_path, wav, progress=extract_progress)
+
+        # 2. transcribe ---------------------------------------------------
+        job.publish("transcribing", 10, message="语音识别中…")
+        asr_cb = self._stage_progress(job, "transcribing")
+        language = None if req.source_language == "auto" else req.source_language
+        segments, detected = asr.transcribe(
+            str(wav),
+            settings.asr,
+            language=language,
+            progress=asr_cb,
+            log=lambda msg: asr_cb(job_fraction(job, "transcribing"), log=msg),
+            should_cancel=job.cancel_event.is_set,
+            network=settings.network,
+        )
+        if not segments:
+            raise RuntimeError("未识别到任何语音内容")
+        lines = segmenter.segment_lines(segments, settings.subtitle)
+        (workdir / "transcript.json").write_text(
+            json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        job.publish(
+            "transcribing", 60,
+            message=f"识别完成，共 {len(lines)} 条字幕（语言: {detected}）",
+        )
+
+        # 3. translate ----------------------------------------------------
+        job.publish("translating", 60, message="AI 翻译中（全局上下文）…")
+        tr_cb = self._stage_progress(job, "translating")
+        translator = Translator(
+            settings.llm,
+            target_language=req.target_language,
+            synopsis=req.synopsis,
+            log=lambda msg: tr_cb(job_fraction(job, "translating"), log=msg),
+            progress=tr_cb,
+            should_cancel=job.cancel_event.is_set,
+            prompts=settings.prompts,
+            max_line_chars=settings.subtitle.max_chars_per_line,
+            network=settings.network,
+        )
+        translator.translate(lines)
+        (workdir / "translation.json").write_text(
+            json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+
+        # 4. compose SRT ----------------------------------------------------
+        job.publish("composing", 95, message="生成 SRT…")
+        srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
+        stem = Path(req.video_path).stem
+        job.srt_path = workdir / f"{stem}.srt"
+        job.srt_path.write_text(srt_text, encoding="utf-8")
+        job.status.srt_filename = job.srt_path.name
+        job.publish("done", 100, message=f"完成：{job.srt_path.name}")
+
+
+def job_fraction(job: Job, stage: str) -> float:
+    """Current fraction within *stage*, derived from overall progress."""
+    lo, hi = STAGE_RANGES[stage]
+    return min(max((job.status.progress - lo) / (hi - lo), 0.0), 1.0)
+
+
+manager = JobManager()

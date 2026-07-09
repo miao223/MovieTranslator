@@ -1,0 +1,19 @@
+# 内部开发笔记，不进仓库
+CLAUDE.md
+.claude/
+
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
