@@ -60,9 +60,23 @@ async function startDownload() {
 
 function pollDownload() {
   clearInterval(pollTimer)
+  let lastBytes = -1
+  let stallCount = 0
   pollTimer = setInterval(async () => {
     try {
       download.value = await api.downloadStatus(settings.value.asr.model_size)
+      const bytes = download.value.downloaded_bytes || 0
+      if (download.value.status === 'downloading') {
+        if (bytes === lastBytes) {
+          stallCount += 1
+          if (stallCount === 60) {
+            ElMessage.warning('下载超过 1 分钟无进展，可能无法直连 HuggingFace——建议启用「模型下载走代理」后重试，或使用本地模型目录')
+          }
+        } else {
+          lastBytes = bytes
+          stallCount = 0
+        }
+      }
       if (download.value.status === 'done') {
         clearInterval(pollTimer)
         ElMessage.success('模型下载完成')

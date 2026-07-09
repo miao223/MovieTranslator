@@ -259,7 +259,9 @@ def fs_browse(path: str = ""):
     except PermissionError:
         raise HTTPException(status_code=403, detail=f"无权限访问: {path}")
 
-    parent = str(p.parent) if p.parent != p else None
-    if sys.platform == "win32" and parent == str(p):
-        parent = ""  # back to drive list
+    if p.parent == p:  # filesystem root: C:\ on Windows, / on Linux
+        # Windows: "" navigates back to the drive list; Linux: no parent
+        parent = "" if sys.platform == "win32" else None
+    else:
+        parent = str(p.parent)
     return {"path": str(p), "parent": parent, "dirs": dirs, "files": files}

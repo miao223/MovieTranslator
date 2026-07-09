@@ -146,18 +146,38 @@ class JobManager:
         )
         model_download.start_download(size, settings.network)
         last_logged = -10.0
+        last_bytes = -1
+        stalled_since = time.monotonic()
+        stall_warned = 0
         while True:
             check_cancel()
             st = model_download.get_status(size)
             if st["status"] == "failed":
                 raise RuntimeError(f"模型下载失败: {st.get('error')}")
             pct = float(st.get("progress") or 0.0)
-            mb = (st.get("downloaded_bytes") or 0) // 1048576
+            done_bytes = st.get("downloaded_bytes") or 0
+            mb = done_bytes // 1048576
             total_mb = (st.get("total_bytes") or 0) // 1048576
             logline = ""
             if pct - last_logged >= 5 or st["status"] == "done":
                 last_logged = pct
                 logline = f"模型下载 {pct:.0f}%（{mb}/{total_mb} MB）"
+            # stall watchdog: no bytes for 60s almost always means the machine
+            # cannot reach HuggingFace — tell the user what to do about it
+            if done_bytes != last_bytes:
+                last_bytes = done_bytes
+                stalled_since = time.monotonic()
+                stall_warned = 0
+            elif st["status"] == "downloading":
+                stalled = int(time.monotonic() - stalled_since)
+                if stalled >= 60 and stalled // 60 > stall_warned:
+                    stall_warned = stalled // 60
+                    logline = (
+                        f"⚠ 模型下载已 {stalled} 秒无进展——大概率无法直连 "
+                        "HuggingFace。建议：取消任务后，到「设置 → 网络」启用"
+                        "「模型下载走代理」，或用设置页「立即下载」重试，"
+                        "或改用「本地模型目录」离线导入。"
+                    )
             job.publish(
                 "transcribing", 10 + pct * 0.1,
                 message=f"下载模型 {size}: {pct:.0f}%", log=logline,
