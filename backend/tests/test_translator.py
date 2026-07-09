@@ -115,6 +115,18 @@ def test_persistent_missing_line_raises():
         tr.translate(lines)
 
 
+def test_glossary_request_demands_target_language_names():
+    lines = make_lines(1)
+    fake = FakeClient(["glossary", "[1] 一"])
+    tr = Translator(settings(), "简体中文", client=fake)
+    tr.translate(lines)
+    glossary_request = fake.calls[0][1]["content"]
+    assert "简体中文译名" in glossary_request
+    assert "罗马音" in glossary_request  # explicit prohibition present
+    system = fake.calls[0][0]["content"]
+    assert "不得用罗马音" in system
+
+
 def test_synopsis_included_in_system_prompt():
     lines = make_lines(1)
     fake = FakeClient(["glossary", "[1] 一"])

@@ -87,6 +87,9 @@ def build_system_prompt(
             "源语言中的音译外来词（如日语片假名的人名、地名、品牌、术语），"
             "同一个词全片必须采用统一的译法，并收入译名对照表；"
             "语音识别可能把同一个词写得不一致，请按发音判断是否为同一词并统一处理。"
+            f"译法必须是{target_language}（人名地名用通行译名，无通行译名的按发音翻译），"
+            "不得用罗马音、拼音或原文字母拼写充当译文；"
+            f"仅当该词在{target_language}中习惯直接使用原文时（如品牌名、缩写）才可保留。"
         )
     if prompts.limit_length:
         rules.append(
@@ -221,7 +224,11 @@ class Translator:
                 "role": "user",
                 "content": (
                     "以下是全片字幕（行号+原文）。请先通读全文，"
-                    "输出一份主要人名/术语的译名对照表（每行一条，格式：原文 → 译文），"
+                    "输出一份主要人名/术语的译名对照表"
+                    f"（每行一条，格式：原文 → {self.target_language}译名）。"
+                    f"注意：右侧必须是{self.target_language}译名"
+                    "（人名地名用通行译名，无通行译名的按发音翻译成"
+                    f"{self.target_language}），不得填写罗马音、拼音或原文字母；"
                     "之后我会分批向你索取各行译文。\n\n" + _numbered(lines)
                 ),
             },
@@ -342,7 +349,11 @@ class Translator:
                 "role": "user",
                 "content": (
                     "以下是全片字幕的抽样内容。请输出主要人名/地名/术语的译名对照表"
-                    "（每行一条，格式：原文 → 译文），不要输出其它内容。\n\n"
+                    f"（每行一条，格式：原文 → {self.target_language}译名）。"
+                    f"注意：右侧必须是{self.target_language}译名"
+                    "（人名地名用通行译名，无通行译名的按发音翻译成"
+                    f"{self.target_language}），不得填写罗马音、拼音或原文字母。"
+                    "不要输出其它内容。\n\n"
                     + "\n".join(sample)
                 ),
             },
