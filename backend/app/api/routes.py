@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import string
 import sys
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core import config
@@ -197,6 +198,29 @@ def asr_cuda_status():
         return {"available": count > 0, "device_count": count}
     except Exception as exc:  # noqa: BLE001 — missing CUDA libs land here
         return {"available": False, "device_count": 0, "error": str(exc)}
+
+
+# ---------------------------------------------------------------- upload
+
+
+@router.post("/upload")
+def upload_video(file: UploadFile):
+    """Receive a drag-dropped video into the work dir and return its path.
+
+    Browsers cannot reveal the local path of a dropped file, so drag & drop
+    uploads a copy into the managed cache (wiped on next startup).
+    """
+    from app.core.cache import cache_root
+
+    name = Path(file.filename or "video").name
+    if Path(name).suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(status_code=400, detail=f"不支持的视频格式: {name}")
+    dest_dir = cache_root() / "uploads"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / name
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f, length=1024 * 1024)
+    return {"path": str(dest), "size": dest.stat().st_size}
 
 
 # ------------------------------------------------------------ file browse

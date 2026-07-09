@@ -85,7 +85,7 @@ function resetDefaults() {
           </el-form-item>
           <el-form-item label="外来语规范">
             <el-switch v-model="settings.prompts.normalize_loanwords" />
-            <span class="hint">片假名等音译词先还原原词再译，全片统一（对日语尤其有效）</span>
+            <span class="hint">片假名等音译词全片统一译法（对日语尤其有效）</span>
           </el-form-item>
           <el-form-item label="译文长度限制">
             <el-switch v-model="settings.prompts.limit_length" />

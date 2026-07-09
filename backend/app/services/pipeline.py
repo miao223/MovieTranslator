@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -130,6 +131,41 @@ class JobManager:
                 job.publish("failed", job.status.progress,
                             message=f"失败: {exc}", log=tb)
 
+    def _download_model_with_progress(self, job: Job, settings, check_cancel) -> float:
+        """Download the whisper model, mapping progress into 10–20%.
+
+        Returns the progress value where transcription should start (20.0).
+        """
+        from app.services import model_download
+
+        size = settings.asr.model_size
+        job.publish(
+            "transcribing", 10,
+            message=f"下载语音识别模型 {size}…",
+            log=f"本地未找到模型 {size}，开始下载（仅首次需要）",
+        )
+        model_download.start_download(size, settings.network)
+        last_logged = -10.0
+        while True:
+            check_cancel()
+            st = model_download.get_status(size)
+            if st["status"] == "failed":
+                raise RuntimeError(f"模型下载失败: {st.get('error')}")
+            pct = float(st.get("progress") or 0.0)
+            mb = (st.get("downloaded_bytes") or 0) // 1048576
+            total_mb = (st.get("total_bytes") or 0) // 1048576
+            logline = ""
+            if pct - last_logged >= 5 or st["status"] == "done":
+                last_logged = pct
+                logline = f"模型下载 {pct:.0f}%（{mb}/{total_mb} MB）"
+            job.publish(
+                "transcribing", 10 + pct * 0.1,
+                message=f"下载模型 {size}: {pct:.0f}%", log=logline,
+            )
+            if st["status"] == "done":
+                return 20.0
+            time.sleep(1)
+
     def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
         settings = config.load_settings()
 
@@ -147,17 +183,39 @@ class JobManager:
             extract_cb(fraction)
 
         audio.extract_audio(req.video_path, wav, progress=extract_progress)
+        job.publish(
+            "extracting", 10,
+            log=f"音频提取完成: audio.wav（{wav.stat().st_size // 1048576} MB）",
+        )
 
-        # 2. transcribe ---------------------------------------------------
-        job.publish("transcribing", 10, message="语音识别中…")
-        asr_cb = self._stage_progress(job, "transcribing")
+        # 2a. download the ASR model first if it's missing, with progress --
+        asr_lo = 10.0
+        if not settings.asr.model_path.strip() and not asr.is_model_cached(
+            settings.asr.model_size
+        ):
+            asr_lo = self._download_model_with_progress(job, settings, check_cancel)
+
+        # 2b. transcribe ----------------------------------------------------
+        span = 60.0 - asr_lo
+        job.publish("transcribing", asr_lo, message="语音识别中…")
+
+        def asr_progress(fraction: float):
+            job.publish(
+                "transcribing",
+                asr_lo + span * min(max(fraction, 0.0), 1.0),
+                message=f"语音识别中… {min(max(fraction, 0.0), 1.0):.0%}",
+            )
+
+        def asr_log(msg: str):
+            job.publish("transcribing", job.status.progress, log=msg)
+
         language = None if req.source_language == "auto" else req.source_language
         segments, detected = asr.transcribe(
             str(wav),
             settings.asr,
             language=language,
-            progress=asr_cb,
-            log=lambda msg: asr_cb(job_fraction(job, "transcribing"), log=msg),
+            progress=asr_progress,
+            log=asr_log,
             should_cancel=job.cancel_event.is_set,
             network=settings.network,
         )
@@ -175,13 +233,19 @@ class JobManager:
 
         # 3. translate ----------------------------------------------------
         job.publish("translating", 60, message="AI 翻译中（全局上下文）…")
-        tr_cb = self._stage_progress(job, "translating")
+
+        def tr_log(msg: str):
+            job.publish("translating", job.status.progress, log=msg)
+
         translator = Translator(
             settings.llm,
             target_language=req.target_language,
             synopsis=req.synopsis,
-            log=lambda msg: tr_cb(job_fraction(job, "translating"), log=msg),
-            progress=tr_cb,
+            log=tr_log,
+            progress=lambda f: job.publish(
+                "translating", 60 + 35 * min(max(f, 0.0), 1.0),
+                message=f"AI 翻译中… {min(max(f, 0.0), 1.0):.0%}",
+            ),
             should_cancel=job.cancel_event.is_set,
             prompts=settings.prompts,
             max_line_chars=settings.subtitle.max_chars_per_line,
@@ -201,12 +265,6 @@ class JobManager:
         job.srt_path.write_text(srt_text, encoding="utf-8")
         job.status.srt_filename = job.srt_path.name
         job.publish("done", 100, message=f"完成：{job.srt_path.name}")
-
-
-def job_fraction(job: Job, stage: str) -> float:
-    """Current fraction within *stage*, derived from overall progress."""
-    lo, hi = STAGE_RANGES[stage]
-    return min(max((job.status.progress - lo) / (hi - lo), 0.0), 1.0)
 
 
 manager = JobManager()

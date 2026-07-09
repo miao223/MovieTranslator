@@ -85,8 +85,8 @@ def build_system_prompt(
     if prompts.normalize_loanwords:
         rules.append(
             "源语言中的音译外来词（如日语片假名的人名、地名、品牌、术语），"
-            "先还原其原词（多为英语）再决定译法；同一个词全片必须统一，"
-            "并收入译名对照表。语音识别常把片假名写错，请按发音推断原词。"
+            "同一个词全片必须采用统一的译法，并收入译名对照表；"
+            "语音识别可能把同一个词写得不一致，请按发音判断是否为同一词并统一处理。"
         )
     if prompts.limit_length:
         rules.append(
@@ -226,6 +226,7 @@ class Translator:
                 ),
             },
         ]
+        self.log("正在通读全文并生成术语/译名对照表…（长片首个响应可能需要 1-2 分钟）")
         glossary = self._chat(messages)
         messages.append({"role": "assistant", "content": glossary})
         self.log("术语表已生成：\n" + glossary.strip()[:800])
@@ -235,6 +236,7 @@ class Translator:
         for i in range(0, len(lines), batch):
             chunk = lines[i : i + batch]
             first, last = chunk[0].index, chunk[-1].index
+            self.log(f"请求第 {first}-{last} 行译文…")
             messages.append(
                 {
                     "role": "user",
@@ -297,6 +299,7 @@ class Translator:
         prev: List[SubtitleLine] = []
         for i in range(0, len(lines), batch):
             chunk = lines[i : i + batch]
+            self.log(f"请求第 {chunk[0].index}-{chunk[-1].index} 行译文（分块模式）…")
             context_block = ""
             if prev:
                 tail = prev[-tail_context:]

@@ -12,6 +12,7 @@ dependencies = [
     "openai>=1.30",
     "platformdirs>=4.0",
     "pydantic>=2.6",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]

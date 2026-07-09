@@ -181,6 +181,16 @@ async function testLLM() {
     </el-card>
 
     <el-card shadow="never" class="section">
+      <template #header>💾 存储</template>
+      <el-form label-width="150px">
+        <el-form-item label="临时工作文件夹">
+          <el-input v-model="settings.work_dir" placeholder="（留空 = 系统缓存目录）" />
+          <span class="hint">存放提取音频等中间文件；程序只管理其中的 jobs 子目录并在启动时清空，保存后新任务立即生效</span>
+        </el-form-item>
+      </el-form>
+    </el-card>
+
+    <el-card shadow="never" class="section">
       <template #header>🌐 网络</template>
       <el-form label-width="150px">
         <el-form-item label="HTTPS 代理地址">

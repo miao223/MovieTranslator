@@ -196,6 +196,8 @@ def transcribe(
     *language* is a whisper language code, or None for auto-detection.
     """
     model = _get_model(settings, log, network)
+    if log:
+        log("模型就绪，开始识别（语言检测与首段解码可能需要等待一会儿）…")
     # CUDA libraries load lazily on the first encode (inside transcribe /
     # segment iteration), so the whole decode path needs the friendly wrap
     try:

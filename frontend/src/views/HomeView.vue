@@ -56,6 +56,43 @@ function fmtSize(bytes) {
   return (bytes / 1024).toFixed(0) + ' KB'
 }
 
+// -------------------------------------------------------- drag & drop
+const uploading = ref(null) // { name, progress }
+
+function onDrop(e) {
+  const f = e.dataTransfer?.files?.[0]
+  if (!f) return
+  uploadFile(f)
+}
+
+function uploadFile(f) {
+  const fd = new FormData()
+  fd.append('file', f)
+  const xhr = new XMLHttpRequest()
+  xhr.open('POST', '/api/upload')
+  uploading.value = { name: f.name, progress: 0 }
+  xhr.upload.onprogress = (ev) => {
+    if (ev.lengthComputable && uploading.value)
+      uploading.value.progress = Math.round((ev.loaded / ev.total) * 100)
+  }
+  xhr.onload = () => {
+    uploading.value = null
+    if (xhr.status === 200) {
+      form.video_path = JSON.parse(xhr.responseText).path
+      ElMessage.success('已添加: ' + f.name)
+    } else {
+      let msg = xhr.statusText
+      try { msg = JSON.parse(xhr.responseText).detail || msg } catch { /* keep */ }
+      ElMessage.error('添加失败: ' + msg)
+    }
+  }
+  xhr.onerror = () => {
+    uploading.value = null
+    ElMessage.error('上传中断，请重试或使用「浏览」按钮')
+  }
+  xhr.send(fd)
+}
+
 // ---------------------------------------------------------------- job
 const job = ref(null) // { id, stage, progress, message }
 const logs = ref([])
@@ -98,7 +135,8 @@ function listen(id) {
     const ev = JSON.parse(msg.data)
     job.value = { ...job.value, ...ev }
     if (ev.log) {
-      logs.value.push(ev.log)
+      const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      logs.value.push(`[${ts}] ${ev.log}`)
       if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500)
       requestAnimationFrame(() => {
         if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight
@@ -126,11 +164,25 @@ onBeforeUnmount(() => eventSource?.close())
   <el-card shadow="never">
     <el-form :model="form" label-width="110px">
       <el-form-item label="视频文件" required>
-        <el-input v-model="form.video_path" placeholder="视频文件的完整路径">
-          <template #append>
-            <el-button @click="openBrowser()">浏览…</el-button>
-          </template>
-        </el-input>
+        <div style="width: 100%">
+          <el-input v-model="form.video_path" placeholder="视频文件的完整路径">
+            <template #append>
+              <el-button @click="openBrowser()">浏览…</el-button>
+            </template>
+          </el-input>
+          <div
+            class="dropzone"
+            @dragover.prevent
+            @dragenter.prevent
+            @drop.prevent="onDrop"
+          >
+            <template v-if="uploading">
+              正在添加 {{ uploading.name }}…
+              <el-progress :percentage="uploading.progress" style="margin-top: 4px" />
+            </template>
+            <template v-else>⬇ 或将视频文件拖拽到此处</template>
+          </div>
+        </div>
       </el-form-item>
       <el-form-item label="音频语言">
         <el-select v-model="form.source_language" style="width: 200px">
@@ -214,6 +266,20 @@ onBeforeUnmount(() => eventSource?.close())
   margin-left: 12px;
   color: #909399;
   font-size: 12px;
+}
+.dropzone {
+  margin-top: 8px;
+  padding: 14px;
+  border: 2px dashed #c0c4cc;
+  border-radius: 6px;
+  text-align: center;
+  color: #909399;
+  font-size: 13px;
+  transition: border-color 0.2s;
+}
+.dropzone:hover {
+  border-color: #409eff;
+  color: #409eff;
 }
 .progress-card {
   margin-top: 16px;

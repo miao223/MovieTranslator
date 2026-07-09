@@ -67,6 +67,9 @@ class PromptSettings(BaseModel):
 
 
 class AppSettings(BaseModel):
+    # temp working dir for intermediate files; empty = platform cache dir.
+    # only its "jobs" subdirectory is managed (and wiped on startup)
+    work_dir: str = ""
     llm: LLMSettings = LLMSettings()
     asr: ASRSettings = ASRSettings()
     subtitle: SubtitleSettings = SubtitleSettings()
