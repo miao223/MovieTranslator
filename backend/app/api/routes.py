@@ -188,6 +188,21 @@ def asr_download_status(model_size: str):
     return model_download.get_status(model_size)
 
 
+@router.get("/asr/storage-info")
+def asr_storage_info():
+    """Where models are actually stored (custom dir or the HF default cache)."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    from app.services.asr import get_model_cache_dir
+
+    custom = get_model_cache_dir()
+    return {
+        "custom_dir": custom or "",
+        "effective_dir": custom or str(HF_HUB_CACHE),
+        "is_default": custom is None,
+    }
+
+
 @router.get("/asr/cuda-status")
 def asr_cuda_status():
     """Whether CUDA is usable by ctranslate2 on this machine."""

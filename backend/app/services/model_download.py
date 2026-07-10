@@ -94,11 +94,14 @@ def start_download(model_size: str, network: Optional[NetworkSettings]) -> dict:
         from huggingface_hub import snapshot_download
 
         try:
+            from app.services.asr import get_model_cache_dir
+
             with proxy_env(network):
                 snapshot_download(
                     repo,
                     allow_patterns=_ALLOW_PATTERNS,
                     tqdm_class=_make_progress_tqdm(model_size),
+                    cache_dir=get_model_cache_dir(),
                 )
             _set_status(model_size, status="done", progress=100.0)
         except Exception as exc:  # noqa: BLE001 — shown in the UI

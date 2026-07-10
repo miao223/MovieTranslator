@@ -30,6 +30,7 @@ export const api = {
   modelStatus: (modelSize) =>
     request(`/api/asr/model-status?model_size=${encodeURIComponent(modelSize)}`),
   cudaStatus: () => request('/api/asr/cuda-status'),
+  storageInfo: () => request('/api/asr/storage-info'),
   downloadModel: (modelSize) =>
     request('/api/asr/download', { method: 'POST', body: JSON.stringify({ model_size: modelSize }) }),
   downloadStatus: (modelSize) =>

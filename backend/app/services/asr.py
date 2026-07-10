@@ -37,6 +37,14 @@ def resolve_model(model_size: str) -> str:
     return EXTRA_MODELS.get(model_size, model_size)
 
 
+def get_model_cache_dir() -> Optional[str]:
+    """User-configured model storage dir, or None for the HF default cache."""
+    from app.core import config  # lazy to avoid circular import
+
+    d = config.load_settings().model_cache_dir.strip()
+    return d or None
+
+
 _dll_dirs_registered = False
 
 
@@ -127,7 +135,11 @@ def is_model_cached(model_size: str) -> bool:
     from faster_whisper.utils import download_model
 
     try:
-        download_model(resolve_model(model_size), local_files_only=True)
+        download_model(
+            resolve_model(model_size),
+            local_files_only=True,
+            cache_dir=get_model_cache_dir(),
+        )
         return True
     except Exception:
         return False
@@ -185,6 +197,7 @@ def _get_model(
                         device=settings.device,
                         compute_type=settings.compute_type,
                         local_files_only=cached,
+                        download_root=None if use_path else get_model_cache_dir(),
                     )
             except Exception as exc:
                 wrapped = _wrap_cuda_error(exc, settings)

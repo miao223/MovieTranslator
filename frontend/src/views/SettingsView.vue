@@ -8,6 +8,7 @@ const saving = ref(false)
 const testing = ref(false)
 const modelDownloaded = ref(null) // null = unknown / loading
 const cuda = ref(null) // { available, device_count }
+const storageInfo = ref(null) // { effective_dir, is_default }
 const download = ref({ status: 'idle', progress: 0 })
 let pollTimer = null
 
@@ -45,6 +46,7 @@ onMounted(async () => {
     settings.value = await api.getSettings()
     refreshModelStatus()
     api.cudaStatus().then((r) => (cuda.value = r)).catch(() => {})
+    api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
   } catch (e) {
     ElMessage.error('加载设置失败: ' + e.message)
   }
@@ -55,6 +57,8 @@ async function save() {
   try {
     settings.value = await api.saveSettings(settings.value)
     ElMessage.success('设置已保存')
+    api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
+    refreshModelStatus()
   } catch (e) {
     ElMessage.error('保存失败: ' + e.message)
   } finally {
@@ -223,6 +227,16 @@ async function testLLM() {
           <el-input v-model="settings.work_dir" placeholder="（留空 = 系统缓存目录）" />
           <span class="hint">存放提取音频等中间文件；程序只管理其中的 jobs 子目录并在启动时清空，保存后新任务立即生效</span>
         </el-form-item>
+        <el-form-item label="模型存储位置">
+          <el-input v-model="settings.model_cache_dir" placeholder="（留空 = HuggingFace 默认缓存目录）" />
+          <span class="hint">修改后新下载的模型存到新位置；已下载的模型不会自动迁移（原位置的模型会被视为未下载）</span>
+        </el-form-item>
+        <el-form-item v-if="storageInfo" label=" ">
+          <div class="storage-path">
+            📂 模型当前实际存放于：<code>{{ storageInfo.effective_dir }}</code>
+            <el-tag v-if="storageInfo.is_default" size="small" type="info" style="margin-left: 8px">默认位置</el-tag>
+          </div>
+        </el-form-item>
       </el-form>
     </el-card>
 
@@ -295,5 +309,15 @@ async function testLLM() {
 }
 .model-notes p {
   margin: 2px 0;
+}
+.storage-path {
+  font-size: 12.5px;
+  color: #606266;
+}
+.storage-path code {
+  background: #f5f7fa;
+  padding: 2px 6px;
+  border-radius: 4px;
+  word-break: break-all;
 }
 </style>
