@@ -24,6 +24,19 @@ _model_lock = threading.Lock()
 # error signatures that indicate missing/broken CUDA runtime libraries
 _CUDA_LIB_HINTS = ("cublas", "cudnn", "cuda", "cudart", "nvidia")
 
+# friendly names for CT2-converted fine-tunes selectable in the UI,
+# resolved to their HuggingFace repo ids
+EXTRA_MODELS = {
+    "kotoba-whisper-v2.0": "kotoba-tech/kotoba-whisper-v2.0-faster",
+    "CrisperWhisper": "nyrahealth/faster_CrisperWhisper",
+}
+
+
+def resolve_model(model_size: str) -> str:
+    """Map a UI model name to what faster-whisper expects (size or repo id)."""
+    return EXTRA_MODELS.get(model_size, model_size)
+
+
 _dll_dirs_registered = False
 
 
@@ -114,7 +127,7 @@ def is_model_cached(model_size: str) -> bool:
     from faster_whisper.utils import download_model
 
     try:
-        download_model(model_size, local_files_only=True)
+        download_model(resolve_model(model_size), local_files_only=True)
         return True
     except Exception:
         return False
@@ -150,7 +163,7 @@ def _get_model(
                     log(f"加载本地模型目录 {use_path} "
                         f"({settings.device}/{settings.compute_type})")
             else:
-                source = settings.model_size
+                source = resolve_model(settings.model_size)
                 cached = is_model_cached(settings.model_size)
                 if log:
                     if cached:

@@ -40,9 +40,14 @@ def _set_status(model_size: str, **fields) -> None:
 def _repo_id(model_size: str) -> str:
     from faster_whisper.utils import _MODELS
 
-    if model_size not in _MODELS:
-        raise ValueError(f"未知模型: {model_size}")
-    return _MODELS[model_size]
+    from app.services.asr import resolve_model
+
+    resolved = resolve_model(model_size)
+    if resolved in _MODELS:
+        return _MODELS[resolved]
+    if "/" in resolved:  # already a HuggingFace repo id (CT2 format)
+        return resolved
+    raise ValueError(f"未知模型: {model_size}")
 
 
 def _make_progress_tqdm(model_size: str):

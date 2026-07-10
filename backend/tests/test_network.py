@@ -54,6 +54,21 @@ def test_wrap_cuda_error_maps_dll_failure():
     assert _wrap_cuda_error(raw, ASRSettings(device="cpu")) is raw
 
 
+def test_model_alias_resolution():
+    from app.services.asr import resolve_model
+    from app.services.model_download import _repo_id
+
+    assert resolve_model("large-v2") == "large-v2"
+    assert resolve_model("kotoba-whisper-v2.0") == "kotoba-tech/kotoba-whisper-v2.0-faster"
+    assert _repo_id("kotoba-whisper-v2.0") == "kotoba-tech/kotoba-whisper-v2.0-faster"
+    assert _repo_id("CrisperWhisper") == "nyrahealth/faster_CrisperWhisper"
+    assert _repo_id("large-v2") == "Systran/faster-whisper-large-v2"
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        _repo_id("not-a-model")
+
+
 def test_is_local_model_dir(tmp_path):
     assert not is_local_model_dir(str(tmp_path))          # empty dir
     (tmp_path / "model.bin").write_bytes(b"x")

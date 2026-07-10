@@ -11,10 +11,23 @@ const cuda = ref(null) // { available, device_count }
 const download = ref({ status: 'idle', progress: 0 })
 let pollTimer = null
 
+// size = download size in MB (from the HuggingFace repos, model.bin + config)
 const WHISPER_MODELS = [
-  'tiny', 'base', 'small', 'medium',
-  'large-v2', 'large-v3', 'large-v3-turbo', 'distil-large-v3',
+  { value: 'tiny', size: 75 },
+  { value: 'base', size: 141 },
+  { value: 'small', size: 464 },
+  { value: 'medium', size: 1460 },
+  { value: 'large-v2', size: 2946 },
+  { value: 'large-v3', size: 2948 },
+  { value: 'large-v3-turbo', size: 1547 },
+  { value: 'distil-large-v3', size: 1446 },
+  { value: 'kotoba-whisper-v2.0', size: 1446 },
+  { value: 'CrisperWhisper', size: 2948 },
 ]
+
+function fmtModelSize(mb) {
+  return mb >= 1000 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB'
+}
 const COMPUTE_TYPES = ['int8', 'int8_float16', 'float16', 'float32']
 
 async function refreshModelStatus() {
@@ -141,8 +154,11 @@ async function testLLM() {
       <template #header>🎙️ 语音识别（Faster Whisper）</template>
       <el-form label-width="150px">
         <el-form-item label="模型">
-          <el-select v-model="settings.asr.model_size" style="width: 200px" @change="refreshModelStatus">
-            <el-option v-for="m in WHISPER_MODELS" :key="m" :value="m" :label="m" />
+          <el-select v-model="settings.asr.model_size" style="width: 260px" @change="refreshModelStatus">
+            <el-option v-for="m in WHISPER_MODELS" :key="m.value" :value="m.value" :label="m.value">
+              <span>{{ m.value }}</span>
+              <span class="model-size">{{ fmtModelSize(m.size) }}</span>
+            </el-option>
           </el-select>
           <el-tag v-if="modelDownloaded === true" type="success" class="tag">已下载，可离线使用</el-tag>
           <el-tag v-else-if="modelDownloaded === false" type="warning" class="tag">未下载</el-tag>
@@ -192,6 +208,12 @@ async function testLLM() {
           <span class="hint">过滤无语音片段，减少幻听字幕</span>
         </el-form-item>
       </el-form>
+      <div class="model-notes">
+        <p><strong>📌 模型选择说明</strong>（列表右侧为下载体积，模型仅在首次选用时下载一次）</p>
+        <p>· <strong>为什么默认 large-v2</strong>：large-v3 在安静的基准测试中略准，但在真实影视音频中幻觉率明显更高（第三方实测约为 v2 的 4 倍）——电影中大量的配乐、音效和静默正是幻觉的高发场景，会凭空产生不存在的台词。因此默认使用更稳定的 large-v2。</p>
+        <p>· <strong>kotoba-whisper-v2.0</strong>：日语专用蒸馏模型，日语准确率不低于 large-v2、接近 large-v3，速度约为其 6 倍且无 v3 的幻觉问题。翻译日语影片时建议优先选用。</p>
+        <p>· <strong>CrisperWhisper</strong>：针对幻觉和逐字转写强化的模型，能更忠实地转写每个词、词级时间戳更准。仅支持英语和德语影片。</p>
+      </div>
     </el-card>
 
     <el-card shadow="never" class="section">
@@ -256,5 +278,22 @@ async function testLLM() {
 }
 .tag {
   margin-left: 12px;
+}
+.model-size {
+  float: right;
+  color: #909399;
+  font-size: 12px;
+}
+.model-notes {
+  margin-top: 4px;
+  padding: 10px 14px;
+  background: #f5f7fa;
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 1.8;
+  color: #606266;
+}
+.model-notes p {
+  margin: 2px 0;
 }
 </style>
