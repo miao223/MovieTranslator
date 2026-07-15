@@ -8,6 +8,7 @@ and are wiped on the next application startup.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -188,7 +189,10 @@ class JobManager:
                 return 20.0
             time.sleep(1)
 
-    def _translate_frames(self, job, req, settings, workdir: Path) -> List[SubtitleLine]:
+    def _translate_frames(
+        self, job, req, settings, workdir: Path,
+        progress_lo: float = 93.0, progress_hi: float = 95.0,
+    ) -> List[SubtitleLine]:
         """Translate on-screen text at the requested timestamps.
 
         Every task is independently fault-tolerant: a bad timestamp, a
@@ -202,7 +206,8 @@ class JobManager:
         for i, task in enumerate(req.frame_tasks, start=1):
             label = task.time.strip()
             job.publish(
-                "translating", 93 + 2 * i / total,
+                "translating",
+                progress_lo + (progress_hi - progress_lo) * i / total,
                 message=f"画面翻译 {i}/{total}…",
             )
             try:
@@ -247,7 +252,55 @@ class JobManager:
                 )
         return results
 
+    def _execute_frame_only(self, job: Job, req: JobRequest, workdir: Path) -> None:
+        """Supplement mode: translate frames and merge into the existing
+        same-stem subtitle file (.ass preferred over .srt) in place."""
+        settings = config.load_settings()
+        video = Path(req.video_path)
+        target = next(
+            (p for p in (video.with_suffix(".ass"), video.with_suffix(".srt"))
+             if p.is_file()),
+            None,
+        )
+        if target is None:
+            raise RuntimeError(
+                "未找到视频同名的 .srt / .ass 字幕文件，补充模式需要已有字幕；"
+                "请先执行完整翻译"
+            )
+        if not req.frame_tasks:
+            raise RuntimeError("补充模式至少需要一条画面翻译时间点")
+
+        job.publish("translating", 10, message=f"补充画面翻译 → {target.name}")
+        frame_lines = self._translate_frames(
+            job, req, settings, workdir, progress_lo=20.0, progress_hi=90.0
+        )
+        if not frame_lines:
+            raise RuntimeError("所有画面翻译均失败，未修改字幕文件（原因见日志）")
+
+        job.publish("composing", 95, message="合并进字幕文件…")
+        cues = [(l.start, l.end, l.translation) for l in frame_lines]
+        original = target.read_text(encoding="utf-8", errors="replace")
+        if target.suffix.lower() == ".ass":
+            updated = subtitle.insert_frame_cues_ass(original, cues)
+        else:
+            updated = subtitle.insert_frame_cues_srt(original, cues)
+        # atomic replace so a crash can never corrupt the user's subtitles
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(updated, encoding="utf-8")
+        os.replace(tmp, target)
+
+        job.srt_path = target
+        job.status.srt_filename = str(target)
+        job.status.srt_in_place = True
+        job.publish(
+            "done", 100,
+            message=f"已补充 {len(frame_lines)} 条画面翻译到: {target}",
+        )
+
     def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
+        if req.frame_only:
+            self._execute_frame_only(job, req, workdir)
+            return
         settings = config.load_settings()
 
         def check_cancel():

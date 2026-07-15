@@ -1,4 +1,4 @@
-"""SRT serialization: mono-language or bilingual cues.
+"""SRT/ASS serialization and in-place frame-cue insertion.
 
 Timestamps live only here — the LLM never sees them; lines are matched
 back to their timestamps via the 1-based line index.
@@ -6,9 +6,18 @@ back to their timestamps via the 1-based line index.
 
 from __future__ import annotations
 
-from typing import List
+import re
+from typing import List, Sequence, Tuple
 
 from app.models.schemas import SubtitleLine, SubtitleSettings
+
+# (start_seconds, end_seconds, translated_text)
+FrameCue = Tuple[float, float, str]
+
+_SRT_TIMING = re.compile(
+    r"^(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}\s*$"
+)
+_ASS_DIALOGUE_START = re.compile(r"^Dialogue:\s*\d+\s*,\s*(\d+):(\d{2}):(\d{2})\.(\d{2})\s*,")
 
 
 def format_timestamp(seconds: float) -> str:
@@ -116,3 +125,88 @@ def build_srt(
             f"{n}\n{format_timestamp(line.start)} --> {format_timestamp(line.end)}\n{text}\n"
         )
     return "\n".join(blocks)
+
+
+# ------------------------------------------------- in-place cue insertion
+
+
+def insert_frame_cues_srt(srt_text: str, cues: Sequence[FrameCue]) -> str:
+    """Insert frame cues (as {\\an7} blocks) into existing SRT text.
+
+    Existing block text is preserved verbatim; only numbering is redone.
+    """
+    blocks = []  # (start_seconds, [timing_line, *text_lines])
+    for raw in re.split(r"\n\s*\n", srt_text.strip()):
+        lines = raw.splitlines()
+        if not lines:
+            continue
+        # first line is usually the index — timing may be on line 0 or 1
+        timing_idx = next(
+            (i for i, l in enumerate(lines[:2]) if _SRT_TIMING.match(l.strip())),
+            None,
+        )
+        if timing_idx is None:
+            continue  # malformed block: drop rather than corrupt output
+        m = _SRT_TIMING.match(lines[timing_idx].strip())
+        start = (
+            int(m.group(1)) * 3600 + int(m.group(2)) * 60
+            + int(m.group(3)) + int(m.group(4)) / 1000
+        )
+        blocks.append((start, lines[timing_idx:]))
+
+    for start, end, text in cues:
+        timing = f"{format_timestamp(start)} --> {format_timestamp(end)}"
+        blocks.append((start, [timing, "{\\an7}" + text]))
+
+    blocks.sort(key=lambda b: b[0])
+    out = []
+    for n, (_start, lines) in enumerate(blocks, start=1):
+        out.append(str(n) + "\n" + "\n".join(lines) + "\n")
+    return "\n".join(out)
+
+
+def _ass_start_seconds(line: str) -> float | None:
+    m = _ASS_DIALOGUE_START.match(line)
+    if not m:
+        return None
+    return (
+        int(m.group(1)) * 3600 + int(m.group(2)) * 60
+        + int(m.group(3)) + int(m.group(4)) / 100
+    )
+
+
+def insert_frame_cues_ass(ass_text: str, cues: Sequence[FrameCue]) -> str:
+    """Insert frame cues as Dialogue events, sorted by start time.
+
+    Header/style sections are untouched. If no Dialogue lines are found
+    (unexpected format), the new events are appended at the end — ASS
+    renderers do not require chronological event order.
+    """
+    new_events = [
+        f"Dialogue: 0,{format_ass_timestamp(start)},{format_ass_timestamp(end)},"
+        f"Default,,0,0,0,,{{\\an7}}{_ass_escape(text)}"
+        for start, end, text in cues
+    ]
+    lines = ass_text.splitlines()
+    dialogue_idx = [
+        (i, s) for i, l in enumerate(lines)
+        if (s := _ass_start_seconds(l)) is not None
+    ]
+    if not dialogue_idx:
+        return ass_text.rstrip("\n") + "\n" + "\n".join(new_events) + "\n"
+
+    for event, (start, _e, _t) in sorted(
+        zip(new_events, cues), key=lambda p: p[1][0], reverse=True
+    ):
+        # insert before the first existing dialogue that starts later
+        insert_at = dialogue_idx[-1][0] + 1
+        for i, s in dialogue_idx:
+            if s > start:
+                insert_at = i
+                break
+        lines.insert(insert_at, event)
+        dialogue_idx = [
+            (i, s) for i, l in enumerate(lines)
+            if (s := _ass_start_seconds(l)) is not None
+        ]
+    return "\n".join(lines) + "\n"

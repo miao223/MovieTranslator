@@ -135,15 +135,21 @@ const STAGE_LABELS = {
 const running = () =>
   job.value && !['done', 'failed', 'cancelled'].includes(job.value.stage)
 
-async function start() {
+async function start(frameOnly = false) {
   if (!form.video_path) {
     ElMessage.warning('请先选择视频文件')
+    return
+  }
+  const tasks = frameTasks.value.filter((t) => t.time.trim())
+  if (frameOnly && !tasks.length) {
+    ElMessage.warning('补充模式至少需要一条画面翻译时间点')
     return
   }
   try {
     const status = await api.createJob({
       ...form,
-      frame_tasks: frameTasks.value.filter((t) => t.time.trim()),
+      frame_tasks: tasks,
+      frame_only: frameOnly,
     })
     job.value = { ...status }
     logs.value = []
@@ -352,10 +358,19 @@ onBeforeUnmount(() => {
             <el-button type="danger" plain circle size="small" @click="removeFrameTask(i)">✕</el-button>
           </div>
           <el-button size="small" @click="addFrameTask">＋ 添加时间点</el-button>
+          <el-button
+            v-if="frameTasks.some((t) => t.time.trim())"
+            size="small" type="warning" plain
+            :disabled="running() || batchRunning()"
+            @click="start(true)"
+          >
+            ⚡ 仅补充到已有字幕
+          </el-button>
           <div class="hint" style="margin: 4px 0 0; display: block">
             （可选）翻译画面中的文字内容（手机屏幕、纸质文件、电视画面等），译文将在该时间点显示于屏幕左上角，固定持续 5 秒。<br>
             时间格式（用半角冒号）：<code>5</code> = 第 5 秒；<code>8:19</code> = 8 分 19 秒；<code>1:02:03</code> = 1 小时 2 分 3 秒，支持小数秒（如 <code>8:19.5</code>）。<br>
-            需要模型具备视觉能力（设置 → 翻译模型 → 视觉模型）；单条失败只记录日志，不影响正常字幕。
+            需要模型具备视觉能力（设置 → 翻译模型 → 视觉模型）；单条失败只记录日志，不影响正常字幕。<br>
+            <strong>仅补充到已有字幕</strong>：不重新识别和翻译语音，只把上面的画面翻译条目合并进视频旁已有的同名字幕文件（.ass 和 .srt 同时存在时优先修改 .ass）——适合翻完观看后发现遗漏的场景。
           </div>
         </div>
       </el-form-item>

@@ -117,6 +117,9 @@ class JobRequest(BaseModel):
     synopsis: str = ""  # optional plot synopsis to steer the translation
     output_mode: Literal["bilingual", "translation_only"] = "bilingual"
     frame_tasks: list[FrameTask] = []
+    # supplement mode: skip ASR/translation entirely, only translate the
+    # frame_tasks and merge them into the existing same-stem .srt/.ass
+    frame_only: bool = False
 
 
 class BatchRequest(BaseModel):
