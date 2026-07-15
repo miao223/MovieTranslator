@@ -217,6 +217,45 @@ def asr_cuda_status():
 # ------------------------------------------------------------ file browse
 
 
+@router.get("/fs/resolve")
+def fs_resolve(path: str):
+    """Resolve a pasted path (Explorer address / file path, maybe quoted)."""
+    raw = path.strip().strip('"').strip("'").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="路径为空")
+    p = Path(raw).expanduser()
+    if p.is_dir():
+        return {"type": "dir", "path": str(p)}
+    if p.is_file():
+        return {
+            "type": "file",
+            "path": str(p),
+            "is_video": p.suffix.lower() in VIDEO_EXTS,
+        }
+    return {"type": "missing", "path": raw}
+
+
+@router.get("/fs/quick-access")
+def fs_quick_access():
+    """Shortcuts shown in the file browser: drives + common user folders."""
+    items = []
+    if sys.platform == "win32":
+        for letter in string.ascii_uppercase:
+            root = f"{letter}:\\"
+            if os.path.exists(root):
+                items.append({"name": f"{letter}:", "path": root})
+    home = Path.home()
+    items.append({"name": "主目录", "path": str(home)})
+    for label, sub in (
+        ("桌面", "Desktop"), ("下载", "Downloads"),
+        ("视频", "Videos"), ("影片", "Movies"),
+    ):
+        d = home / sub
+        if d.is_dir():
+            items.append({"name": label, "path": str(d)})
+    return {"items": items}
+
+
 @router.get("/fs/browse")
 def fs_browse(path: str = ""):
     """List directories and video files for the server-side file picker."""

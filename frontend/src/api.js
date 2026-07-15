@@ -26,6 +26,9 @@ export const api = {
     request('/api/settings/test-llm', { method: 'POST', body: JSON.stringify(llm) }),
   browse: (path) =>
     request(`/api/fs/browse?path=${encodeURIComponent(path || '')}`),
+  resolvePath: (path) =>
+    request(`/api/fs/resolve?path=${encodeURIComponent(path)}`),
+  quickAccess: () => request('/api/fs/quick-access'),
   promptPreview: (payload) =>
     request('/api/prompts/preview', { method: 'POST', body: JSON.stringify(payload) }),
   modelStatus: (modelSize) =>

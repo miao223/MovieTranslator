@@ -28,12 +28,41 @@ const form = reactive({
 // ---------------------------------------------------------- file browser
 const browserVisible = ref(false)
 const browser = reactive({ path: '', parent: null, dirs: [], files: [] })
+const addressInput = ref('')
+const quickAccess = ref([])
 
 async function openBrowser(path = '') {
   try {
     const data = await api.browse(path)
     Object.assign(browser, data)
+    addressInput.value = data.path
     browserVisible.value = true
+    if (!quickAccess.value.length) {
+      api.quickAccess().then((r) => (quickAccess.value = r.items)).catch(() => {})
+    }
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+// jump to a pasted Explorer path: a folder opens it, a full video file
+// path selects it directly (quotes from "复制文件地址" are stripped server-side)
+async function jumpToAddress() {
+  const raw = addressInput.value.trim()
+  if (!raw) return
+  try {
+    const r = await api.resolvePath(raw)
+    if (r.type === 'dir') {
+      openBrowser(r.path)
+    } else if (r.type === 'file' && r.is_video) {
+      form.video_path = r.path
+      browserVisible.value = false
+      ElMessage.success('已选择: ' + r.path)
+    } else if (r.type === 'file') {
+      ElMessage.warning('该文件不是支持的视频格式')
+    } else {
+      ElMessage.warning('路径不存在: ' + r.path)
+    }
   } catch (e) {
     ElMessage.error(e.message)
   }
@@ -197,12 +226,29 @@ onBeforeUnmount(() => eventSource?.close())
     </template>
   </el-card>
 
-  <el-dialog v-model="browserVisible" title="选择视频文件" width="620px">
+  <el-dialog v-model="browserVisible" title="选择视频文件" width="680px">
     <div class="browser-path">
       <el-button size="small" :disabled="browser.parent === null" @click="openBrowser(browser.parent)">
         ↑ 上级
       </el-button>
-      <code>{{ browser.path || '磁盘列表' }}</code>
+      <el-input
+        v-model="addressInput"
+        size="small"
+        placeholder="粘贴文件夹或视频文件的完整路径，回车跳转"
+        @keyup.enter="jumpToAddress"
+      >
+        <template #append>
+          <el-button @click="jumpToAddress">跳转</el-button>
+        </template>
+      </el-input>
+    </div>
+    <div v-if="quickAccess.length" class="quick-access">
+      <el-tag
+        v-for="q in quickAccess" :key="q.path"
+        class="quick-item" effect="plain" @click="openBrowser(q.path)"
+      >
+        {{ q.name }}
+      </el-tag>
     </div>
     <div class="browser-list">
       <div v-for="d in browser.dirs" :key="'d-' + d" class="entry dir" @click="openBrowser(browser.path ? joinPath(browser.path, d) : d)">
@@ -252,6 +298,13 @@ onBeforeUnmount(() => eventSource?.close())
   align-items: center;
   gap: 10px;
   margin-bottom: 8px;
+}
+.quick-access {
+  margin-bottom: 8px;
+}
+.quick-item {
+  margin: 0 6px 4px 0;
+  cursor: pointer;
 }
 .browser-list {
   max-height: 380px;
