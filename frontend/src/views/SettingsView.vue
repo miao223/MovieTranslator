@@ -38,7 +38,6 @@ const WHISPER_MODELS = [
   { value: 'large-v3', size: 2948 },
   { value: 'large-v3-turbo', size: 1547 },
   { value: 'distil-large-v3', size: 1446 },
-  { value: 'kotoba-whisper-v2.0', size: 1446 },
   { value: 'CrisperWhisper', size: 2948 },
 ]
 
@@ -267,7 +266,6 @@ async function testLLM() {
       <div class="model-notes">
         <p><strong>📌 模型选择说明</strong>（列表右侧为下载体积，模型仅在首次选用时下载一次）</p>
         <p>· <strong>为什么默认 large-v2</strong>：large-v3 在安静的基准测试中略准，但在真实影视音频中幻觉率明显更高（第三方实测约为 v2 的 4 倍）——电影中大量的配乐、音效和静默正是幻觉的高发场景，会凭空产生不存在的台词。因此默认使用更稳定的 large-v2。</p>
-        <p>· <strong>kotoba-whisper-v2.0</strong>：日语专用蒸馏模型，日语准确率不低于 large-v2、接近 large-v3，速度约为其 6 倍且无 v3 的幻觉问题。翻译日语影片时建议优先选用。</p>
         <p>· <strong>CrisperWhisper</strong>：针对幻觉和逐字转写强化的模型，能更忠实地转写每个词、词级时间戳更准。仅支持英语和德语影片。</p>
       </div>
     </el-card>

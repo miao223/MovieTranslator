@@ -38,7 +38,9 @@ _model_lock = threading.Lock()
 _CUDA_LIB_HINTS = ("cublas", "cudnn", "cuda", "cudart", "nvidia")
 
 # friendly names for CT2-converted fine-tunes selectable in the UI,
-# resolved to their HuggingFace repo ids
+# resolved to their HuggingFace repo ids. kotoba was removed from the UI
+# (poor real-world results) but stays resolvable so saved settings keep
+# working for users who already downloaded it.
 EXTRA_MODELS = {
     "kotoba-whisper-v2.0": "kotoba-tech/kotoba-whisper-v2.0-faster",
     "CrisperWhisper": "nyrahealth/faster_CrisperWhisper",
