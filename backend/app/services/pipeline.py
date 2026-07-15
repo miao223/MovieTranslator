@@ -188,6 +188,65 @@ class JobManager:
                 return 20.0
             time.sleep(1)
 
+    def _translate_frames(self, job, req, settings, workdir: Path) -> List[SubtitleLine]:
+        """Translate on-screen text at the requested timestamps.
+
+        Every task is independently fault-tolerant: a bad timestamp, a
+        text-only model or an empty frame only produces a warning log.
+        """
+        from app.services import frame as frame_svc
+        from app.services import vision
+
+        results: List[SubtitleLine] = []
+        total = len(req.frame_tasks)
+        for i, task in enumerate(req.frame_tasks, start=1):
+            label = task.time.strip()
+            job.publish(
+                "translating", 93 + 2 * i / total,
+                message=f"画面翻译 {i}/{total}…",
+            )
+            try:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                seconds = frame_svc.parse_time(task.time)
+                jpg = workdir / f"frame_{i}.jpg"
+                frame_svc.extract_frame(req.video_path, seconds, jpg)
+                text = vision.translate_frame(
+                    jpg,
+                    target_language=req.target_language,
+                    note=task.note,
+                    llm=settings.llm,
+                    network=settings.network,
+                )
+                if text is None:
+                    job.publish(
+                        "translating", job.status.progress,
+                        log=f"画面翻译 [{label}]：模型判断画面无可翻译文字，已跳过",
+                    )
+                    continue
+                results.append(
+                    SubtitleLine(
+                        index=0,
+                        start=round(seconds, 3),
+                        end=round(seconds + task.duration, 3),
+                        text="",
+                        translation=text,
+                        is_frame=True,
+                    )
+                )
+                job.publish(
+                    "translating", job.status.progress,
+                    log=f"画面翻译 [{label}] 完成：{text[:60]}",
+                )
+            except InterruptedError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — per-task tolerance by design
+                job.publish(
+                    "translating", job.status.progress,
+                    log=f"⚠ 画面翻译 [{label}] 失败（不影响正常字幕）: {exc}",
+                )
+        return results
+
     def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
         settings = config.load_settings()
 
@@ -278,6 +337,13 @@ class JobManager:
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
             encoding="utf-8",
         )
+
+        # 3b. on-screen text translation (画面翻译) — best-effort per task,
+        # failures must never affect the speech subtitles
+        if req.frame_tasks:
+            frame_lines = self._translate_frames(job, req, settings, workdir)
+            if frame_lines:
+                lines = sorted(lines + frame_lines, key=lambda l: l.start)
 
         # 4. compose subtitle file -----------------------------------------
         styled = settings.subtitle.style_enabled

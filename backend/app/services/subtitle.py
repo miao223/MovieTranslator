@@ -73,7 +73,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for line in lines:
         translation = _ass_escape(line.translation.strip() or line.text)
         original = _ass_escape(line.text)
-        if mode == "translation_only":
+        if line.is_frame:
+            text = "{\\an7}" + translation
+        elif mode == "translation_only":
             text = translation
         elif settings.bilingual_layout == "translation_top":
             text = f"{translation}\\N{orig_tag}{original}"
@@ -99,7 +101,11 @@ def build_srt(
     blocks: List[str] = []
     for n, line in enumerate(lines, start=1):
         translation = line.translation.strip() or line.text
-        if mode == "translation_only":
+        if line.is_frame:
+            # on-screen text cue: top-left ({\an7} is honoured by VLC /
+            # PotPlayer / mpv even in SRT), translation only
+            text = "{\\an7}" + translation
+        elif mode == "translation_only":
             text = translation
         else:
             if settings.bilingual_layout == "translation_top":

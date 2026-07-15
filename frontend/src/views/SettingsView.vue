@@ -165,6 +165,10 @@ async function testLLM() {
         <el-form-item label="模型名称">
           <el-input v-model="settings.llm.model" placeholder="gpt-4o-mini / deepseek-chat / …" />
         </el-form-item>
+        <el-form-item label="视觉模型">
+          <el-input v-model="settings.llm.vision_model" placeholder="（可选）qwen-vl-plus / gpt-4o-mini / glm-4v …" />
+          <span class="hint">仅画面翻译功能使用，留空则用上方主模型；DeepSeek 等纯文本模型不支持画面翻译</span>
+        </el-form-item>
         <el-form-item label="Temperature">
           <el-slider v-model="settings.llm.temperature" :min="0" :max="1.5" :step="0.1" show-input style="width: 400px" />
         </el-form-item>

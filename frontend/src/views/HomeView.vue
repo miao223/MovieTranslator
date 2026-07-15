@@ -33,6 +33,17 @@ const batchForm = reactive({
   skip_existing_srt: true,
 })
 
+// 画面翻译 (on-screen text) time points, single-file mode only
+const frameTasks = ref([])
+
+function addFrameTask() {
+  frameTasks.value.push({ time: '', note: '', duration: 5 })
+}
+
+function removeFrameTask(i) {
+  frameTasks.value.splice(i, 1)
+}
+
 // ---------------------------------------------------------- file browser
 const browserVisible = ref(false)
 const browser = reactive({ path: '', parent: null, dirs: [], files: [] })
@@ -130,7 +141,10 @@ async function start() {
     return
   }
   try {
-    const status = await api.createJob({ ...form })
+    const status = await api.createJob({
+      ...form,
+      frame_tasks: frameTasks.value.filter((t) => t.time.trim()),
+    })
     job.value = { ...status }
     logs.value = []
     listen(status.id)
@@ -330,6 +344,22 @@ onBeforeUnmount(() => {
           <el-radio value="translation_only">纯译文</el-radio>
         </el-radio-group>
       </el-form-item>
+      <el-form-item v-if="mode === 'single'" label="画面翻译">
+        <div style="width: 100%">
+          <div v-for="(t, i) in frameTasks" :key="i" class="frame-task-row">
+            <el-input v-model="t.time" placeholder="时:分:秒" style="width: 110px" />
+            <el-input v-model="t.note" placeholder="备注（如：手机短信内容，可留空）" style="flex: 1" />
+            <el-input-number v-model="t.duration" :min="1" :max="60" :step="1" style="width: 100px" />
+            <span class="hint" style="margin: 0">秒</span>
+            <el-button type="danger" plain circle size="small" @click="removeFrameTask(i)">✕</el-button>
+          </div>
+          <el-button size="small" @click="addFrameTask">＋ 添加时间点</el-button>
+          <div class="hint" style="margin: 4px 0 0; display: block">
+            （可选）翻译画面中的文字内容（手机屏幕、纸质文件、电视画面等），译文显示在屏幕左上角。
+            需要模型具备视觉能力（设置 → 翻译模型 → 视觉模型）；单条失败不影响正常字幕。
+          </div>
+        </div>
+      </el-form-item>
       <el-form-item>
         <el-button
           type="primary"
@@ -475,6 +505,12 @@ onBeforeUnmount(() => {
 }
 .progress-card {
   margin-top: 16px;
+}
+.frame-task-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 .progress-row {
   display: flex;

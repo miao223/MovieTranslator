@@ -14,6 +14,9 @@ class LLMSettings(BaseModel):
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
+    # vision model for on-screen text translation; empty = use `model`
+    # (needed because strong text models like DeepSeek have no vision)
+    vision_model: str = ""
     temperature: float = Field(0.3, ge=0.0, le=2.0)
     # lines translated per output batch (limited by the model's max output tokens)
     batch_size: int = Field(80, ge=1, le=500)
@@ -99,12 +102,21 @@ class AppSettings(BaseModel):
 # ---------------------------------------------------------------- jobs
 
 
+class FrameTask(BaseModel):
+    """One on-screen-text translation point (画面翻译)."""
+
+    time: str  # "1:23:45" / "23:45" / "85"
+    note: str = ""  # hint for the vision model, e.g. "手机短信内容"
+    duration: float = Field(5.0, ge=1.0, le=60.0)  # cue display seconds
+
+
 class JobRequest(BaseModel):
     video_path: str
     source_language: str = "auto"  # whisper language code or "auto"
     target_language: str = "简体中文"
     synopsis: str = ""  # optional plot synopsis to steer the translation
     output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+    frame_tasks: list[FrameTask] = []
 
 
 class BatchRequest(BaseModel):
@@ -136,6 +148,8 @@ class SubtitleLine(BaseModel):
     end: float
     text: str
     translation: str = ""
+    # on-screen text cue (画面翻译): rendered top-left, translation only
+    is_frame: bool = False
 
 
 class JobStatus(BaseModel):
