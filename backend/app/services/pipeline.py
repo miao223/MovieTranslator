@@ -279,11 +279,16 @@ class JobManager:
             encoding="utf-8",
         )
 
-        # 4. compose SRT ----------------------------------------------------
-        job.publish("composing", 95, message="生成 SRT…")
-        srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
+        # 4. compose subtitle file -----------------------------------------
+        styled = settings.subtitle.style_enabled
+        ext = ".ass" if styled else ".srt"
+        job.publish("composing", 95, message=f"生成 {ext[1:].upper()} 字幕…")
+        if styled:
+            srt_text = subtitle.build_ass(lines, settings.subtitle, mode=req.output_mode)
+        else:
+            srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
         video = Path(req.video_path)
-        target = video.parent / f"{video.stem}.srt"
+        target = video.parent / f"{video.stem}{ext}"
         try:
             target.write_text(srt_text, encoding="utf-8")
             job.srt_path = target
@@ -291,7 +296,7 @@ class JobManager:
         except OSError as exc:
             # video dir not writable (read-only share etc.): keep it in the
             # work dir and let the UI offer a download instead
-            job.srt_path = workdir / f"{video.stem}.srt"
+            job.srt_path = workdir / f"{video.stem}{ext}"
             job.srt_path.write_text(srt_text, encoding="utf-8")
             job.status.srt_in_place = False
             job.publish(

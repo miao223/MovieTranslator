@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 
@@ -45,6 +45,19 @@ function fmtModelSize(mb) {
   return mb >= 1000 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB'
 }
 const COMPUTE_TYPES = ['int8', 'int8_float16', 'float16', 'float32']
+
+// preview box is ~1/3 of a 1080p frame's height, scale fonts accordingly
+const PREVIEW_SCALE = 0.33
+const transStyle = computed(() => ({
+  fontSize: Math.round(settings.value.subtitle.font_size * PREVIEW_SCALE) + 'px',
+  color: settings.value.subtitle.translation_color,
+  textShadow: '1px 1px 2px #000',
+}))
+const origStyle = computed(() => ({
+  fontSize: Math.round(settings.value.subtitle.original_font_size * PREVIEW_SCALE) + 'px',
+  color: settings.value.subtitle.original_color,
+  textShadow: '1px 1px 2px #000',
+}))
 
 async function refreshModelStatus() {
   modelDownloaded.value = null
@@ -323,6 +336,38 @@ async function testLLM() {
             <el-radio value="translation_top">译文在上</el-radio>
           </el-radio-group>
         </el-form-item>
+        <el-form-item label="字幕样式">
+          <el-switch v-model="settings.subtitle.style_enabled" />
+          <span class="hint">开启后输出 .ass 格式（支持字号/颜色，主流播放器均可自动挂载）；关闭输出标准 .srt</span>
+        </el-form-item>
+        <template v-if="settings.subtitle.style_enabled">
+          <el-form-item label="译文字号">
+            <el-slider v-model="settings.subtitle.font_size" :min="24" :max="100" show-input style="width: 400px" />
+            <span class="hint">按 1080P 画布计算</span>
+          </el-form-item>
+          <el-form-item label="原文字号">
+            <el-slider v-model="settings.subtitle.original_font_size" :min="16" :max="100" show-input style="width: 400px" />
+          </el-form-item>
+          <el-form-item label="译文颜色">
+            <el-color-picker v-model="settings.subtitle.translation_color" />
+            <span class="hint" style="margin-right: 24px">{{ settings.subtitle.translation_color }}</span>
+            <span style="margin-right: 8px">原文颜色</span>
+            <el-color-picker v-model="settings.subtitle.original_color" />
+            <span class="hint">{{ settings.subtitle.original_color }}</span>
+          </el-form-item>
+          <el-form-item label="效果预览">
+            <div class="subtitle-preview">
+              <template v-if="settings.subtitle.bilingual_layout === 'translation_top'">
+                <div :style="transStyle">不要问你的国家能为你做什么</div>
+                <div :style="origStyle">ask not what your country can do for you</div>
+              </template>
+              <template v-else>
+                <div :style="origStyle">ask not what your country can do for you</div>
+                <div :style="transStyle">不要问你的国家能为你做什么</div>
+              </template>
+            </div>
+          </el-form-item>
+        </template>
       </el-form>
     </el-card>
 
@@ -363,6 +408,19 @@ async function testLLM() {
 .storage-path {
   font-size: 12.5px;
   color: #606266;
+}
+.subtitle-preview {
+  width: 480px;
+  height: 150px;
+  border-radius: 6px;
+  background: linear-gradient(160deg, #2c3e50 0%, #4a3f55 55%, #1a252f 100%);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  padding-bottom: 14px;
+  line-height: 1.45;
+  font-family: 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
 }
 .storage-path code {
   background: #f5f7fa;

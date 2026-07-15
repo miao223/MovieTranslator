@@ -54,6 +54,13 @@ class SubtitleSettings(BaseModel):
     bilingual_layout: Literal["translation_top", "translation_bottom"] = (
         "translation_bottom"
     )
+    # styled output: emits .ass instead of .srt (SRT cannot carry font
+    # size/color reliably); sizes are for a 1920x1080 canvas
+    style_enabled: bool = False
+    font_size: int = Field(56, ge=16, le=120)  # translation line
+    original_font_size: int = Field(40, ge=12, le=120)
+    translation_color: str = "#FFFFFF"
+    original_color: str = "#B4B4B4"
 
 
 DEFAULT_TONE = "语言口语化、符合角色语气，适合字幕阅读，简洁不啰嗦。"
