@@ -56,27 +56,6 @@ function fmtSize(bytes) {
   return (bytes / 1024).toFixed(0) + ' KB'
 }
 
-// -------------------------------------------------------- drag & drop
-// browsers hide the local path of dropped files, so we locate the file
-// server-side by exact name + size (no copying)
-async function onDrop(e) {
-  const f = e.dataTransfer?.files?.[0]
-  if (!f) return
-  try {
-    const r = await api.locate(f.name, f.size)
-    if (r.found) {
-      form.video_path = r.path
-      ElMessage.success('已定位: ' + r.path)
-    } else {
-      ElMessage.warning(
-        '未能自动定位该文件（浏览器不提供本地路径）。请先用「浏览」打开过该文件所在的目录，再拖入即可识别；或直接用浏览按钮选择。',
-      )
-    }
-  } catch (err) {
-    ElMessage.error(err.message)
-  }
-}
-
 // ---------------------------------------------------------------- job
 const job = ref(null) // { id, stage, progress, message }
 const logs = ref([])
@@ -152,21 +131,11 @@ onBeforeUnmount(() => eventSource?.close())
   <el-card shadow="never">
     <el-form :model="form" label-width="110px">
       <el-form-item label="视频文件" required>
-        <div style="width: 100%">
-          <el-input v-model="form.video_path" placeholder="视频文件的完整路径">
-            <template #append>
-              <el-button @click="openBrowser()">浏览…</el-button>
-            </template>
-          </el-input>
-          <div
-            class="dropzone"
-            @dragover.prevent
-            @dragenter.prevent
-            @drop.prevent="onDrop"
-          >
-            ⬇ 或将视频文件拖拽到此处（自动定位路径，不复制文件）
-          </div>
-        </div>
+        <el-input v-model="form.video_path" placeholder="视频文件的完整路径">
+          <template #append>
+            <el-button @click="openBrowser()">浏览…</el-button>
+          </template>
+        </el-input>
       </el-form-item>
       <el-form-item label="音频语言">
         <el-select v-model="form.source_language" style="width: 200px">
@@ -252,20 +221,6 @@ onBeforeUnmount(() => eventSource?.close())
   margin-left: 12px;
   color: #909399;
   font-size: 12px;
-}
-.dropzone {
-  margin-top: 8px;
-  padding: 14px;
-  border: 2px dashed #c0c4cc;
-  border-radius: 6px;
-  text-align: center;
-  color: #909399;
-  font-size: 13px;
-  transition: border-color 0.2s;
-}
-.dropzone:hover {
-  border-color: #409eff;
-  color: #409eff;
 }
 .progress-card {
   margin-top: 16px;

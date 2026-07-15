@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import string
 import sys
-from collections import deque
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -32,7 +31,6 @@ def create_job(req: JobRequest) -> JobStatus:
         job = manager.create(req)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _remember_dir(Path(req.video_path).parent)
     return job.status
 
 
@@ -216,47 +214,6 @@ def asr_cuda_status():
         return {"available": False, "device_count": 0, "error": str(exc)}
 
 
-# ------------------------------------------------------------ file locate
-
-# directories worth checking when locating a drag-dropped file: browsers
-# never reveal local paths, so we match by exact name + size instead
-_recent_dirs: "deque[str]" = deque(maxlen=15)
-
-
-def _remember_dir(path: Path) -> None:
-    s = str(path)
-    if s in _recent_dirs:
-        _recent_dirs.remove(s)
-    _recent_dirs.appendleft(s)
-
-
-@router.post("/fs/locate")
-def fs_locate(body: dict):
-    """Find the local path of a dropped file by exact name + size match."""
-    name = Path(str(body.get("name", ""))).name
-    size = int(body.get("size") or 0)
-    if not name:
-        raise HTTPException(status_code=400, detail="缺少文件名")
-    home = Path.home()
-    candidates = [Path(d) for d in _recent_dirs] + [
-        home / "Desktop", home / "Downloads", home / "Videos",
-        home / "Movies", home,
-    ]
-    seen = set()
-    for d in candidates:
-        key = str(d)
-        if key in seen or not d.is_dir():
-            continue
-        seen.add(key)
-        p = d / name
-        try:
-            if p.is_file() and (size == 0 or p.stat().st_size == size):
-                return {"found": True, "path": str(p)}
-        except OSError:
-            continue
-    return {"found": False}
-
-
 # ------------------------------------------------------------ file browse
 
 
@@ -275,7 +232,6 @@ def fs_browse(path: str = ""):
     p = Path(path)
     if not p.is_dir():
         raise HTTPException(status_code=400, detail=f"不是有效目录: {path}")
-    _remember_dir(p)
 
     dirs, files = [], []
     try:
