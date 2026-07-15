@@ -57,40 +57,24 @@ function fmtSize(bytes) {
 }
 
 // -------------------------------------------------------- drag & drop
-const uploading = ref(null) // { name, progress }
-
-function onDrop(e) {
+// browsers hide the local path of dropped files, so we locate the file
+// server-side by exact name + size (no copying)
+async function onDrop(e) {
   const f = e.dataTransfer?.files?.[0]
   if (!f) return
-  uploadFile(f)
-}
-
-function uploadFile(f) {
-  const fd = new FormData()
-  fd.append('file', f)
-  const xhr = new XMLHttpRequest()
-  xhr.open('POST', '/api/upload')
-  uploading.value = { name: f.name, progress: 0 }
-  xhr.upload.onprogress = (ev) => {
-    if (ev.lengthComputable && uploading.value)
-      uploading.value.progress = Math.round((ev.loaded / ev.total) * 100)
-  }
-  xhr.onload = () => {
-    uploading.value = null
-    if (xhr.status === 200) {
-      form.video_path = JSON.parse(xhr.responseText).path
-      ElMessage.success('已添加: ' + f.name)
+  try {
+    const r = await api.locate(f.name, f.size)
+    if (r.found) {
+      form.video_path = r.path
+      ElMessage.success('已定位: ' + r.path)
     } else {
-      let msg = xhr.statusText
-      try { msg = JSON.parse(xhr.responseText).detail || msg } catch { /* keep */ }
-      ElMessage.error('添加失败: ' + msg)
+      ElMessage.warning(
+        '未能自动定位该文件（浏览器不提供本地路径）。请先用「浏览」打开过该文件所在的目录，再拖入即可识别；或直接用浏览按钮选择。',
+      )
     }
+  } catch (err) {
+    ElMessage.error(err.message)
   }
-  xhr.onerror = () => {
-    uploading.value = null
-    ElMessage.error('上传中断，请重试或使用「浏览」按钮')
-  }
-  xhr.send(fd)
 }
 
 // ---------------------------------------------------------------- job
@@ -144,7 +128,11 @@ function listen(id) {
     }
     if (['done', 'failed', 'cancelled'].includes(ev.stage)) {
       eventSource.close()
-      if (ev.stage === 'done') ElMessage.success('字幕生成完成！')
+      if (ev.stage === 'done') {
+        ElMessage.success('字幕生成完成！')
+        // SSE events carry no srt fields; fetch the final status once
+        api.getJob(job.value.id).then((s) => (job.value = { ...job.value, ...s })).catch(() => {})
+      }
       if (ev.stage === 'failed') ElMessage.error(ev.message)
     }
   }
@@ -176,11 +164,7 @@ onBeforeUnmount(() => eventSource?.close())
             @dragenter.prevent
             @drop.prevent="onDrop"
           >
-            <template v-if="uploading">
-              正在添加 {{ uploading.name }}…
-              <el-progress :percentage="uploading.progress" style="margin-top: 4px" />
-            </template>
-            <template v-else>⬇ 或将视频文件拖拽到此处</template>
+            ⬇ 或将视频文件拖拽到此处（自动定位路径，不复制文件）
           </div>
         </div>
       </el-form-item>
@@ -231,15 +215,19 @@ onBeforeUnmount(() => eventSource?.close())
     <div ref="logBox" class="logs">
       <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
     </div>
-    <el-button
-      v-if="job.stage === 'done'"
-      type="success"
-      tag="a"
-      :href="api.resultUrl(job.id)"
-      download
-    >
-      下载 SRT 字幕
-    </el-button>
+    <template v-if="job.stage === 'done' && job.srt_filename">
+      <el-alert v-if="job.srt_in_place" type="success" :closable="false">
+        字幕已保存到视频所在目录：<code>{{ job.srt_filename }}</code>
+      </el-alert>
+      <template v-else>
+        <el-alert type="warning" :closable="false" style="margin-bottom: 8px">
+          视频目录不可写，字幕暂存在工作目录，请下载保存
+        </el-alert>
+        <el-button type="success" tag="a" :href="api.resultUrl(job.id)" download>
+          下载 SRT 字幕
+        </el-button>
+      </template>
+    </template>
   </el-card>
 
   <el-dialog v-model="browserVisible" title="选择视频文件" width="620px">

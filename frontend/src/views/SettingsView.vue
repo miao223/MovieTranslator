@@ -211,6 +211,24 @@ async function testLLM() {
           <el-switch v-model="settings.asr.vad_filter" />
           <span class="hint">过滤无语音片段，减少幻听字幕</span>
         </el-form-item>
+        <template v-if="settings.asr.vad_filter">
+          <el-form-item label="VAD 灵敏度阈值">
+            <el-slider v-model="settings.asr.vad_threshold" :min="0.05" :max="0.95" :step="0.05" show-input style="width: 400px" />
+            <span class="hint">默认 0.5；有台词被漏识别时调低（如 0.35），误把噪音当语音时调高</span>
+          </el-form-item>
+          <el-form-item label="语音前后填充">
+            <el-input-number v-model="settings.asr.vad_speech_pad_ms" :min="0" :max="3000" :step="100" />
+            <span class="hint">毫秒，默认 400；句首/句尾被切掉时增大（如 800）</span>
+          </el-form-item>
+          <el-form-item label="最短语音时长">
+            <el-input-number v-model="settings.asr.vad_min_speech_ms" :min="0" :max="5000" :step="50" />
+            <span class="hint">毫秒，默认 250；短促的感叹词被丢弃时调低</span>
+          </el-form-item>
+          <el-form-item label="最短静默时长">
+            <el-input-number v-model="settings.asr.vad_min_silence_ms" :min="100" :max="10000" :step="100" />
+            <span class="hint">毫秒，默认 2000；低于此时长的停顿不会切断语音段</span>
+          </el-form-item>
+        </template>
       </el-form>
       <div class="model-notes">
         <p><strong>📌 模型选择说明</strong>（列表右侧为下载体积，模型仅在首次选用时下载一次）</p>

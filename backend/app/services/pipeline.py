@@ -280,11 +280,24 @@ class JobManager:
         # 4. compose SRT ----------------------------------------------------
         job.publish("composing", 95, message="生成 SRT…")
         srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
-        stem = Path(req.video_path).stem
-        job.srt_path = workdir / f"{stem}.srt"
-        job.srt_path.write_text(srt_text, encoding="utf-8")
-        job.status.srt_filename = job.srt_path.name
-        job.publish("done", 100, message=f"完成：{job.srt_path.name}")
+        video = Path(req.video_path)
+        target = video.parent / f"{video.stem}.srt"
+        try:
+            target.write_text(srt_text, encoding="utf-8")
+            job.srt_path = target
+            job.status.srt_in_place = True
+        except OSError as exc:
+            # video dir not writable (read-only share etc.): keep it in the
+            # work dir and let the UI offer a download instead
+            job.srt_path = workdir / f"{video.stem}.srt"
+            job.srt_path.write_text(srt_text, encoding="utf-8")
+            job.status.srt_in_place = False
+            job.publish(
+                "composing", 99,
+                log=f"⚠ 无法写入视频所在目录（{exc}），字幕已保存到工作目录，可用下载按钮获取",
+            )
+        job.status.srt_filename = str(job.srt_path)
+        job.publish("done", 100, message=f"完成，字幕已保存: {job.srt_path}")
 
 
 manager = JobManager()

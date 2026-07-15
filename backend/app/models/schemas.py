@@ -36,6 +36,12 @@ class ASRSettings(BaseModel):
     compute_type: str = "int8"
     beam_size: int = Field(5, ge=1, le=10)
     vad_filter: bool = True
+    # silero-VAD tuning (defaults mirror faster-whisper); lower threshold /
+    # higher padding help when quiet speech gets skipped
+    vad_threshold: float = Field(0.5, ge=0.05, le=0.95)
+    vad_min_speech_ms: int = Field(250, ge=0, le=5000)
+    vad_min_silence_ms: int = Field(2000, ge=100, le=10000)
+    vad_speech_pad_ms: int = Field(400, ge=0, le=3000)
 
 
 class SubtitleSettings(BaseModel):
@@ -118,7 +124,8 @@ class JobStatus(BaseModel):
     message: str = ""
     error: Optional[str] = None
     video_path: str = ""
-    srt_filename: str = ""
+    srt_filename: str = ""  # full path of the generated SRT
+    srt_in_place: bool = False  # True when saved next to the video
 
 
 class ProgressEvent(BaseModel):

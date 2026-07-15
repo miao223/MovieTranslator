@@ -227,11 +227,20 @@ def transcribe(
     # CUDA libraries load lazily on the first encode (inside transcribe /
     # segment iteration), so the whole decode path needs the friendly wrap
     try:
+        vad_parameters = None
+        if settings.vad_filter:
+            vad_parameters = dict(
+                threshold=settings.vad_threshold,
+                min_speech_duration_ms=settings.vad_min_speech_ms,
+                min_silence_duration_ms=settings.vad_min_silence_ms,
+                speech_pad_ms=settings.vad_speech_pad_ms,
+            )
         segments_iter, info = model.transcribe(
             wav_path,
             language=language,
             beam_size=settings.beam_size,
             vad_filter=settings.vad_filter,
+            vad_parameters=vad_parameters,
         )
         total = info.duration or 0.0
         if log:
