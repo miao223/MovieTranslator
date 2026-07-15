@@ -13,6 +13,22 @@ const download = ref({ status: 'idle', progress: 0 })
 let pollTimer = null
 
 // size = download size in MB (from the HuggingFace repos, model.bin + config)
+// VAD presets: [threshold, speech_pad_ms, min_speech_ms, min_silence_ms]
+const VAD_PRESETS = [
+  { name: '宽松·防漏（默认）', desc: '适合大多数电影：阈值 0.35 对偏小声的对白也能捕捉', v: [0.35, 400, 250, 2000] },
+  { name: '标准', desc: 'faster-whisper 原始默认值（阈值 0.5），语音清晰、录音质量好的片源', v: [0.5, 400, 250, 2000] },
+  { name: '极宽松·气声对白', desc: '悄悄话/气声仍被漏掉时用（阈值 0.25 + 加大填充）；嘈杂片源可能误检', v: [0.25, 800, 100, 1500] },
+  { name: '严格·防噪', desc: '配乐音效嘈杂、出现幻听字幕时用（阈值 0.6）；小声对白可能被丢弃', v: [0.6, 300, 300, 2500] },
+]
+
+function applyVadPreset(p) {
+  settings.value.asr.vad_threshold = p.v[0]
+  settings.value.asr.vad_speech_pad_ms = p.v[1]
+  settings.value.asr.vad_min_speech_ms = p.v[2]
+  settings.value.asr.vad_min_silence_ms = p.v[3]
+  ElMessage.info(`已应用预设「${p.name}」，记得保存`)
+}
+
 const WHISPER_MODELS = [
   { value: 'tiny', size: 75 },
   { value: 'base', size: 141 },
@@ -212,9 +228,23 @@ async function testLLM() {
           <span class="hint">过滤无语音片段，减少幻听字幕</span>
         </el-form-item>
         <template v-if="settings.asr.vad_filter">
+          <el-form-item label="VAD 预设">
+            <div>
+              <el-button
+                v-for="p in VAD_PRESETS" :key="p.name"
+                size="small" style="margin: 0 8px 4px 0"
+                @click="applyVadPreset(p)"
+              >
+                {{ p.name }}
+              </el-button>
+              <div v-for="p in VAD_PRESETS" :key="'d-' + p.name" class="hint" style="margin: 0; display: block">
+                <strong>{{ p.name }}</strong>：{{ p.desc }}
+              </div>
+            </div>
+          </el-form-item>
           <el-form-item label="VAD 灵敏度阈值">
             <el-slider v-model="settings.asr.vad_threshold" :min="0.05" :max="0.95" :step="0.05" show-input style="width: 400px" />
-            <span class="hint">默认 0.5；有台词被漏识别时调低（如 0.35），误把噪音当语音时调高</span>
+            <span class="hint">默认 0.35；有台词被漏识别时调低，误把噪音当语音时调高</span>
           </el-form-item>
           <el-form-item label="语音前后填充">
             <el-input-number v-model="settings.asr.vad_speech_pad_ms" :min="0" :max="3000" :step="100" />

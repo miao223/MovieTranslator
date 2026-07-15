@@ -216,17 +216,15 @@ onBeforeUnmount(() => eventSource?.close())
       <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
     </div>
     <template v-if="job.stage === 'done' && job.srt_filename">
-      <el-alert v-if="job.srt_in_place" type="success" :closable="false">
+      <el-alert v-if="job.srt_in_place" type="success" :closable="false" style="margin-bottom: 8px">
         字幕已保存到视频所在目录：<code>{{ job.srt_filename }}</code>
       </el-alert>
-      <template v-else>
-        <el-alert type="warning" :closable="false" style="margin-bottom: 8px">
-          视频目录不可写，字幕暂存在工作目录，请下载保存
-        </el-alert>
-        <el-button type="success" tag="a" :href="api.resultUrl(job.id)" download>
-          下载 SRT 字幕
-        </el-button>
-      </template>
+      <el-alert v-else type="warning" :closable="false" style="margin-bottom: 8px">
+        视频目录不可写，字幕暂存在工作目录，请下载保存
+      </el-alert>
+      <el-button type="success" tag="a" :href="api.resultUrl(job.id)" download>
+        下载 SRT 字幕
+      </el-button>
     </template>
   </el-card>
 
