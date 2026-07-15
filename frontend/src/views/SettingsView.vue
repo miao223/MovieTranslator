@@ -223,6 +223,10 @@ async function testLLM() {
         <el-form-item label="Beam Size">
           <el-input-number v-model="settings.asr.beam_size" :min="1" :max="10" />
         </el-form-item>
+        <el-form-item label="词级时间戳">
+          <el-switch v-model="settings.asr.word_timestamps" />
+          <span class="hint">按每个词的真实时间切分字幕行，时间轴更准、可杜绝碎行（推荐开启，速度略降 10-20%）</span>
+        </el-form-item>
         <el-form-item label="VAD 语音检测">
           <el-switch v-model="settings.asr.vad_filter" />
           <span class="hint">过滤无语音片段，减少幻听字幕</span>

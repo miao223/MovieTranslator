@@ -35,6 +35,9 @@ class ASRSettings(BaseModel):
     device: Literal["cpu", "cuda", "auto"] = "cpu"
     compute_type: str = "int8"
     beam_size: int = Field(5, ge=1, le=10)
+    # per-word timestamps: real time boundaries for line segmentation,
+    # eliminates stretched/fabricated cue timings (~10-20% slower)
+    word_timestamps: bool = True
     vad_filter: bool = True
     # silero-VAD tuning; threshold defaults below faster-whisper's 0.5
     # because movie dialog is often quiet and gets skipped at 0.5

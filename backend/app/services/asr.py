@@ -6,13 +6,26 @@ import contextlib
 import os
 import sys
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 from app.models.schemas import ASRSettings, NetworkSettings
 
-# (start, end, text)
-RawSegment = Tuple[float, float, str]
+
+@dataclass
+class Word:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
+class Segment:
+    start: float
+    end: float
+    text: str
+    words: List[Word] = field(default_factory=list)  # empty without word_timestamps
 
 ProgressFn = Callable[[float], None]  # 0..1
 LogFn = Callable[[str], None]
@@ -216,7 +229,7 @@ def transcribe(
     log: Optional[LogFn] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     network: Optional[NetworkSettings] = None,
-) -> Tuple[List[RawSegment], str]:
+) -> tuple[List[Segment], str]:
     """Transcribe *wav_path*; returns (segments, detected_language).
 
     *language* is a whisper language code, or None for auto-detection.
@@ -239,6 +252,7 @@ def transcribe(
             wav_path,
             language=language,
             beam_size=settings.beam_size,
+            word_timestamps=settings.word_timestamps,
             vad_filter=settings.vad_filter,
             vad_parameters=vad_parameters,
         )
@@ -247,14 +261,18 @@ def transcribe(
             lang = language or f"{info.language} (置信度 {info.language_probability:.0%})"
             log(f"检测语言: {lang}，音频时长 {total:.0f}s")
 
-        results: List[RawSegment] = []
+        results: List[Segment] = []
         for seg in segments_iter:
             if should_cancel and should_cancel():
                 raise InterruptedError("cancelled")
             text = seg.text.strip()
             if not text:
                 continue
-            results.append((float(seg.start), float(seg.end), text))
+            words = [
+                Word(float(w.start), float(w.end), w.word)
+                for w in (seg.words or [])
+            ]
+            results.append(Segment(float(seg.start), float(seg.end), text, words))
             if progress and total:
                 progress(min(seg.end / total, 1.0))
             if log:
