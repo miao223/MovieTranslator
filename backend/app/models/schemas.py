@@ -97,6 +97,17 @@ class JobRequest(BaseModel):
     output_mode: Literal["bilingual", "translation_only"] = "bilingual"
 
 
+class BatchRequest(BaseModel):
+    directory: str
+    recursive: bool = True
+    skip_existing_srt: bool = True
+    # per-file task params, shared by every video in the batch
+    source_language: str = "auto"
+    target_language: str = "简体中文"
+    synopsis: str = ""  # shared synopsis is useful for TV series batches
+    output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+
+
 JobStage = Literal[
     "pending",
     "extracting",
@@ -133,3 +144,17 @@ class ProgressEvent(BaseModel):
     progress: float
     message: str = ""
     log: str = ""
+
+
+class BatchStatus(BaseModel):
+    id: str
+    directory: str
+    total: int
+    pending: int = 0
+    running: int = 0
+    done: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    current_job_id: str = ""  # the job currently executing, for SSE attach
+    jobs: list[JobStatus] = []
+    skipped: list[str] = []

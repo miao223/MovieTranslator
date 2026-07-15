@@ -11,15 +11,19 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core import config
-from app.models.schemas import AppSettings, JobRequest, JobStatus, LLMSettings
+from app.core.media import VIDEO_EXTS, scan_videos
+from app.models.schemas import (
+    AppSettings,
+    BatchRequest,
+    BatchStatus,
+    JobRequest,
+    JobStatus,
+    LLMSettings,
+)
+from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
 router = APIRouter(prefix="/api")
-
-VIDEO_EXTS = {
-    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
-    ".ts", ".m2ts", ".mpg", ".mpeg", ".rmvb", ".m4v",
-}
 
 
 # ------------------------------------------------------------------- jobs
@@ -79,6 +83,48 @@ def cancel_job(job_id: str):
         manager.cancel(job_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="job not found")
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ batch
+
+
+@router.get("/batch/scan")
+def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True):
+    """Preview which videos a batch would translate."""
+    try:
+        videos, skipped = scan_videos(path, recursive, skip_existing)
+    except NotADirectoryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "videos": [str(v) for v in videos],
+        "skipped": [str(s) for s in skipped],
+        "total": len(videos),
+    }
+
+
+@router.post("/batch", response_model=BatchStatus)
+def create_batch(req: BatchRequest) -> BatchStatus:
+    try:
+        return batch_manager.create(req)
+    except (NotADirectoryError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/batch/{batch_id}", response_model=BatchStatus)
+def get_batch(batch_id: str) -> BatchStatus:
+    try:
+        return batch_manager.status(batch_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="batch not found")
+
+
+@router.post("/batch/{batch_id}/cancel")
+def cancel_batch(batch_id: str):
+    try:
+        batch_manager.cancel(batch_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="batch not found")
     return {"ok": True}
 
 

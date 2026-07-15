@@ -18,6 +18,12 @@ export const api = {
   createJob: (payload) =>
     request('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
   getJob: (id) => request(`/api/jobs/${id}`),
+  batchScan: (path, recursive, skipExisting) =>
+    request(`/api/batch/scan?path=${encodeURIComponent(path)}&recursive=${recursive}&skip_existing=${skipExisting}`),
+  createBatch: (payload) =>
+    request('/api/batch', { method: 'POST', body: JSON.stringify(payload) }),
+  getBatch: (id) => request(`/api/batch/${id}`),
+  cancelBatch: (id) => request(`/api/batch/${id}/cancel`, { method: 'POST' }),
   cancelJob: (id) => request(`/api/jobs/${id}/cancel`, { method: 'POST' }),
   getSettings: () => request('/api/settings'),
   saveSettings: (settings) =>

@@ -17,6 +17,8 @@ const SOURCE_LANGS = [
 
 const TARGET_LANGS = ['简体中文', '繁體中文', 'English', '日本語', '한국어', 'Français', 'Deutsch']
 
+const mode = ref('single') // 'single' | 'batch'
+
 const form = reactive({
   video_path: '',
   source_language: 'auto',
@@ -25,13 +27,27 @@ const form = reactive({
   output_mode: 'bilingual',
 })
 
+const batchForm = reactive({
+  directory: '',
+  recursive: true,
+  skip_existing_srt: true,
+})
+
 // ---------------------------------------------------------- file browser
 const browserVisible = ref(false)
 const browser = reactive({ path: '', parent: null, dirs: [], files: [] })
 const addressInput = ref('')
 const quickAccess = ref([])
+const browsePick = ref('file') // 'file' | 'dir' — what the dialog selects
 
-async function openBrowser(path = '') {
+function pickThisDir() {
+  if (!browser.path) return
+  batchForm.directory = browser.path
+  browserVisible.value = false
+}
+
+async function openBrowser(path = '', pick = null) {
+  if (pick) browsePick.value = pick
   try {
     const data = await api.browse(path)
     Object.assign(browser, data)
@@ -54,10 +70,12 @@ async function jumpToAddress() {
     const r = await api.resolvePath(raw)
     if (r.type === 'dir') {
       openBrowser(r.path)
-    } else if (r.type === 'file' && r.is_video) {
+    } else if (r.type === 'file' && r.is_video && browsePick.value === 'file') {
       form.video_path = r.path
       browserVisible.value = false
       ElMessage.success('已选择: ' + r.path)
+    } else if (r.type === 'file' && browsePick.value === 'dir') {
+      ElMessage.warning('当前在选择目录，请粘贴文件夹路径或点「选择此目录」')
     } else if (r.type === 'file') {
       ElMessage.warning('该文件不是支持的视频格式')
     } else {
@@ -75,6 +93,7 @@ function joinPath(dir, name) {
 }
 
 function pickFile(name) {
+  if (browsePick.value === 'dir') return
   form.video_path = joinPath(browser.path, name)
   browserVisible.value = false
 }
@@ -153,19 +172,139 @@ async function cancel() {
   if (job.value) await api.cancelJob(job.value.id)
 }
 
-onBeforeUnmount(() => eventSource?.close())
+// ---------------------------------------------------------------- batch
+const batch = ref(null)
+const scanResult = ref(null)
+const confirmVisible = ref(false)
+let batchTimer = null
+let currentSseJob = ''
+
+const batchRunning = () =>
+  batch.value && batch.value.pending + batch.value.running > 0
+
+async function startBatchScan() {
+  if (!batchForm.directory) {
+    ElMessage.warning('请先选择目录')
+    return
+  }
+  try {
+    const r = await api.batchScan(
+      batchForm.directory, batchForm.recursive, batchForm.skip_existing_srt,
+    )
+    if (!r.total) {
+      ElMessage.warning(
+        '目录中没有需要翻译的视频'
+        + (r.skipped.length ? `（${r.skipped.length} 个已有字幕，被跳过）` : ''),
+      )
+      return
+    }
+    scanResult.value = r
+    confirmVisible.value = true
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+async function startBatch() {
+  confirmVisible.value = false
+  try {
+    batch.value = await api.createBatch({
+      ...batchForm,
+      source_language: form.source_language,
+      target_language: form.target_language,
+      synopsis: form.synopsis,
+      output_mode: form.output_mode,
+    })
+    job.value = null
+    logs.value = []
+    currentSseJob = ''
+    pollBatch()
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+function pollBatch() {
+  clearInterval(batchTimer)
+  batchTimer = setInterval(async () => {
+    try {
+      const b = await api.getBatch(batch.value.id)
+      batch.value = b
+      // re-attach the log stream whenever the running job changes
+      if (b.current_job_id && b.current_job_id !== currentSseJob) {
+        currentSseJob = b.current_job_id
+        attachBatchLog(b.current_job_id)
+      }
+      if (b.pending + b.running === 0) {
+        clearInterval(batchTimer)
+        eventSource?.close()
+        ElMessage.success(`批量完成：成功 ${b.done}，失败 ${b.failed}，取消 ${b.cancelled}`)
+      }
+    } catch { /* transient poll error */ }
+  }, 2000)
+}
+
+function attachBatchLog(id) {
+  eventSource?.close()
+  eventSource = new EventSource(api.eventsUrl(id))
+  eventSource.onmessage = (msg) => {
+    const ev = JSON.parse(msg.data)
+    if (ev.log) {
+      const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      logs.value.push(`[${ts}] ${ev.log}`)
+      if (logs.value.length > 500) logs.value.splice(0, logs.value.length - 500)
+      requestAnimationFrame(() => {
+        if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight
+      })
+    }
+  }
+}
+
+async function cancelBatch() {
+  if (batch.value) await api.cancelBatch(batch.value.id)
+}
+
+function baseName(p) {
+  return p.split(/[\\/]/).pop()
+}
+
+onBeforeUnmount(() => {
+  eventSource?.close()
+  clearInterval(batchTimer)
+})
 </script>
 
 <template>
   <el-card shadow="never">
     <el-form :model="form" label-width="110px">
-      <el-form-item label="视频文件" required>
+      <el-form-item label="翻译对象">
+        <el-radio-group v-model="mode">
+          <el-radio value="single">单个文件</el-radio>
+          <el-radio value="batch">批量目录</el-radio>
+        </el-radio-group>
+      </el-form-item>
+      <el-form-item v-if="mode === 'single'" label="视频文件" required>
         <el-input v-model="form.video_path" placeholder="视频文件的完整路径">
           <template #append>
-            <el-button @click="openBrowser()">浏览…</el-button>
+            <el-button @click="openBrowser('', 'file')">浏览…</el-button>
           </template>
         </el-input>
       </el-form-item>
+      <template v-else>
+        <el-form-item label="视频目录" required>
+          <el-input v-model="batchForm.directory" placeholder="将翻译该目录内的所有视频文件">
+            <template #append>
+              <el-button @click="openBrowser('', 'dir')">浏览…</el-button>
+            </template>
+          </el-input>
+        </el-form-item>
+        <el-form-item label="批量选项">
+          <el-switch v-model="batchForm.recursive" />
+          <span class="hint" style="margin-right: 24px">包含子目录</span>
+          <el-switch v-model="batchForm.skip_existing_srt" />
+          <span class="hint">跳过已有同名字幕的视频</span>
+        </el-form-item>
+      </template>
       <el-form-item label="音频语言">
         <el-select v-model="form.source_language" style="width: 200px">
           <el-option v-for="l in SOURCE_LANGS" :key="l.value" :value="l.value" :label="l.label" />
@@ -192,10 +331,53 @@ onBeforeUnmount(() => eventSource?.close())
         </el-radio-group>
       </el-form-item>
       <el-form-item>
-        <el-button type="primary" :disabled="running()" @click="start">开始翻译</el-button>
+        <el-button
+          type="primary"
+          :disabled="running() || batchRunning()"
+          @click="mode === 'single' ? start() : startBatchScan()"
+        >
+          开始翻译
+        </el-button>
         <el-button v-if="running()" type="danger" plain @click="cancel">取消任务</el-button>
+        <el-button v-if="batchRunning()" type="danger" plain @click="cancelBatch">取消批量</el-button>
       </el-form-item>
     </el-form>
+  </el-card>
+
+  <el-card v-if="batch" shadow="never" class="progress-card">
+    <div class="progress-row">
+      <el-tag :type="batchRunning() ? 'primary' : batch.failed ? 'warning' : 'success'">
+        批量 {{ batch.done + batch.failed + batch.cancelled }}/{{ batch.total }}
+      </el-tag>
+      <el-progress
+        :percentage="Math.round(((batch.done + batch.failed + batch.cancelled) / batch.total) * 100)"
+        :status="!batchRunning() ? (batch.failed ? 'warning' : 'success') : undefined"
+        style="flex: 1"
+      />
+    </div>
+    <p class="message">
+      成功 {{ batch.done }} · 失败 {{ batch.failed }} · 取消 {{ batch.cancelled }}
+      · 排队 {{ batch.pending }}
+      <span v-if="batch.skipped.length"> · 跳过 {{ batch.skipped.length }}（已有字幕）</span>
+    </p>
+    <div class="batch-files">
+      <div v-for="j in batch.jobs" :key="j.id" class="batch-file">
+        <span class="name">{{ baseName(j.video_path) }}</span>
+        <el-progress
+          v-if="!['done', 'failed', 'cancelled', 'pending'].includes(j.stage)"
+          :percentage="Math.round(j.progress)" style="width: 140px"
+        />
+        <el-tag
+          size="small"
+          :type="j.stage === 'done' ? 'success' : j.stage === 'failed' ? 'danger' : j.stage === 'cancelled' ? 'info' : j.stage === 'pending' ? 'info' : 'primary'"
+        >
+          {{ STAGE_LABELS[j.stage] || j.stage }}
+        </el-tag>
+      </div>
+    </div>
+    <div ref="logBox" class="logs">
+      <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
+    </div>
   </el-card>
 
   <el-card v-if="job" shadow="never" class="progress-card">
@@ -226,7 +408,24 @@ onBeforeUnmount(() => eventSource?.close())
     </template>
   </el-card>
 
-  <el-dialog v-model="browserVisible" title="选择视频文件" width="680px">
+  <el-dialog v-model="confirmVisible" title="确认批量翻译" width="560px">
+    <p v-if="scanResult">
+      共找到 <strong>{{ scanResult.total }}</strong> 个待翻译视频<span v-if="scanResult.skipped.length">，另有 {{ scanResult.skipped.length }} 个已有字幕将被跳过</span>：
+    </p>
+    <div v-if="scanResult" class="scan-list">
+      <div v-for="v in scanResult.videos" :key="v" class="scan-item">🎬 {{ baseName(v) }}</div>
+    </div>
+    <template #footer>
+      <el-button @click="confirmVisible = false">取消</el-button>
+      <el-button type="primary" @click="startBatch">开始批量翻译</el-button>
+    </template>
+  </el-dialog>
+
+  <el-dialog
+    v-model="browserVisible"
+    :title="browsePick === 'dir' ? '选择目录' : '选择视频文件'"
+    width="680px"
+  >
     <div class="browser-path">
       <el-button size="small" :disabled="browser.parent === null" @click="openBrowser(browser.parent)">
         ↑ 上级
@@ -259,6 +458,12 @@ onBeforeUnmount(() => eventSource?.close())
       </div>
       <el-empty v-if="!browser.dirs.length && !browser.files.length" description="此目录没有子目录或视频文件" :image-size="60" />
     </div>
+    <template v-if="browsePick === 'dir'" #footer>
+      <el-button @click="browserVisible = false">取消</el-button>
+      <el-button type="primary" :disabled="!browser.path" @click="pickThisDir">
+        ✓ 选择此目录
+      </el-button>
+    </template>
   </el-dialog>
 </template>
 
@@ -301,6 +506,36 @@ onBeforeUnmount(() => eventSource?.close())
 }
 .quick-access {
   margin-bottom: 8px;
+}
+.batch-files {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+.batch-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  border-bottom: 1px solid #f5f7fa;
+  font-size: 13px;
+}
+.batch-file .name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scan-list {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 13px;
+  line-height: 1.9;
 }
 .quick-item {
   margin: 0 6px 4px 0;

@@ -121,6 +121,8 @@ class JobManager:
         job.publish("pending", 0, message="排队中…")
         with _run_slot:
             try:
+                if job.cancel_event.is_set():  # cancelled while queued
+                    raise InterruptedError
                 self._execute(job, req, workdir)
             except InterruptedError:
                 job.publish("cancelled", job.status.progress, message="任务已取消")
