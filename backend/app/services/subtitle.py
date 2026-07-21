@@ -54,6 +54,42 @@ def _ass_escape(text: str) -> str:
     return text.replace("{", "（").replace("}", "）")
 
 
+def wrap_display_text(text: str, max_chars: int) -> List[str]:
+    """Break *text* into at most two display lines of ~max_chars each.
+
+    A cue holds a whole sentence now (see segmenter), which can exceed one
+    display line. Wrapping here rather than leaving it to the player keeps
+    the result identical across VLC / mpv / PotPlayer. Text that cannot be
+    split sensibly is returned as-is — never hard-cut mid-word.
+    """
+    text = text.strip()
+    if len(text) <= max_chars or max_chars <= 0:
+        return [text]
+
+    # prefer breaking near the middle so the two lines look balanced
+    target = len(text) / 2
+    best: int | None = None       # closest boundary that also fits max_chars
+    fallback: int | None = None   # closest boundary, fitting or not
+    for i, ch in enumerate(text):
+        if ch not in " ，。、！？；：,.!?;:" or not 0 < i < len(text) - 1:
+            continue
+        # cut after the character, except for spaces which are dropped
+        cut = i if ch == " " else i + 1
+        if not 0 < cut < len(text):
+            continue
+        if fallback is None or abs(cut - target) < abs(fallback - target):
+            fallback = cut
+        if max(len(text[:cut].strip()), len(text[cut:].strip())) > max_chars:
+            continue  # still too wide, but keep it as a fallback candidate
+        if best is None or abs(cut - target) < abs(best - target):
+            best = cut
+    # two overlong lines still beat one very long line
+    cut = best if best is not None else fallback
+    if cut is None:
+        return [text]
+    return [text[:cut].strip(), text[cut:].strip()]
+
+
 def build_ass(
     lines: List[SubtitleLine],
     settings: SubtitleSettings,
@@ -79,9 +115,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f"\\c{_ass_color(settings.original_color)}&}}"
     )
     events = []
+    wrap = settings.max_chars_per_line
     for line in lines:
-        translation = _ass_escape(line.translation.strip() or line.text)
-        original = _ass_escape(line.text)
+        # wrap first, escape after: _ass_escape only touches braces, so the
+        # \N separators inserted here survive untouched
+        translation = "\\N".join(
+            _ass_escape(part)
+            for part in wrap_display_text(line.translation.strip() or line.text, wrap)
+        )
+        original = "\\N".join(
+            _ass_escape(part) for part in wrap_display_text(line.text, wrap)
+        )
         if line.is_frame:
             text = "{\\an7}" + translation
         elif mode == "translation_only":
@@ -108,8 +152,12 @@ def build_srt(
     Lines with an empty translation fall back to the original text.
     """
     blocks: List[str] = []
+    wrap = settings.max_chars_per_line
     for n, line in enumerate(lines, start=1):
-        translation = line.translation.strip() or line.text
+        translation = "\n".join(
+            wrap_display_text(line.translation.strip() or line.text, wrap)
+        )
+        original = "\n".join(wrap_display_text(line.text, wrap))
         if line.is_frame:
             # on-screen text cue: top-left ({\an7} is honoured by VLC /
             # PotPlayer / mpv even in SRT), translation only
@@ -118,9 +166,9 @@ def build_srt(
             text = translation
         else:
             if settings.bilingual_layout == "translation_top":
-                text = f"{translation}\n{line.text}"
+                text = f"{translation}\n{original}"
             else:
-                text = f"{line.text}\n{translation}"
+                text = f"{original}\n{translation}"
         blocks.append(
             f"{n}\n{format_timestamp(line.start)} --> {format_timestamp(line.end)}\n{text}\n"
         )

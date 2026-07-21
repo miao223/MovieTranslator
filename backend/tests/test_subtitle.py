@@ -42,3 +42,64 @@ def test_translation_only_and_fallback():
     blocks = srt.strip().split("\n\n")
     assert blocks[0].splitlines()[2] == "你好。"
     assert blocks[1].splitlines()[2] == "General Kenobi!"
+
+
+# ------------------------------------------------------- display wrapping
+
+
+def test_wrap_returns_short_text_untouched():
+    from app.services.subtitle import wrap_display_text
+
+    assert wrap_display_text("Hello there.", 42) == ["Hello there."]
+
+
+def test_wrap_breaks_near_the_middle_at_a_word_boundary():
+    from app.services.subtitle import wrap_display_text
+
+    parts = wrap_display_text("Yeah, like that thought never entered my mind.", 30)
+    assert len(parts) == 2
+    assert all(len(p) <= 30 for p in parts)
+    assert " ".join(parts) == "Yeah, like that thought never entered my mind."
+
+
+def test_wrap_never_hard_cuts_an_unsplittable_string():
+    from app.services.subtitle import wrap_display_text
+
+    assert wrap_display_text("a" * 60, 20) == ["a" * 60]
+
+
+def test_wrap_at_most_two_lines():
+    from app.services.subtitle import wrap_display_text
+
+    long_text = " ".join(["word"] * 40)
+    assert len(wrap_display_text(long_text, 20)) <= 2
+
+
+def test_srt_wraps_both_languages():
+    from app.models.schemas import SubtitleLine, SubtitleSettings
+    from app.services.subtitle import build_srt
+
+    line = SubtitleLine(
+        index=1, start=0.0, end=3.0,
+        text="Yeah, like that thought never entered my mind.",
+        translation="是啊，好像我压根就没往那儿想过这件事情。",
+    )
+    out = build_srt([line], SubtitleSettings(max_chars_per_line=12))
+    body = out.split("\n", 2)[2]
+    assert len(body.strip().splitlines()) == 4  # 2 original + 2 translation
+
+
+def test_ass_wraps_with_backslash_n():
+    from app.models.schemas import SubtitleLine, SubtitleSettings
+    from app.services.subtitle import build_ass
+
+    line = SubtitleLine(
+        index=1, start=0.0, end=3.0,
+        text="Yeah, like that thought never entered my mind.",
+        translation="是啊，我压根没往那儿想。",
+    )
+    out = build_ass([line], SubtitleSettings(max_chars_per_line=24, style_enabled=True))
+    dialogue = [l for l in out.splitlines() if l.startswith("Dialogue:")][0]
+    # the original wraps into two balanced halves joined by an ASS line break
+    assert "thought\\Nnever" in dialogue
+    assert "{" not in line.text  # sanity: escaping untouched by the wrap

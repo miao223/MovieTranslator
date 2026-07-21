@@ -183,6 +183,7 @@ const STAGE_LABELS = {
   pending: '排队中',
   extracting: '提取音频',
   transcribing: '语音识别',
+  refining: '转写预处理',
   translating: 'AI 翻译',
   composing: '生成字幕',
   done: '完成',

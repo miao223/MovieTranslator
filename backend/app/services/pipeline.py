@@ -25,14 +25,15 @@ from app.models.schemas import (
     ProgressEvent,
     SubtitleLine,
 )
-from app.services import asr, audio, segmenter, subtitle
+from app.services import asr, audio, refine, segmenter, subtitle
 from app.services.translator import Translator
 
 # overall progress ranges per stage: (start%, end%)
 STAGE_RANGES = {
     "extracting": (0.0, 10.0),
     "transcribing": (10.0, 60.0),
-    "translating": (60.0, 95.0),
+    "refining": (60.0, 72.0),
+    "translating": (72.0, 95.0),
     "composing": (95.0, 100.0),
 }
 
@@ -379,8 +380,34 @@ class JobManager:
             message=f"识别完成，共 {len(lines)} 条字幕（语言: {detected}）",
         )
 
+        # 2c. preprocess the transcript ------------------------------------
+        # rejoin sentences the ASR cut mid-phrase, in the source language and
+        # with mechanical verification — a line holding only a fragment has
+        # no counterpart in the target language, and the translator fills it
+        # with the next line's content, shifting everything after it
+        if settings.prompts.refine_enabled:
+            job.publish("refining", 60, message="转写预处理中（断句整理 + 识别纠错）…")
+            lines = refine.refine_lines(
+                lines,
+                settings.llm,
+                settings.subtitle,
+                language_hint=detected or "",
+                log=lambda msg: job.publish("refining", job.status.progress, log=msg),
+                progress=lambda f: job.publish(
+                    "refining", 60 + 12 * min(max(f, 0.0), 1.0),
+                    message=f"转写预处理中… {min(max(f, 0.0), 1.0):.0%}",
+                ),
+                should_cancel=job.cancel_event.is_set,
+                network=settings.network,
+            )
+            (workdir / "transcript_refined.json").write_text(
+                json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            job.publish("refining", 72, message=f"预处理完成，共 {len(lines)} 条字幕")
+
         # 3. translate ----------------------------------------------------
-        job.publish("translating", 60, message="AI 翻译中（全局上下文）…")
+        job.publish("translating", 72, message="AI 翻译中（全局上下文）…")
 
         def tr_log(msg: str):
             job.publish("translating", job.status.progress, log=msg)
@@ -391,7 +418,7 @@ class JobManager:
             synopsis=req.synopsis,
             log=tr_log,
             progress=lambda f: job.publish(
-                "translating", 60 + 35 * min(max(f, 0.0), 1.0),
+                "translating", 72 + 23 * min(max(f, 0.0), 1.0),
                 message=f"AI 翻译中… {min(max(f, 0.0), 1.0):.0%}",
             ),
             should_cancel=job.cancel_event.is_set,

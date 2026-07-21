@@ -49,3 +49,27 @@ def test_custom_override_wins():
 def test_max_line_chars_propagates():
     p = build_system_prompt(PromptSettings(), "简体中文", max_line_chars=20)
     assert "20 个字符" in p
+
+
+# --------------------------------- no-borrowing rule (the line-shift bug)
+
+
+def test_prompt_forbids_borrowing_content_across_lines():
+    p = build_system_prompt(PromptSettings(), "简体中文")
+    assert "严禁把下一行的内容提前翻译到本行" in p
+    assert "宁可单行译文读起来不完整" in p
+
+
+def test_prompt_no_longer_invites_reflowing():
+    """The old wording asked for lines to 'read as one fluent sentence',
+    which is exactly what made the model move content between lines."""
+    p = build_system_prompt(PromptSettings(), "简体中文")
+    assert "使连起来读是通顺的一句话" not in p
+
+
+def test_no_borrowing_rule_survives_every_switch_off():
+    off = PromptSettings(
+        fix_asr_errors=False, link_fragments=False,
+        normalize_loanwords=False, limit_length=False, tone="",
+    )
+    assert "严禁把下一行的内容提前翻译到本行" in build_system_prompt(off, "简体中文")

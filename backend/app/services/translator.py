@@ -67,6 +67,15 @@ def build_system_prompt(
     rules = [
         "严格保持行号对应，每行输出格式为 `[行号] 译文`，一行原文对应一行译文，"
         "不得合并、拆分或跳过任何行。",
+        # the shift bug: a line holding only a sentence tail has nothing to
+        # say on its own, and the model "solves" it by pulling the next
+        # line's content forward — offsetting every line after it
+        "每行译文只能翻译该行原文本身的内容。若某行原文只是上一句话的残尾"
+        "（例如只有一两个词），译文也只能对应这几个词；"
+        "严禁把下一行的内容提前翻译到本行，也严禁把本行内容推迟到下一行。"
+        "宁可单行译文读起来不完整，也不得跨行搬运内容。\n"
+        "   正确：`[7] 我没想到` / `[8] 这一点`；"
+        "错误：`[7] 我没想到这一点` / `[8]（挪用了第 9 行的内容）`",
         "全片人名、地名、术语的译法必须前后一致。",
     ]
     if prompts.tone.strip():
@@ -79,8 +88,9 @@ def build_system_prompt(
         )
     if prompts.link_fragments:
         rules.append(
-            "相邻行常常是同一句话被拆成的两半。翻译时要照顾跨行的语序和衔接，"
-            "使连起来读是通顺的一句话，但仍必须逐行输出，每行译文只对应该行内容。"
+            "相邻行可能是同一句话被拆成的两半。理解时要结合上下文，"
+            "但输出时不得因此调整内容的归属：该行有多少内容就译多少内容，"
+            "跨行的语序差异宁可保留，也不得把内容挪到别的行去凑通顺。"
         )
     if prompts.normalize_loanwords:
         rules.append(
