@@ -2,6 +2,13 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
+import { THEMES, applyTheme, loadTheme } from '../theme'
+
+const theme = ref(loadTheme())
+
+function pickTheme(value) {
+  theme.value = applyTheme(value) // 立即生效并写入 localStorage，不随「保存设置」
+}
 
 const settings = ref(null)
 const saving = ref(false)
@@ -152,6 +159,30 @@ async function testLLM() {
 
 <template>
   <div v-if="settings">
+    <el-card shadow="never" class="section">
+      <template #header>🎨 界面主题</template>
+      <div class="themes">
+        <div
+          v-for="t in THEMES" :key="t.value"
+          class="theme-tile" :class="{ active: theme === t.value }"
+          @click="pickTheme(t.value)"
+        >
+          <div class="theme-swatch" :style="{ background: t.swatch[0] }">
+            <span class="chip" :style="{ background: t.swatch[1] }" />
+            <span class="chip accent" :style="{ background: t.swatch[2] }" />
+          </div>
+          <div class="theme-name">
+            {{ t.name }}
+            <el-tag v-if="t.value === 'slate'" size="small" type="info">默认</el-tag>
+          </div>
+          <div class="theme-desc">{{ t.desc }}</div>
+        </div>
+      </div>
+      <div class="hint" style="margin: 10px 0 0; display: block">
+        点击即刻切换，无需保存；主题只存在当前浏览器（换设备/清缓存后回到默认）。
+      </div>
+    </el-card>
+
     <el-card shadow="never" class="section">
       <template #header>🤖 翻译模型（OpenAI 兼容 API）</template>
       <el-form label-width="150px">
@@ -386,7 +417,7 @@ async function testLLM() {
 }
 .hint {
   margin-left: 12px;
-  color: #909399;
+  color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 .tag {
@@ -394,24 +425,74 @@ async function testLLM() {
 }
 .model-size {
   float: right;
-  color: #909399;
+  color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 .model-notes {
   margin-top: 4px;
   padding: 10px 14px;
-  background: #f5f7fa;
-  border-radius: 6px;
+  background: var(--app-note-bg);
+  border-radius: var(--app-radius);
   font-size: 12.5px;
   line-height: 1.8;
-  color: #606266;
+  color: var(--el-text-color-regular);
+}
+.themes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.theme-tile {
+  width: 208px;
+  padding: 10px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: var(--app-radius);
+  cursor: pointer;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.theme-tile:hover {
+  border-color: var(--el-color-primary-light-5);
+}
+.theme-tile.active {
+  border-color: var(--el-color-primary);
+  box-shadow: 0 0 0 1px var(--el-color-primary);
+}
+.theme-swatch {
+  height: 52px;
+  border-radius: calc(var(--app-radius) - 4px);
+  border: 1px solid var(--el-border-color-lighter);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+}
+.theme-swatch .chip {
+  width: 46px;
+  height: 26px;
+  border-radius: calc(var(--app-radius) - 6px);
+  border: 1px solid rgba(128, 128, 128, 0.25);
+}
+.theme-swatch .chip.accent {
+  width: 26px;
+}
+.theme-name {
+  margin-top: 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+.theme-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--el-text-color-secondary);
 }
 .model-notes p {
   margin: 2px 0;
 }
 .storage-path {
   font-size: 12.5px;
-  color: #606266;
+  color: var(--el-text-color-regular);
 }
 .subtitle-preview {
   width: 480px;
@@ -427,7 +508,8 @@ async function testLLM() {
   font-family: 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
 }
 .storage-path code {
-  background: #f5f7fa;
+  background: var(--el-fill-color);
+  font-family: var(--app-mono);
   padding: 2px 6px;
   border-radius: 4px;
   word-break: break-all;

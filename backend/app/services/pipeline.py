@@ -316,7 +316,21 @@ class JobManager:
             check_cancel()
             extract_cb(fraction)
 
-        audio.extract_audio(req.video_path, wav, progress=extract_progress)
+        tracks = audio.list_tracks(req.video_path)
+        track = audio.pick_track(tracks, req.audio_track, req.audio_language)
+        if req.audio_track is not None and track["index"] != req.audio_track:
+            job.publish(
+                "extracting", 0,
+                log=f"⚠ 指定的音轨 #{req.audio_track} 不存在，改用 {audio.describe_track(track)}",
+            )
+        elif len(tracks) > 1:
+            job.publish(
+                "extracting", 0,
+                log=f"检测到 {len(tracks)} 条音轨，使用 {audio.describe_track(track)}",
+            )
+        audio.extract_audio(
+            req.video_path, wav, progress=extract_progress, track_index=track["index"]
+        )
         job.publish(
             "extracting", 10,
             log=f"音频提取完成: audio.wav（{wav.stat().st_size // 1048576} MB）",

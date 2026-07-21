@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, reactive, ref } from 'vue'
+import { onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 
@@ -17,10 +17,24 @@ const SOURCE_LANGS = [
 
 const TARGET_LANGS = ['简体中文', '繁體中文', 'English', '日本語', '한국어', 'Français', 'Deutsch']
 
+// batch mode picks tracks by language tag: stream indices differ per file
+const AUDIO_LANGS = [
+  { value: '', label: '每个文件的默认音轨' },
+  { value: 'jpn', label: '日语音轨（jpn）' },
+  { value: 'eng', label: '英语音轨（eng）' },
+  { value: 'chi', label: '中文音轨（chi/zho）' },
+  { value: 'kor', label: '韩语音轨（kor）' },
+  { value: 'fre', label: '法语音轨（fre）' },
+  { value: 'ger', label: '德语音轨（ger）' },
+  { value: 'spa', label: '西班牙语音轨（spa）' },
+  { value: 'rus', label: '俄语音轨（rus）' },
+]
+
 const mode = ref('single') // 'single' | 'batch'
 
 const form = reactive({
   video_path: '',
+  audio_track: null, // null = 默认音轨
   source_language: 'auto',
   target_language: '简体中文',
   synopsis: '',
@@ -31,6 +45,50 @@ const batchForm = reactive({
   directory: '',
   recursive: true,
   skip_existing_srt: true,
+  audio_language: '',
+})
+
+// ------------------------------------------------------------ audio tracks
+const tracks = ref([])
+const tracksState = ref('idle') // 'idle' | 'loading' | 'ok' | 'error'
+const tracksError = ref('')
+let probeTimer = null
+
+function trackLabel(t) {
+  const bits = [`#${t.index}`, t.language_name]
+  if (t.title) bits.push(`「${t.title}」`)
+  const tail = [t.codec, t.channel_name].filter(Boolean).join(' ')
+  if (tail) bits.push(tail)
+  if (t.default) bits.push('(默认)')
+  return bits.join(' ')
+}
+
+async function probeTracks() {
+  const path = form.video_path.trim()
+  tracks.value = []
+  form.audio_track = null
+  if (!path) {
+    tracksState.value = 'idle'
+    return
+  }
+  tracksState.value = 'loading'
+  try {
+    const list = await api.audioTracks(path)
+    tracks.value = list
+    tracksState.value = 'ok'
+    // preselect what the backend would choose anyway, so the box isn't empty
+    const def = list.find((t) => t.default) || list[0]
+    if (def) form.audio_track = def.index
+  } catch (e) {
+    tracksState.value = 'error'
+    tracksError.value = e.message
+  }
+}
+
+// the path can be typed, pasted or picked in the browser — debounce them all
+watch(() => form.video_path, () => {
+  clearTimeout(probeTimer)
+  probeTimer = setTimeout(probeTracks, 400)
 })
 
 // 画面翻译 (on-screen text) time points, single-file mode only
@@ -291,6 +349,7 @@ function baseName(p) {
 onBeforeUnmount(() => {
   eventSource?.close()
   clearInterval(batchTimer)
+  clearTimeout(probeTimer)
 })
 </script>
 
@@ -310,6 +369,26 @@ onBeforeUnmount(() => {
           </template>
         </el-input>
       </el-form-item>
+      <el-form-item v-if="mode === 'single' && tracksState !== 'idle'" label="音轨">
+        <template v-if="tracksState === 'loading'">
+          <span class="hint" style="margin-left: 0">正在读取音轨…</span>
+        </template>
+        <template v-else-if="tracksState === 'error'">
+          <span class="hint" style="margin-left: 0">无法读取音轨（{{ tracksError }}），将使用默认音轨</span>
+        </template>
+        <template v-else-if="tracks.length > 1">
+          <el-select v-model="form.audio_track" style="width: 420px">
+            <el-option
+              v-for="t in tracks" :key="t.index"
+              :value="t.index" :label="trackLabel(t)"
+            />
+          </el-select>
+          <span class="hint">检测到 {{ tracks.length }} 条音轨（原声/配音/评论），请选择要识别的那条</span>
+        </template>
+        <template v-else>
+          <span class="hint" style="margin-left: 0">单音轨：{{ trackLabel(tracks[0]) }}</span>
+        </template>
+      </el-form-item>
       <template v-else>
         <el-form-item label="视频目录" required>
           <el-input v-model="batchForm.directory" placeholder="将翻译该目录内的所有视频文件">
@@ -323,6 +402,12 @@ onBeforeUnmount(() => {
           <span class="hint" style="margin-right: 24px">包含子目录</span>
           <el-switch v-model="batchForm.skip_existing_srt" />
           <span class="hint">跳过已有同名字幕的视频</span>
+        </el-form-item>
+        <el-form-item label="音轨">
+          <el-select v-model="batchForm.audio_language" style="width: 260px">
+            <el-option v-for="l in AUDIO_LANGS" :key="l.value" :value="l.value" :label="l.label" />
+          </el-select>
+          <span class="hint">批量模式下各文件的音轨序号不同，因此按语言标签匹配；找不到该语言的文件回退到默认音轨</span>
         </el-form-item>
       </template>
       <el-form-item label="音频语言">
@@ -516,7 +601,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .hint {
   margin-left: 12px;
-  color: #909399;
+  color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 .progress-card {
@@ -534,18 +619,18 @@ onBeforeUnmount(() => {
   gap: 12px;
 }
 .message {
-  color: #606266;
+  color: var(--el-text-color-regular);
   font-size: 13px;
 }
 .logs {
   height: 220px;
   overflow-y: auto;
-  background: #1e1e1e;
-  color: #d4d4d4;
-  font-family: Consolas, Menlo, monospace;
+  background: var(--app-log-bg);
+  color: var(--app-log-fg);
+  font-family: var(--app-mono);
   font-size: 12px;
   padding: 8px 12px;
-  border-radius: 6px;
+  border-radius: var(--app-radius);
   margin-bottom: 12px;
   white-space: pre-wrap;
   word-break: break-all;
@@ -562,8 +647,8 @@ onBeforeUnmount(() => {
 .batch-files {
   max-height: 220px;
   overflow-y: auto;
-  border: 1px solid #ebeef5;
-  border-radius: 6px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: var(--app-radius);
   margin-bottom: 12px;
 }
 .batch-file {
@@ -571,7 +656,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   padding: 5px 12px;
-  border-bottom: 1px solid #f5f7fa;
+  border-bottom: 1px solid var(--el-border-color-lighter);
   font-size: 13px;
 }
 .batch-file .name {
@@ -583,8 +668,8 @@ onBeforeUnmount(() => {
 .scan-list {
   max-height: 300px;
   overflow-y: auto;
-  border: 1px solid #ebeef5;
-  border-radius: 6px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: var(--app-radius);
   padding: 4px 12px;
   font-size: 13px;
   line-height: 1.9;
@@ -596,20 +681,20 @@ onBeforeUnmount(() => {
 .browser-list {
   max-height: 380px;
   overflow-y: auto;
-  border: 1px solid #ebeef5;
-  border-radius: 6px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: var(--app-radius);
 }
 .entry {
   padding: 7px 12px;
   cursor: pointer;
-  border-bottom: 1px solid #f5f7fa;
+  border-bottom: 1px solid var(--el-border-color-lighter);
 }
 .entry:hover {
-  background: #ecf5ff;
+  background: var(--el-color-primary-light-9);
 }
 .entry .size {
   float: right;
-  color: #909399;
+  color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 </style>

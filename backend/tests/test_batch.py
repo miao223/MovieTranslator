@@ -75,3 +75,29 @@ def test_batch_endpoints(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
     assert c.post("/api/batch", json={"directory": str(empty)}).status_code == 400
+
+
+def test_batch_passes_audio_language_to_each_job(tmp_path, monkeypatch):
+    """Batches select tracks by language tag, so every job must carry it."""
+    from app.models.schemas import BatchRequest, JobStatus
+    from app.services import batch as batch_mod
+
+    make_tree(tmp_path)
+    seen = []
+    fakes = {}
+
+    class FakeJob:
+        def __init__(self, req):
+            seen.append(req)
+            self.id = f"job{len(seen)}"
+            self.status = JobStatus(id=self.id)
+            fakes[self.id] = self
+
+    monkeypatch.setattr(batch_mod.job_manager, "create", FakeJob)
+    monkeypatch.setattr(batch_mod.job_manager, "get", lambda jid: fakes[jid])
+    batch_mod.batch_manager.create(
+        BatchRequest(directory=str(tmp_path), audio_language="jpn")
+    )
+    assert len(seen) == 2
+    assert {r.audio_language for r in seen} == {"jpn"}
+    assert all(r.audio_track is None for r in seen)

@@ -47,6 +47,7 @@ class BatchManager:
                 job = job_manager.create(
                     JobRequest(
                         video_path=str(video),
+                        audio_language=req.audio_language,
                         source_language=req.source_language,
                         target_language=req.target_language,
                         synopsis=req.synopsis,

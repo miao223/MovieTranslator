@@ -110,8 +110,28 @@ class FrameTask(BaseModel):
     duration: float = Field(5.0, ge=1.0, le=60.0)  # cue display seconds
 
 
+class AudioTrack(BaseModel):
+    """One audio stream of a video, as offered for selection."""
+
+    index: int  # container stream index, the value passed back as audio_track
+    codec: str = ""
+    language: str = ""  # canonical ISO 639-2/B code, "" when untagged
+    language_name: str = ""
+    title: str = ""
+    channels: int = 0
+    channel_name: str = ""
+    sample_rate: int = 0
+    default: bool = False
+
+
 class JobRequest(BaseModel):
     video_path: str
+    # container stream index of the audio track to transcribe; None = the
+    # track flagged default, else the first one
+    audio_track: Optional[int] = None
+    # fallback when audio_track is None (batch jobs, where indices differ per
+    # file): prefer a track tagged with this language, e.g. "jpn"
+    audio_language: str = ""
     source_language: str = "auto"  # whisper language code or "auto"
     target_language: str = "简体中文"
     synopsis: str = ""  # optional plot synopsis to steer the translation
@@ -127,6 +147,8 @@ class BatchRequest(BaseModel):
     recursive: bool = True
     skip_existing_srt: bool = True
     # per-file task params, shared by every video in the batch
+    # track indices differ per file, so batches select by language tag instead
+    audio_language: str = ""  # e.g. "jpn"; empty = each file's default track
     source_language: str = "auto"
     target_language: str = "简体中文"
     synopsis: str = ""  # shared synopsis is useful for TV series batches

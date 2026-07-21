@@ -157,7 +157,7 @@ function resetDefaults() {
 }
 .hint {
   margin-left: 12px;
-  color: #909399;
+  color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 .preview-card {
@@ -167,12 +167,12 @@ function resetDefaults() {
 .preview {
   white-space: pre-wrap;
   word-break: break-all;
-  font-family: Consolas, Menlo, monospace;
+  font-family: var(--app-mono);
   font-size: 12px;
   line-height: 1.7;
-  color: #303133;
-  background: #f5f7fa;
-  border-radius: 6px;
+  color: var(--el-text-color-primary);
+  background: var(--app-note-bg);
+  border-radius: var(--app-radius);
   padding: 12px;
   margin: 0;
   max-height: 70vh;

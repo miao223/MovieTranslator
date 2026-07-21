@@ -32,8 +32,6 @@ const activeTab = ref('home')
 <style>
 body {
   margin: 0;
-  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
-  background: #f5f7fa;
 }
 .app {
   max-width: 1200px;
@@ -49,9 +47,10 @@ body {
 .header h1 {
   margin: 0;
   font-size: 24px;
+  color: var(--el-text-color-primary);
 }
 .header .subtitle {
-  color: #909399;
+  color: var(--el-text-color-secondary);
   font-size: 14px;
 }
 </style>

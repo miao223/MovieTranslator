@@ -1,0 +1,199 @@
+/* 主题变量：覆盖 Element Plus 的 CSS 变量 + 本项目自定义的 --app-* 变量。
+   html[data-theme] 由 theme.js 设置；暗色主题额外带 html.dark（Element Plus 暗色组件样式）。 */
+
+/* ---------------------------------------------- ③ 柔雾蓝灰（默认） */
+:root,
+html[data-theme='slate'] {
+  --el-color-primary: #4c6fe7;
+  --el-color-primary-light-3: #829aee;
+  --el-color-primary-light-5: #a6b7f3;
+  --el-color-primary-light-7: #c8d3f8;
+  --el-color-primary-light-8: #dbe2fa;
+  --el-color-primary-light-9: #edf0fd;
+  --el-color-primary-dark-2: #3d59b9;
+
+  --el-bg-color: #f7f9fc;
+  --el-bg-color-page: #e9edf3;
+  --el-bg-color-overlay: #f7f9fc;
+
+  --el-text-color-primary: #23304a;
+  --el-text-color-regular: #4e5d78;
+  --el-text-color-secondary: #7e8aa0;
+  --el-text-color-placeholder: #a3aec0;
+
+  --el-border-color: #d6dee9;
+  --el-border-color-light: #e0e6ef;
+  --el-border-color-lighter: #e7ecf3;
+  --el-border-color-extra-light: #eef1f6;
+
+  --el-fill-color: #e9edf3;
+  --el-fill-color-light: #edf1f7;
+  --el-fill-color-lighter: #f2f5f9;
+  --el-fill-color-blank: #f7f9fc;
+
+  --el-box-shadow-light: 0 2px 10px rgba(61, 81, 112, 0.1);
+
+  --app-bg: #e9edf3;
+  --app-card-shadow: 0 2px 12px rgba(61, 81, 112, 0.09);
+  --app-card-border: transparent;
+  --app-radius: 12px;
+  --app-log-bg: #1d2430;
+  --app-log-fg: #d3dae6;
+  --app-note-bg: #edf1f7;
+  --app-font: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  --app-mono: Consolas, Menlo, monospace;
+}
+
+/* ---------------------------------------------- ① 暖白纸感 */
+html[data-theme='paper'] {
+  --el-color-primary: #4a6b57;
+  --el-color-primary-light-3: #809789;
+  --el-color-primary-light-5: #a5b5ab;
+  --el-color-primary-light-7: #c9d3cd;
+  --el-color-primary-light-8: #dbe2dc;
+  --el-color-primary-light-9: #edf0ee;
+  --el-color-primary-dark-2: #3b5646;
+
+  --el-bg-color: #fbf9f3;
+  --el-bg-color-page: #f4f1e9;
+  --el-bg-color-overlay: #fbf9f3;
+
+  --el-text-color-primary: #3b3a34;
+  --el-text-color-regular: #5c574b;
+  --el-text-color-secondary: #8c8577;
+  --el-text-color-placeholder: #a79f8c;
+
+  --el-border-color: #ded6c4;
+  --el-border-color-light: #e3dccb;
+  --el-border-color-lighter: #e8e2d3;
+  --el-border-color-extra-light: #eee9dd;
+
+  --el-fill-color: #ebe4d3;
+  --el-fill-color-light: #f2eee1;
+  --el-fill-color-lighter: #f6f3ea;
+  --el-fill-color-blank: #fffdf8;
+
+  --el-box-shadow-light: 0 1px 4px rgba(138, 127, 106, 0.16);
+
+  --app-bg: #f4f1e9;
+  --app-card-shadow: 0 1px 3px rgba(138, 127, 106, 0.13);
+  --app-card-border: #e3dccb;
+  --app-radius: 8px;
+  --app-log-bg: #2f2c25;
+  --app-log-fg: #ded7c6;
+  --app-note-bg: #f2eee1;
+  --app-font: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  --app-mono: Consolas, Menlo, monospace;
+}
+
+/* ---------------------------------------------- ② 深色影院 */
+html[data-theme='cinema'] {
+  --el-color-primary: #e8b45e;
+  --el-color-primary-light-3: #a9854b;
+  --el-color-primary-light-5: #7f663e;
+  --el-color-primary-light-7: #554732;
+  --el-color-primary-light-8: #40372a;
+  --el-color-primary-light-9: #2b2824;
+  --el-color-primary-dark-2: #edc37e;
+
+  --el-bg-color: #20242b;
+  --el-bg-color-page: #16181d;
+  --el-bg-color-overlay: #252a32;
+
+  --el-text-color-primary: #e4e7ec;
+  --el-text-color-regular: #c0c6d0;
+  --el-text-color-secondary: #868d99;
+  --el-text-color-placeholder: #6b727e;
+
+  --el-border-color: #3c424c;
+  --el-border-color-light: #343a44;
+  --el-border-color-lighter: #2e333c;
+  --el-border-color-extra-light: #272b33;
+
+  --el-fill-color: #2b3037;
+  --el-fill-color-light: #262a31;
+  --el-fill-color-lighter: #21252b;
+  --el-fill-color-blank: #171a1f;
+
+  --el-box-shadow-light: 0 2px 10px rgba(0, 0, 0, 0.45);
+
+  --app-bg: #16181d;
+  --app-card-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+  --app-card-border: #2e333c;
+  --app-radius: 10px;
+  --app-log-bg: #14171b;
+  --app-log-fg: #b9c0cb;
+  --app-note-bg: #191c21;
+  --app-font: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  --app-mono: Consolas, Menlo, monospace;
+}
+
+/* ---------------------------------------------- ⑤ 终端极客 */
+html[data-theme='terminal'] {
+  --el-color-primary: #5fd08a;
+  --el-color-primary-light-3: #479867;
+  --el-color-primary-light-5: #38734f;
+  --el-color-primary-light-7: #284e37;
+  --el-color-primary-light-8: #203b2c;
+  --el-color-primary-light-9: #182920;
+  --el-color-primary-dark-2: #7fd9a1;
+
+  --el-bg-color: #131b18;
+  --el-bg-color-page: #101614;
+  --el-bg-color-overlay: #16211c;
+
+  --el-text-color-primary: #c7dcd1;
+  --el-text-color-regular: #9fbcae;
+  --el-text-color-secondary: #6f9683;
+  --el-text-color-placeholder: #4c6659;
+
+  --el-border-color: #38564a;
+  --el-border-color-light: #2b3d36;
+  --el-border-color-lighter: #243530;
+  --el-border-color-extra-light: #1d2b25;
+
+  --el-fill-color: #1b2a23;
+  --el-fill-color-light: #16211c;
+  --el-fill-color-lighter: #131b18;
+  --el-fill-color-blank: #0c120f;
+
+  --el-border-radius-base: 0px;
+  --el-border-radius-small: 0px;
+  --el-box-shadow-light: 0 0 0 1px #243530;
+
+  --app-bg: #101614;
+  --app-card-shadow: none;
+  --app-card-border: #243530;
+  --app-radius: 0px;
+  --app-log-bg: #0c120f;
+  --app-log-fg: #89b79e;
+  --app-note-bg: #0e1512;
+  --app-font: ui-monospace, 'SF Mono', Menlo, Consolas, 'Microsoft YaHei', monospace;
+  --app-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+/* ---------------------------------------------- 全局应用 */
+body {
+  background: var(--app-bg);
+  color: var(--el-text-color-primary);
+  font-family: var(--app-font);
+}
+
+.el-card {
+  border-radius: var(--app-radius) !important;
+  border-color: var(--app-card-border) !important;
+  box-shadow: var(--app-card-shadow) !important;
+}
+
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
+  border-radius: var(--el-border-radius-base);
+}
+
+/* 暗色主题下 Element Plus 的部分组件底色跟随卡片 */
+html.dark .el-card,
+html.dark .el-collapse-item__header,
+html.dark .el-collapse-item__wrap {
+  background-color: var(--el-bg-color);
+}

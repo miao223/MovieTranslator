@@ -14,12 +14,14 @@ from app.core import config
 from app.core.media import VIDEO_EXTS, scan_videos
 from app.models.schemas import (
     AppSettings,
+    AudioTrack,
     BatchRequest,
     BatchStatus,
     JobRequest,
     JobStatus,
     LLMSettings,
 )
+from app.services import audio
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -258,6 +260,24 @@ def asr_cuda_status():
         return {"available": count > 0, "device_count": count}
     except Exception as exc:  # noqa: BLE001 — missing CUDA libs land here
         return {"available": False, "device_count": 0, "error": str(exc)}
+
+
+# ------------------------------------------------------------------ media
+
+
+@router.get("/media/audio-tracks", response_model=list[AudioTrack])
+def media_audio_tracks(path: str) -> list[AudioTrack]:
+    """List the audio tracks of a video so the user can pick one."""
+    p = Path(path.strip().strip('"').strip("'")).expanduser()
+    if not p.is_file():
+        raise HTTPException(status_code=400, detail=f"文件不存在: {p}")
+    try:
+        tracks = audio.list_tracks(p)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — unreadable/corrupt container
+        raise HTTPException(status_code=400, detail=f"无法读取视频: {exc}") from exc
+    return [AudioTrack(**t) for t in tracks]
 
 
 # ------------------------------------------------------------ file browse

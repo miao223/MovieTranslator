@@ -35,6 +35,8 @@ export const api = {
   resolvePath: (path) =>
     request(`/api/fs/resolve?path=${encodeURIComponent(path)}`),
   quickAccess: () => request('/api/fs/quick-access'),
+  audioTracks: (path) =>
+    request(`/api/media/audio-tracks?path=${encodeURIComponent(path)}`),
   promptPreview: (payload) =>
     request('/api/prompts/preview', { method: 'POST', body: JSON.stringify(payload) }),
   modelStatus: (modelSize) =>
