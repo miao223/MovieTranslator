@@ -48,5 +48,7 @@ export const api = {
   downloadStatus: (modelSize) =>
     request(`/api/asr/download-status?model_size=${encodeURIComponent(modelSize)}`),
   resultUrl: (id) => `/api/jobs/${id}/result`,
+  jobLogUrl: (id) => `/api/logs/job/${id}`,
+  logs: () => request('/api/logs'),
   eventsUrl: (id) => `/api/jobs/${id}/events`,
 }

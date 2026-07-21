@@ -15,6 +15,7 @@ import av
 SAMPLE_RATE = 16_000
 
 ProgressFn = Callable[[float], None]  # 0..1
+LogFn = Callable[[str], None]
 
 AV_DISPOSITION_DEFAULT = 1 << 0
 
@@ -102,6 +103,44 @@ def list_tracks(video_path: str | Path) -> list[dict]:
     return tracks
 
 
+def describe_media(video_path: str | Path) -> list[str]:
+    """Container / video / audio summary for the job log.
+
+    Every audio track is listed, not just the chosen one — a decode failure
+    is usually answered by "which codec was it actually handed".
+    """
+    video_path = Path(video_path)
+    lines: list[str] = []
+    try:
+        size = video_path.stat().st_size
+        lines.append(f"文件大小      : {size / (1 << 30):.2f} GB ({size} 字节)")
+    except OSError as exc:
+        lines.append(f"文件大小      : 读取失败 ({exc})")
+
+    with av.open(str(video_path)) as container:
+        duration = (
+            float(container.duration / av.time_base) if container.duration else 0.0
+        )
+        lines.append(
+            f"容器格式      : {container.format.name} "
+            f"时长 {int(duration // 3600):02d}:{int(duration % 3600 // 60):02d}:{int(duration % 60):02d}"
+        )
+        for stream in container.streams.video:
+            cc = stream.codec_context
+            lines.append(
+                f"视频流        : #{stream.index} {cc.name} "
+                f"{cc.width}x{cc.height} {float(stream.average_rate or 0):.3f} fps"
+            )
+        for track in (_track_info(s) for s in container.streams.audio):
+            lines.append(f"音轨          : {describe_track(track)} @{track['sample_rate']}Hz")
+        for stream in container.streams.subtitles:
+            lines.append(
+                f"内嵌字幕      : #{stream.index} {stream.codec_context.name} "
+                f"{stream.language or '未标注'}"
+            )
+    return lines
+
+
 def pick_track(
     tracks: list[dict],
     index: Optional[int] = None,
@@ -133,12 +172,14 @@ def extract_audio(
     out_wav: str | Path,
     progress: Optional[ProgressFn] = None,
     track_index: Optional[int] = None,
+    log: Optional[LogFn] = None,
 ) -> Path:
     """Decode one audio stream of *video_path* into a 16 kHz mono WAV.
 
     *track_index* is a container stream index (see `list_tracks`); None takes
-    the first audio stream. Raises ValueError if the file has no audio stream
-    or the requested index is not an audio stream of this file.
+    the first audio stream. Damaged packets are skipped rather than aborting
+    the job. Raises ValueError if the file has no audio stream, the requested
+    index is not an audio stream, or nothing at all could be decoded.
     """
     video_path = Path(video_path)
     out_wav = Path(out_wav)
@@ -161,20 +202,56 @@ def extract_audio(
             out_stream.layout = "mono"
             resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
 
-            for frame in in_container.decode(in_stream):
-                if progress and duration and frame.pts is not None:
-                    ts = float(frame.pts * in_stream.time_base)
-                    progress(min(ts / duration, 1.0))
-                for out_frame in resampler.resample(frame):
-                    for packet in out_stream.encode(out_frame):
-                        out_container.mux(packet)
+            decoded = bad_packets = 0
+            reached = 0.0
+            try:
+                for packet in in_container.demux(in_stream):
+                    try:
+                        frames = packet.decode()
+                    except av.error.FFmpegError:
+                        # a damaged packet must not cost the whole film —
+                        # ffmpeg's own CLI logs and moves on
+                        bad_packets += 1
+                        continue
+                    for frame in frames:
+                        decoded += 1
+                        if duration and frame.pts is not None:
+                            reached = float(frame.pts * in_stream.time_base)
+                            if progress:
+                                progress(min(reached / duration, 1.0))
+                        for out_frame in resampler.resample(frame):
+                            for out_packet in out_stream.encode(out_frame):
+                                out_container.mux(out_packet)
+            except av.error.FFmpegError as exc:
+                # the container itself broke down mid-file
+                if not decoded:
+                    raise
+                if log:
+                    log(
+                        f"⚠ 视频文件在 {reached:.0f}s 处损坏（{exc}），"
+                        "已用此前解码出的音频继续；该时间点之后不会有字幕"
+                    )
             # flush resampler and encoder
             for out_frame in resampler.resample(None):
-                for packet in out_stream.encode(out_frame):
-                    out_container.mux(packet)
-            for packet in out_stream.encode(None):
-                out_container.mux(packet)
+                for out_packet in out_stream.encode(out_frame):
+                    out_container.mux(out_packet)
+            for out_packet in out_stream.encode(None):
+                out_container.mux(out_packet)
 
+    if not decoded:
+        raise ValueError(
+            f"音轨 #{in_stream.index}（{(in_stream.codec_context.name or '未知').upper()}）"
+            "无法解码，可能是编码格式不受支持或该音轨已损坏；"
+            "请在任务页改选其他音轨后重试"
+        )
+    if log:
+        log(
+            f"音轨 #{in_stream.index} 解码完成：{decoded} 个音频帧，"
+            f"覆盖到 {reached:.0f}s / 共 {duration:.0f}s"
+            + (f"，跳过 {bad_packets} 个损坏的包" if bad_packets else "")
+        )
+    if bad_packets and log:
+        log("⚠ 文件存在轻微损坏，跳过的部分不会有字幕；其余部分已正常提取")
     if progress:
         progress(1.0)
     return out_wav

@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 
-from app.core import config
+from app.core import config, joblog
 from app.core.media import VIDEO_EXTS, scan_videos
 from app.models.schemas import (
     AppSettings,
@@ -260,6 +260,44 @@ def asr_cuda_status():
         return {"available": count > 0, "device_count": count}
     except Exception as exc:  # noqa: BLE001 — missing CUDA libs land here
         return {"available": False, "device_count": 0, "error": str(exc)}
+
+
+# ------------------------------------------------------------------- logs
+
+
+@router.get("/logs")
+def list_logs():
+    """Recent job logs, newest first, plus the folder holding them."""
+    files = []
+    for path in sorted(
+        joblog.logs_dir().glob("*.log"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        stat = path.stat()
+        files.append({
+            "name": path.name,
+            "size": stat.st_size,
+            "modified": stat.st_mtime,
+        })
+    return {"dir": str(joblog.logs_dir()), "files": files}
+
+
+@router.get("/logs/job/{job_id}")
+def download_job_log(job_id: str):
+    path = joblog.find_log(job_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="该任务没有日志文件")
+    return FileResponse(path, media_type="text/plain", filename=path.name)
+
+
+@router.get("/logs/file/{name}")
+def download_log(name: str):
+    # resolve against the listing so no path can escape the log folder
+    path = joblog.logs_dir() / Path(name).name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="日志文件不存在")
+    return FileResponse(path, media_type="text/plain", filename=path.name)
 
 
 # ------------------------------------------------------------------ media

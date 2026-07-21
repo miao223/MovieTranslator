@@ -194,3 +194,53 @@ def test_audio_tracks_endpoint(multitrack):
 
         bad = client.get("/api/media/audio-tracks", params={"path": "/no/such/file.mkv"})
         assert bad.status_code == 400
+
+
+# --------------------------------------------------- damaged / undecodable
+
+
+def corrupt_copy(src: Path, dst: Path, span: int = 600) -> Path:
+    """Flip a stretch of bytes in the middle of the payload."""
+    raw = bytearray(src.read_bytes())
+    mid = len(raw) // 2
+    for i in range(mid, min(mid + span, len(raw))):
+        raw[i] ^= 0xFF
+    dst.write_bytes(bytes(raw))
+    return dst
+
+
+def test_damaged_packets_are_skipped_not_fatal(multitrack, tmp_path):
+    """One bad packet used to abort the whole job with InvalidDataError."""
+    broken = corrupt_copy(multitrack, tmp_path / "broken.mkv")
+    logs = []
+    out = extract_audio(broken, tmp_path / "broken.wav", track_index=2, log=logs.append)
+    assert _peak(out) > 0.0  # audio still came through
+
+
+def test_undecodable_track_reports_which_track_to_avoid(tmp_path):
+    """A declared-but-empty audio track (seen in some remuxes) decodes to
+    nothing; the user needs to be told which track to stop choosing."""
+    import av
+
+    path = tmp_path / "emptytrack.mkv"
+    with av.open(str(path), "w") as container:
+        video = container.add_stream("libx264", rate=8)
+        video.width, video.height = 64, 48
+        video.pix_fmt = "yuv420p"
+        empty = container.add_stream("aac", rate=SR)
+        empty.layout = "mono"
+        empty.metadata["language"] = "eng"
+        for i in range(8):
+            frame = av.VideoFrame.from_ndarray(
+                np.zeros((48, 64, 3), dtype=np.uint8), format="rgb24"
+            )
+            frame.pts = i
+            for packet in video.encode(frame):
+                container.mux(packet)
+        for packet in video.encode(None):
+            container.mux(packet)
+
+    with pytest.raises(ValueError) as err:
+        extract_audio(path, tmp_path / "none.wav", track_index=1)
+    assert "音轨 #1" in str(err.value)
+    assert "改选其他音轨" in str(err.value)

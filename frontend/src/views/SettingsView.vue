@@ -16,6 +16,7 @@ const testing = ref(false)
 const modelDownloaded = ref(null) // null = unknown / loading
 const cuda = ref(null) // { available, device_count }
 const storageInfo = ref(null) // { effective_dir, is_default }
+const logInfo = ref(null) // { dir, files: [{name, size, modified}] }
 const download = ref({ status: 'idle', progress: 0 })
 let pollTimer = null
 
@@ -82,6 +83,7 @@ onMounted(async () => {
     refreshModelStatus()
     api.cudaStatus().then((r) => (cuda.value = r)).catch(() => {})
     api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
+    api.logs().then((r) => (logInfo.value = r)).catch(() => {})
   } catch (e) {
     ElMessage.error('加载设置失败: ' + e.message)
   }
@@ -335,6 +337,19 @@ async function testLLM() {
             <el-tag v-if="storageInfo.is_default" size="small" type="info" style="margin-left: 8px">默认位置</el-tag>
           </div>
         </el-form-item>
+        <el-form-item v-if="logInfo" label="日志文件夹">
+          <div class="storage-path">
+            📝 <code>{{ logInfo.dir }}</code>
+            <span class="hint">每个任务一个文件，保留最近 20 个；清空缓存不会删除</span>
+            <div v-if="logInfo.files.length" class="log-list">
+              <div v-for="f in logInfo.files.slice(0, 5)" :key="f.name" class="log-item">
+                <a :href="'/api/logs/file/' + encodeURIComponent(f.name)" download>{{ f.name }}</a>
+                <span class="log-size">{{ (f.size / 1024).toFixed(0) }} KB</span>
+              </div>
+            </div>
+            <span v-else class="hint" style="margin-left: 0">（暂无日志，运行一次任务后生成）</span>
+          </div>
+        </el-form-item>
       </el-form>
     </el-card>
 
@@ -506,6 +521,28 @@ async function testLLM() {
   padding-bottom: 14px;
   line-height: 1.45;
   font-family: 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+}
+.log-list {
+  margin-top: 6px;
+}
+.log-item {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  padding: 2px 0;
+  font-size: 12.5px;
+}
+.log-item a {
+  color: var(--el-color-primary);
+  text-decoration: none;
+  font-family: var(--app-mono);
+}
+.log-item a:hover {
+  text-decoration: underline;
+}
+.log-size {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 .storage-path code {
   background: var(--el-fill-color);

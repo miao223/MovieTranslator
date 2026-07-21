@@ -510,6 +510,9 @@ onBeforeUnmount(() => {
     <div ref="logBox" class="logs">
       <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
     </div>
+    <p class="hint" style="margin: 8px 0 0; display: block">
+      每个文件的完整日志单独存盘，位置见「设置 → 存储 → 日志文件夹」
+    </p>
   </el-card>
 
   <el-card v-if="job" shadow="never" class="progress-card">
@@ -538,6 +541,16 @@ onBeforeUnmount(() => {
         下载 SRT 字幕
       </el-button>
     </template>
+    <el-alert v-if="job.stage === 'failed'" type="error" :closable="false" style="margin-bottom: 8px">
+      任务失败。请点下方「下载完整日志」并把文件发给开发者——日志里包含运行环境、
+      音轨列表和完整错误信息，比截图更容易定位问题。
+    </el-alert>
+    <el-button
+      v-if="['done', 'failed', 'cancelled'].includes(job.stage)"
+      tag="a" :href="api.jobLogUrl(job.id)" download style="margin-left: 8px"
+    >
+      下载完整日志
+    </el-button>
   </el-card>
 
   <el-dialog v-model="confirmVisible" title="确认批量翻译" width="560px">

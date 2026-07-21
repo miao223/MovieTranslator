@@ -19,6 +19,7 @@ from typing import Dict, Iterator, List, Optional
 
 from app.core import config
 from app.core.cache import job_dir
+from app.core.joblog import JobLogWriter
 from app.models.schemas import (
     JobRequest,
     JobStatus,
@@ -50,6 +51,8 @@ class Job:
         self.subscribers: List[queue.Queue] = []
         self.lock = threading.Lock()
         self.srt_path: Optional[Path] = None
+        # everything published below is mirrored into a downloadable file
+        self.logfile = JobLogWriter(self.id, request.video_path)
 
     # -------------------------------------------------------- events
 
@@ -61,6 +64,7 @@ class Job:
         event = ProgressEvent(
             stage=stage, progress=self.status.progress, message=message, log=log
         )
+        self.logfile.event(stage, self.status.progress, message, log)
         with self.lock:
             self.events.append(event)
             for q in self.subscribers:
@@ -298,11 +302,20 @@ class JobManager:
             message=f"已补充 {len(frame_lines)} 条画面翻译到: {target}",
         )
 
+    def _write_diagnostics(self, job: Job, req: JobRequest, settings) -> None:
+        """Header that lets one log file explain a failure on its own."""
+        job.logfile.write_environment()
+        job.logfile.write_request(req)
+        job.logfile.write_settings(settings)
+        job.logfile.write_media(req.video_path)
+        job.logfile.section("进度", [])
+
     def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
+        settings = config.load_settings()
+        self._write_diagnostics(job, req, settings)
         if req.frame_only:
             self._execute_frame_only(job, req, workdir)
             return
-        settings = config.load_settings()
 
         def check_cancel():
             if job.cancel_event.is_set():
@@ -319,18 +332,32 @@ class JobManager:
 
         tracks = audio.list_tracks(req.video_path)
         track = audio.pick_track(tracks, req.audio_track, req.audio_language)
+        job.publish(
+            "extracting", 0,
+            log=f"检测到 {len(tracks)} 条音轨：\n"
+                + "\n".join("  " + audio.describe_track(t) for t in tracks),
+        )
         if req.audio_track is not None and track["index"] != req.audio_track:
             job.publish(
                 "extracting", 0,
                 log=f"⚠ 指定的音轨 #{req.audio_track} 不存在，改用 {audio.describe_track(track)}",
             )
-        elif len(tracks) > 1:
+        else:
+            reason = (
+                "用户指定" if req.audio_track is not None
+                else f"匹配语言偏好 {req.audio_language}" if req.audio_language
+                else "片源默认音轨" if track["default"]
+                else "第一条音轨"
+            )
             job.publish(
                 "extracting", 0,
-                log=f"检测到 {len(tracks)} 条音轨，使用 {audio.describe_track(track)}",
+                log=f"选用 {audio.describe_track(track)}（{reason}）",
             )
         audio.extract_audio(
-            req.video_path, wav, progress=extract_progress, track_index=track["index"]
+            req.video_path, wav,
+            progress=extract_progress,
+            track_index=track["index"],
+            log=lambda msg: job.publish("extracting", job.status.progress, log=msg),
         )
         job.publish(
             "extracting", 10,
