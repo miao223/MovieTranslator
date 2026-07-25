@@ -145,15 +145,16 @@ def test_merge_stops_at_a_real_pause():
 
 
 def test_merge_respects_the_char_budget():
-    segs = [(0.0, 2.0, "a" * 60), (2.0, 4.0, "b" * 40)]
+    segs = [(0.0, 2.0, "a" * 60), (2.0, 4.0, "b" * 40 + ".")]
     lines = segment_lines(segs, SubtitleSettings(max_chars_per_line=42))
-    assert len(lines) == 2  # 60 + 40 > 84
+    assert sum(len(l.text) for l in lines) == 101
+    assert all(len(l.text) <= 84 for l in lines)  # 60 + 40 never end up together
 
 
 def test_cjk_merge_keeps_no_space():
-    segs = [(0.0, 2.0, "私好きですよ"), (2.2, 3.0, "そういう話")]
+    segs = [(0.0, 2.0, "私好きですよ"), (2.2, 3.0, "そういう話。"), (4.0, 5.0, "うん。")]
     lines = segment_lines(segs, SubtitleSettings())
-    assert lines[0].text == "私好きですよそういう話"
+    assert lines[0].text == "私好きですよそういう話。"
 
 
 def test_word_path_breaks_at_a_clause_boundary():
@@ -251,3 +252,61 @@ def test_only_the_fragment_side_of_a_suppressed_gap_is_distrusted():
     ])
     lines = segment_lines([seg], SubtitleSettings())
     assert lines[0].start == pytest.approx(10.0)  # not moved
+
+
+# --------------------------------------- merging without punctuation to go on
+#
+# A run whose ASR returned punctuation on 6% of its cues had 1262 correctly
+# broken lines glued down to 725, because "the previous cue does not end a
+# sentence" is trivially true when nothing ends a sentence. One cue ended up
+# holding four sentences from three speakers.
+
+
+UNPUNCTUATED = [
+    (0.0, 1.4, "これが本当だったらな"),
+    (1.6, 3.0, "本当なんじゃないの"),
+    (3.0, 4.4, "補償しますって書いてあるよ"),
+    (4.4, 6.6, "それでは各自頑張って生き抜いてください"),
+]
+
+
+def test_separate_sentences_are_not_glued_without_punctuation():
+    lines = segment_lines(UNPUNCTUATED, SubtitleSettings())
+    assert len(lines) == 4  # left for refine, which restores the punctuation
+    for prev, line in zip(lines, lines[1:]):
+        assert line.start >= prev.end
+
+
+def test_the_same_lines_do_merge_once_punctuated():
+    punctuated = [
+        (0.0, 1.4, "これが本当だったらな。"),
+        (1.6, 3.0, "本当なんじゃないの？"),
+        (3.0, 4.4, "補償しますって書いてあるよ。"),
+    ]
+    lines = segment_lines(punctuated, SubtitleSettings())
+    assert len(lines) == 3  # each is complete, so none is glued to the next
+
+
+def test_fragments_are_still_repaired_without_punctuation():
+    """The fragment rule needs no punctuation, so it keeps working."""
+    segs = [(0.0, 2.0, "なんかいいね"), (2.1, 2.4, "し")]
+    lines = segment_lines(segs, SubtitleSettings())
+    assert [l.text for l in lines] == ["なんかいいねし"]
+
+
+def test_the_unpunctuated_verdict_is_a_majority_not_an_any():
+    from app.services.segmenter import (
+        has_sentence_punctuation,
+        is_effectively_unpunctuated,
+    )
+    from app.models.schemas import SubtitleLine
+
+    def L(text):
+        return SubtitleLine(index=1, start=0.0, end=1.0, text=text)
+
+    mostly_bare = [L("これが本当だったらな")] * 9 + [L("うん。")]
+    assert has_sentence_punctuation(mostly_bare)      # one cue has it...
+    assert is_effectively_unpunctuated(mostly_bare)   # ...which proves nothing
+
+    mostly_punctuated = [L("うん。")] * 9 + [L("これが本当だったらな")]
+    assert not is_effectively_unpunctuated(mostly_punctuated)

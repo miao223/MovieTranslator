@@ -419,13 +419,16 @@ class JobManager:
         if not segments:
             raise RuntimeError("未识别到任何语音内容")
         lines = segmenter.segment_lines(segments, settings.subtitle, debug=debug)
-        if not segmenter.has_sentence_punctuation(lines):
-            # everything downstream that decides where a sentence ends reads
-            # punctuation; without it those rules quietly stop working
+        if segmenter.is_effectively_unpunctuated(lines):
+            # everything that decides where a sentence ends reads punctuation;
+            # without it the segmenter only repairs fragments and leaves whole
+            # sentences to the refine pass, which restores the punctuation first
             job.publish(
                 "transcribing", job.status.progress,
-                log="⚠ 语音识别未输出任何句末标点，断句/合并/换行的判断会受影响，"
-                    "已交由转写预处理补回",
+                log=f"⚠ 语音识别几乎未输出句末标点（{len(lines)} 条），"
+                    "已跳过整句合并，改由转写预处理补回标点后再合并"
+                    + ("" if settings.prompts.refine_enabled
+                       else "；但转写预处理已关闭，字幕会偏碎，建议开启"),
             )
         (workdir / "transcript.json").write_text(
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),

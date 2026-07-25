@@ -267,7 +267,11 @@ def _join_text(a: str, b: str) -> str:
 
 
 def _can_merge(
-    prev: SubtitleLine, line: SubtitleLine, budget: int, max_duration: float
+    prev: SubtitleLine,
+    line: SubtitleLine,
+    budget: int,
+    max_duration: float,
+    punctuated: bool = True,
 ) -> bool:
     gap = line.start - prev.end
     # a fragment on EITHER side makes this pair a fragment pair: whichever
@@ -277,6 +281,14 @@ def _can_merge(
         if gap > MERGE_FRAGMENT_GAP:  # stray 1-2 char fragment (CJK)
             return False
     else:
+        if not punctuated:
+            # Rejoining two substantial cues rests entirely on "the previous
+            # one does not end a sentence". Without punctuation that is not
+            # a finding, it is the absence of one — and acting on it glued
+            # four sentences from three speakers into one 6.6s cue. Leave
+            # the pair alone; refine restores the punctuation and then
+            # decides, with the words in front of it.
+            return False
         if _SENTENCE_END.search(prev.text):
             return False  # previous cue is a complete sentence, leave it alone
         if gap > MERGE_GAP:
@@ -287,19 +299,22 @@ def _can_merge(
 
 
 def _merge_sentence_units(
-    lines: List[SubtitleLine], settings: SubtitleSettings
+    lines: List[SubtitleLine], settings: SubtitleSettings, punctuated: bool = True
 ) -> List[SubtitleLine]:
     """Glue cues that whisper cut mid-sentence back into whole sentences.
 
     A cue ending without sentence punctuation is the tell: whatever follows
     it after a short gap is the rest of that sentence. Leaving those halves
     apart is what pushes the translator into re-flowing content across lines.
+
+    That tell only exists in a punctuated transcript. When *punctuated* is
+    False only the fragment repair runs — see ``_can_merge``.
     """
     budget = max(settings.max_chars_per_line * CUE_CHAR_BUDGET_RATIO, 1)
     max_duration = max(settings.max_duration, MERGE_MAX_DURATION)
     merged: List[SubtitleLine] = []
     for line in lines:
-        if merged and _can_merge(merged[-1], line, budget, max_duration):
+        if merged and _can_merge(merged[-1], line, budget, max_duration, punctuated):
             merged[-1].text = _join_text(merged[-1].text, line.text)
             merged[-1].end = line.end
         else:
@@ -320,6 +335,19 @@ def _fix_overlaps(lines: List[SubtitleLine]) -> int:
             line.start = round(min(prev.end, line.end - 0.05), 3)
             fixed += 1
     return fixed
+
+
+# Punctuation counts as a usable signal only when the ASR actually supplies
+# it. One transcript came back with 6% of its cues punctuated — enough for
+# has_sentence_punctuation() to answer yes, nowhere near enough to tell
+# where a sentence ends. The cut sits at "absent more often than present"
+# rather than at any measured value, so it encodes no single film's numbers.
+UNPUNCTUATED_ABOVE = 0.5
+
+
+def is_effectively_unpunctuated(lines: Sequence[SubtitleLine]) -> bool:
+    """Should punctuation-based rules be trusted on this transcript?"""
+    return open_ended_ratio(lines) > UNPUNCTUATED_ABOVE
 
 
 def has_sentence_punctuation(lines: Sequence[SubtitleLine]) -> bool:
@@ -378,18 +406,25 @@ def segment_lines(
             lines.extend(_lines_from_text(seg.start, seg.end, seg.text, settings))
 
     raw = [l.model_copy() for l in lines] if debug is not None and debug.enabled else []
-    merged = _merge_sentence_units(lines, settings)
+    punctuated = not is_effectively_unpunctuated(lines)
+    merged = _merge_sentence_units(lines, settings, punctuated)
     nudged = _fix_overlaps(merged)
 
     for i, line in enumerate(merged, start=1):
         line.index = i
 
     if debug is not None and debug.enabled:
-        _report(debug, raw, merged, nudged)
+        _report(debug, raw, merged, nudged, punctuated)
     return merged
 
 
-def _report(debug, raw: List[SubtitleLine], merged: List[SubtitleLine], nudged: int):
+def _report(
+    debug,
+    raw: List[SubtitleLine],
+    merged: List[SubtitleLine],
+    nudged: int,
+    punctuated: bool,
+):
     from app.core.debuglog import fmt_cue, percentiles
 
     debug.section("分句结果（segmenter）")
@@ -397,6 +432,11 @@ def _report(debug, raw: List[SubtitleLine], merged: List[SubtitleLine], nudged: 
     debug.kv("句子合并后条数", len(merged))
     debug.kv("因起点夹紧而顺延的 cue", nudged)
     debug.kv("ASR 是否输出句末标点", "是" if has_sentence_punctuation(merged) else "否 ⚠")
+    debug.kv(
+        "句子合并策略",
+        "完整（转写有标点可依据）" if punctuated
+        else "仅修复碎片，整句合并交给预处理（转写标点不可用 ⚠）",
+    )
     debug.kv("未完句结尾占比", f"{open_ended_ratio(merged):.0%}")
     debug.kv(
         f"≤{MERGE_FRAGMENT_CHARS} 字的碎片 cue",
