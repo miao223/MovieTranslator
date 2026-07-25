@@ -74,3 +74,67 @@ def test_is_local_model_dir(tmp_path):
     (tmp_path / "model.bin").write_bytes(b"x")
     assert is_local_model_dir(str(tmp_path))
     assert not is_local_model_dir(str(tmp_path / "nope"))  # missing dir
+
+
+# ------------------------------------- what the "test connection" button says
+
+
+class _Msg:
+    def __init__(self, content, reasoning=""):
+        self.content = content
+        self.reasoning_content = reasoning
+
+
+def _response(content, reasoning="", reasoning_tokens=0):
+    class Details:
+        pass
+
+    class Usage:
+        pass
+
+    class Resp:
+        pass
+
+    details = Details()
+    details.reasoning_tokens = reasoning_tokens
+    usage = Usage()
+    usage.completion_tokens_details = details
+    resp = Resp()
+    choice = Details()
+    choice.message = _Msg(content, reasoning)
+    resp.choices = [choice]
+    resp.usage = usage
+    return resp
+
+
+def _describe(disable_thinking, resp, accepted=True):
+    from app.api.routes import _describe_thinking
+    from app.models.schemas import LLMSettings
+
+    llm = LLMSettings(model="m", disable_thinking=disable_thinking)
+    return _describe_thinking(llm, resp, resp.choices[0].message, accepted)
+
+
+def test_thinking_reported_as_successfully_off():
+    out = _describe(True, _response("5"))
+    assert out["level"] == "success"
+    assert "已成功关闭" in out["text"]
+
+
+def test_thinking_reported_when_the_model_thought_anyway():
+    out = _describe(True, _response("5", reasoning="let me see...", reasoning_tokens=42))
+    assert out["level"] == "warning"
+    assert "仍返回了思考内容" in out["text"]
+    assert out["reasoning_tokens"] == 42
+
+
+def test_thinking_reported_when_the_provider_refused_the_parameter():
+    out = _describe(True, _response("5"), accepted=False)
+    assert out["level"] == "warning"
+    assert "不认识关闭思考的参数" in out["text"]
+
+
+def test_thinking_reported_as_on_when_the_switch_is_off():
+    out = _describe(False, _response("5", reasoning="hmm", reasoning_tokens=7))
+    assert out["level"] == "info"
+    assert "开启" in out["text"]

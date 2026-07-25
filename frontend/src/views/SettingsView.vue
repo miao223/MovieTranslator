@@ -149,8 +149,16 @@ async function testLLM() {
   testing.value = true
   try {
     const r = await api.testLLM(settings.value.llm)
-    if (r.ok) ElMessage.success('连接成功，模型回复: ' + r.reply)
-    else ElMessage.error('连接失败: ' + r.error)
+    if (!r.ok) {
+      ElMessage.error('连接失败: ' + r.error)
+    } else {
+      ElMessage.success('连接成功，模型回复: ' + r.reply)
+      if (r.thinking) {
+        // shown separately and left on screen longer: whether the switch
+        // actually took effect is the thing being tested here
+        ElMessage({ type: r.thinking.level, message: r.thinking.text, duration: 6000 })
+      }
+    }
   } catch (e) {
     ElMessage.error(e.message)
   } finally {

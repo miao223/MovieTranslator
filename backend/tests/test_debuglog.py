@@ -168,3 +168,36 @@ def test_blanks_fall_back_to_spans_without_word_timestamps():
 
     segs = [Segment(0.0, 10.0, "a"), Segment(60.0, 70.0, "b")]
     assert _blank_regions(segs, 100.0, 15.0) == [(10.0, 60.0), (70.0, 100.0)]
+
+
+# ------------------------------------------ whisper's subtitle-outro artefacts
+
+
+def test_the_canonical_outro_hallucinations_are_filtered():
+    """Verbatim from one film's second pass, which produced 20 of these."""
+    from app.services.asr import is_hallucinated
+
+    for line in (
+        "ご視聴ありがとうございました",
+        "最後までご視聴いただきありがとうございます。",
+        "チャンネル登録をお願いいたします。",
+        "Thank you for watching!",
+        "Subtitles by the Amara.org community",
+    ):
+        assert is_hallucinated(line), line
+
+
+def test_ordinary_lines_that_merely_look_suspicious_are_kept():
+    """「おやすみなさい」 came up four times in the same run and is also
+    suspicious — but "good night" is a line people say, and blocking it
+    would cost more than it saves."""
+    from app.services.asr import is_hallucinated
+
+    for line in (
+        "おやすみなさい",
+        "あああああああ",          # could be a scream in a horror film
+        "もしもし",
+        "ありがとう",
+        "本当にありがとうございました",  # gratitude in dialogue, not an outro
+    ):
+        assert not is_hallucinated(line), line

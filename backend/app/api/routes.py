@@ -156,21 +156,77 @@ def put_settings(settings: AppSettings) -> AppSettings:
 
 @router.post("/settings/test-llm")
 def test_llm(llm: LLMSettings):
-    from app.services.translator import make_openai_client
+    from app.services.translator import (
+        _THINKING_OFF,
+        _rejects_thinking,
+        make_openai_client,
+    )
 
     try:
         # use the saved network settings so the proxy switch is exercised too
         client = make_openai_client(llm, config.load_settings().network)
-        resp = client.chat.completions.create(
-            model=llm.model,
-            messages=[{"role": "user", "content": "ping，请回复 pong"}],
-            max_tokens=8,
-            temperature=0,
-        )
-        reply = (resp.choices[0].message.content or "").strip()
-        return {"ok": True, "reply": reply}
+        # a question worth a moment's thought, so a model that reasons
+        # actually will — "ping" is answered without thinking either way
+        messages = [{"role": "user", "content": "3 和 5 哪个大？只回答数字。"}]
+        extra = _THINKING_OFF if llm.disable_thinking else None
+        accepted = extra is not None
+        try:
+            resp = client.chat.completions.create(
+                model=llm.model, messages=messages, temperature=0,
+                **({"extra_body": extra} if extra else {}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not (extra and _rejects_thinking(exc)):
+                raise
+            accepted = False
+            resp = client.chat.completions.create(
+                model=llm.model, messages=messages, temperature=0,
+            )
+        message = resp.choices[0].message
+        reply = (getattr(message, "content", "") or "").strip()
+        return {
+            "ok": True,
+            "reply": reply,
+            "thinking": _describe_thinking(llm, resp, message, accepted),
+        }
     except Exception as exc:  # noqa: BLE001 — report connectivity errors verbatim
         return {"ok": False, "error": str(exc)}
+
+
+def _describe_thinking(llm, resp, message, accepted: bool) -> dict:
+    """Did the model actually think, and did the switch take effect?
+
+    Two independent signals, because either can be absent: the provider
+    returns its reasoning as `reasoning_content` next to the answer, and
+    reports `reasoning_tokens` in the usage block.
+    """
+    reasoning = (getattr(message, "reasoning_content", "") or "").strip()
+    details = getattr(getattr(resp, "usage", None), "completion_tokens_details", None)
+    tokens = getattr(details, "reasoning_tokens", 0) or 0
+    thought = bool(reasoning) or tokens > 0
+
+    if not llm.disable_thinking:
+        state = "开启（模型返回了思考内容）" if thought else "开启（本次回复未产生思考内容）"
+        return {"level": "info", "text": f"思考模式：{state}", "reasoning_tokens": tokens}
+    if not accepted:
+        return {
+            "level": "warning",
+            "text": "该服务不认识关闭思考的参数，已自动跳过——翻译不受影响，"
+                    "但如果这个模型本身会思考，那部分开销无法避免",
+            "reasoning_tokens": tokens,
+        }
+    if thought:
+        return {
+            "level": "warning",
+            "text": f"已发送关闭指令且服务端接受，但模型仍返回了思考内容"
+                    f"（{tokens} tokens）——该模型可能不支持关闭",
+            "reasoning_tokens": tokens,
+        }
+    return {
+        "level": "success",
+        "text": "思考模式已成功关闭（本次回复无思考内容）",
+        "reasoning_tokens": 0,
+    }
 
 
 # --------------------------------------------------------------- prompts
