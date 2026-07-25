@@ -144,13 +144,13 @@ def test_timestamps_are_never_sent_to_the_model():
 # --------------------------------------- local constraints the model can't see
 
 
-def test_merge_across_a_long_pause_is_rejected():
+def test_merge_across_a_pause_longer_than_a_cue_is_rejected():
     lines = [
         L(1, 0.0, 2.0, "Something happens and"),
-        L(2, 6.0, 7.0, "then more happens."),
+        L(2, 20.0, 21.0, "then more happens."),
     ]
     out, _ = run(["[1-2] Something happens and then more happens."], lines=lines)
-    assert len(out) == 2  # 4s pause: two utterances, not one sentence
+    assert len(out) == 2  # 18s: nothing is one sentence across that
 
 
 def test_merge_beyond_the_char_budget_is_rejected():
@@ -386,3 +386,78 @@ def test_rejections_are_reported_for_the_debug_log():
     )
     assert merged == 0 and len(out) == 2
     assert rejections and "间隔" in rejections[0]
+
+
+# ------------------------------- what a merge means: one sentence vs grouping
+#
+# The gap limit is measured on the cues our own splitting produced, so
+# splitting more finely lowers it — backwards, since finer lines are what
+# need merging. Making one film's segmenter hand over 1172 lines instead of
+# 725 dropped the limit from 1.80s to 1.38s and cost 28 correct merges,
+# among them 「現時点で私が一番」＋「人狼に殺されるリスクが高い」, where the
+# first half is not a sentence in any reading.
+#
+# The way out is not a bigger number but a distinction: a unit the model
+# wrote as ONE sentence is a claim about the language, which a pause cannot
+# refute; a unit holding several sentences is grouping, and there the pause
+# is real evidence. All cases below are verbatim from that run.
+
+
+def tight_filler(count, first_index):
+    """Cues 0.3s apart, so _gap_limit lands at its 1.2s floor like a real
+    transcript's does — with only two lines it would equal their own gap."""
+    return [
+        L(first_index + i, 100.0 + i * 2.3, 102.0 + i * 2.3, f"埋め草{i}です")
+        for i in range(count)
+    ]
+
+
+def test_single_sentence_survives_a_pause_the_grouping_rule_would_veto():
+    lines = [
+        L(1, 0.0, 2.0, "現時点で私が一番"),
+        L(2, 4.2, 6.2, "人狼に殺されるリスクが高い"),
+    ] + tight_filler(10, 3)
+    reply = "[1-2] 現時点で私が一番人狼に殺されるリスクが高い。\n" + "\n".join(
+        f"[{l.index}] {l.text}" for l in lines[2:]
+    )
+    out, _ = run([reply], lines=lines)  # 2.2s gap against a 1.2s limit
+    assert out[0].text == "現時点で私が一番人狼に殺されるリスクが高い。"
+
+
+def test_several_sentences_across_the_same_pause_are_still_rejected():
+    lines = [
+        L(1, 0.0, 2.0, "そこはただ命があるだけ"),
+        L(2, 4.2, 6.2, "あんたがそれを見ていないだけ"),
+    ] + tight_filler(10, 3)
+    reply = "[1-2] そこはただ命があるだけ。あんたがそれを見ていないだけ。\n" + "\n".join(
+        f"[{l.index}] {l.text}" for l in lines[2:]
+    )
+    out, _ = run([reply], lines=lines)  # same 2.2s gap, but this is grouping
+    assert [l.text for l in out[:2]] == [
+        "そこはただ命があるだけ", "あんたがそれを見ていないだけ"
+    ]
+
+
+def test_one_sentence_still_cannot_span_an_impossible_pause():
+    lines = [
+        L(1, 0.0, 2.0, "そんなんないから信"),
+        L(2, 12.5, 13.0, "じてくれ"),
+    ]
+    out, _ = run(["[1-2] そんなんないから信じてくれ。"], lines=lines)
+    assert len(out) == 2  # 10.5s > max_duration: physically not one utterance
+
+
+@pytest.mark.parametrize("text,single", [
+    ("現時点で私が一番人狼に殺されるリスクが高い。", True),
+    ("だから今夜以降さ、投票する相手を私に決めさせてほしい。", True),  # 、 is not an ender
+    ("そう？！", True),                                        # stacked enders
+    ("Yeah, like that thought never entered my mind.", True),
+    ("そこはただ命があるだけ。あんたがそれを見ていないだけ。", False),
+    ("なんで？私変わりたいの。", False),
+    ("Okay. Come on.", False),
+    ("", False),
+])
+def test_single_sentence_detection(text, single):
+    from app.services.refine import _is_single_sentence
+
+    assert _is_single_sentence(text) is single

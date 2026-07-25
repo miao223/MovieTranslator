@@ -76,7 +76,9 @@ GIVE_UP_AFTER = 3
 
 _WORD_RE = re.compile(r"[0-9A-Za-z']+|[^\sA-Za-z0-9']")
 _PUNCT = set("。、，,.!?！？…‥：:；;「」『』（）()[]【】\"“”'‘’-—―~～·・/\\|*&#")
-_SENTENCE_END_RE = re.compile(r"[.!?。！？…]$")
+_SENTENCE_CHARS = ".!?。！？…"
+_SENTENCE_END_RE = re.compile(rf"[{re.escape(_SENTENCE_CHARS)}]$")
+_SENTENCE_CHARS_RE = re.compile(rf"[{re.escape(_SENTENCE_CHARS)}]")
 
 
 def build_refine_prompt(language_hint: str = "", glossary: str = "") -> str:
@@ -198,6 +200,20 @@ def _is_fragment(line: SubtitleLine) -> bool:
     return 0 < len(text) <= FRAGMENT_CHARS and not _SENTENCE_END_RE.search(text)
 
 
+def _is_single_sentence(text: str) -> bool:
+    """Does the model's version of a unit read as one sentence?
+
+    This is the difference between the two things a merge can mean. One
+    sentence is the model *asserting* that these lines are a single
+    utterance — a statement about language, which a timestamp is in no
+    position to refute. Several sentences is the model merely grouping
+    neighbouring lines for convenience, and there a measured pause really
+    is evidence about whether they belong together.
+    """
+    stripped = text.strip().rstrip(_SENTENCE_CHARS + "\"'」』）)")
+    return bool(text.strip()) and not _SENTENCE_CHARS_RE.search(stripped)
+
+
 def _gap_limit(lines: Sequence[SubtitleLine]) -> float:
     """The pause length that counts as a real pause *in this transcript*.
 
@@ -207,6 +223,13 @@ def _gap_limit(lines: Sequence[SubtitleLine]) -> float:
     veto happens before the model's judgement is even consulted. Reading
     the limit off the file's own gap distribution keeps the rule's meaning
     ("shorter than most pauses here") stable across films.
+
+    Caveat this limit cannot escape: it is measured on the cues *our own*
+    splitting produced, so finer input lowers it — which is backwards, as
+    finer input is what needs merging most. Splitting one film's lines from
+    725 to 1172 dropped it from 1.80s to 1.38s and cost 28 correct merges.
+    ``_is_single_sentence`` is what keeps that from mattering: the merges
+    it protects are exactly the ones a pause should not be deciding.
     """
     gaps = sorted(
         b.start - a.end for a, b in zip(lines, lines[1:]) if b.start > a.end
@@ -245,17 +268,26 @@ def _apply_units(
         reason = "" if _is_faithful(text, joined) else "改写幅度过大（保真校验未通过）"
         start, end = sources[0].start, sources[-1].end
         if not reason and len(sources) > 1:
-            # constraints the model could not check: it never sees timestamps
+            # constraints the model could not check: it never sees timestamps.
+            # A unit the model wrote as ONE sentence is a claim about the
+            # language, so the pause only has to stay physically plausible;
+            # a pause longer than a whole cue may be displayed for is not an
+            # intra-sentence pause under any reading.
+            limit = (
+                max(gap_limit, settings.max_duration)
+                if _is_single_sentence(text)
+                else gap_limit
+            )
             for a, b in zip(sources, sources[1:]):
                 gap = b.start - a.end
-                if gap <= gap_limit:
+                if gap <= limit:
                     continue
                 # a pause measured against a one-or-two-character cue is not
                 # a pause, it is a bad timestamp — the model reading the words
                 # is the better judge there, so let its merge stand
                 if _is_fragment(a) or _is_fragment(b):
                     continue
-                reason = f"[{a.index}]-[{b.index}] 间隔 {gap:.1f}s > {gap_limit:.1f}s"
+                reason = f"[{a.index}]-[{b.index}] 间隔 {gap:.1f}s > {limit:.1f}s"
                 break
             if not reason and len(text) > budget:
                 reason = f"合并后 {len(text)} 字 > 每条上限 {budget} 字"

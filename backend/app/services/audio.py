@@ -195,6 +195,11 @@ def extract_audio(
             if match is None:
                 raise ValueError(f"音轨 #{track_index} 不存在于 {video_path.name}")
             in_stream = match
+        # read these while the container is open: a stream outlives it as a
+        # Python object but its fields become garbage once av frees it, and
+        # the message below exists precisely to name the track to avoid
+        stream_index = in_stream.index
+        codec_name = (in_stream.codec_context.name or "未知").upper()
         duration = float(in_container.duration / av.time_base) if in_container.duration else 0.0
 
         with av.open(str(out_wav), mode="w", format="wav") as out_container:
@@ -240,13 +245,13 @@ def extract_audio(
 
     if not decoded:
         raise ValueError(
-            f"音轨 #{in_stream.index}（{(in_stream.codec_context.name or '未知').upper()}）"
+            f"音轨 #{stream_index}（{codec_name}）"
             "无法解码，可能是编码格式不受支持或该音轨已损坏；"
             "请在任务页改选其他音轨后重试"
         )
     if log:
         log(
-            f"音轨 #{in_stream.index} 解码完成：{decoded} 个音频帧，"
+            f"音轨 #{stream_index} 解码完成：{decoded} 个音频帧，"
             f"覆盖到 {reached:.0f}s / 共 {duration:.0f}s"
             + (f"，跳过 {bad_packets} 个损坏的包" if bad_packets else "")
         )
