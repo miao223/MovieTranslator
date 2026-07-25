@@ -497,6 +497,7 @@ class JobManager:
             debug=debug,
         )
         translator.translate(lines)
+        job.publish("translating", 95, log=translator.report_usage())
         (workdir / "translation.json").write_text(
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
             encoding="utf-8",

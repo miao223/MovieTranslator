@@ -223,6 +223,120 @@ def _get_model(
     return _model
 
 
+def _report_coverage(
+    wav_path: str,
+    settings: ASRSettings,
+    segments: List[Segment],
+    log: Optional[LogFn],
+    debug,
+) -> None:
+    """How much of the speech actually made it into text.
+
+    Purely diagnostic, and never allowed to fail a job: a two-hour film had
+    15-20% of its speech silently absent, and three runs with different VAD
+    settings each lost a *different* 15-20% — which no amount of parameter
+    tuning fixes and nothing in the output revealed.
+    """
+    try:
+        import time
+
+        started = time.monotonic()
+        intervals = speech_intervals(wav_path, settings)
+        if not intervals:
+            return
+        speech, covered, misses = coverage_report(intervals, segments)
+        share = covered / speech if speech else 1.0
+        elapsed = time.monotonic() - started
+        summary = (
+            f"识别覆盖率 {share:.0%}（语音 {speech:.0f}s，转写 {covered:.0f}s，"
+            f"完全未转写的语音段 {len(misses)} 处 / {sum(d for _, _, d in misses):.0f}s）"
+        )
+        if log:
+            log(summary if share >= 0.9 else "⚠ " + summary)
+        if debug is not None and debug.enabled:
+            from app.core.debuglog import fmt_time, percentiles
+
+            debug.section("语音检测覆盖（silero VAD vs 实际转写）")
+            debug.line(
+                "silero 认定为语音、却一个字都没转写出来的区间，就是漏识别。\n"
+                "部分覆盖是正常的：silero 会把短于「最短静默」的停顿留在同一区间内。\n"
+            )
+            debug.kv("silero 语音区间", f"{len(intervals)} 段，合计 {speech:.0f}s")
+            debug.kv("实际转写覆盖", f"{covered:.0f}s")
+            debug.kv("覆盖率", f"{share:.0%}")
+            debug.kv("区间时长(s)", percentiles([e - s for s, e in intervals]))
+            debug.kv("本次检测耗时", f"{elapsed:.1f}s")
+            debug.line(f"\n完全未转写的语音段（{len(misses)} 处，按时长排序）：")
+            debug.lines(
+                f"  {fmt_time(s)} → {fmt_time(e)}  {d:6.1f}s"
+                for s, e, d in sorted(misses, key=lambda m: -m[2])
+            )
+            debug.line("\nsilero 全部语音区间：")
+            debug.lines(
+                f"  {fmt_time(s)} → {fmt_time(e)}  {e - s:6.2f}s"
+                for s, e in intervals
+            )
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never fail a job
+        if log:
+            log(f"（识别覆盖率统计未能完成: {exc}）")
+
+
+def speech_intervals(wav_path: str, settings: ASRSettings) -> List[tuple[float, float]]:
+    """Silero's own verdict on where the speech is, in seconds.
+
+    faster-whisper runs this internally when vad_filter is on, but only
+    reports the total. Having the intervals is what turns "it feels like
+    some lines are missing" into a number: any interval that comes back
+    with no transcribed words is a measured miss, not a guess.
+
+    Padding is deliberately dropped (speech_pad_ms=0) — it only exists to
+    give the decoder some run-up, and counting it here would inflate the
+    speech total by 0.8s per interval and make the comparison meaningless.
+    """
+    from faster_whisper.audio import decode_audio
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    audio = decode_audio(wav_path, sampling_rate=16000)
+    options = VadOptions(
+        threshold=settings.vad_threshold,
+        min_speech_duration_ms=settings.vad_min_speech_ms,
+        min_silence_duration_ms=settings.vad_min_silence_ms,
+        speech_pad_ms=0,
+    )
+    return [
+        (chunk["start"] / 16000.0, chunk["end"] / 16000.0)
+        for chunk in get_speech_timestamps(audio, options)
+    ]
+
+
+def coverage_report(
+    intervals: List[tuple[float, float]], segments: List[Segment]
+) -> tuple[float, float, List[tuple[float, float, float]]]:
+    """(speech total, transcribed total, misses) — all in seconds.
+
+    A "miss" is an interval Silero calls speech that received no words at
+    all, with the share of it left uncovered. Partial coverage is normal:
+    Silero keeps pauses shorter than min_silence_duration_ms inside one
+    interval, and no words land in those.
+    """
+    words = sorted(
+        (w.start, w.end) for seg in segments for w in seg.words
+    ) or sorted((s.start, s.end) for s in segments)
+
+    speech = sum(e - s for s, e in intervals)
+    covered = 0.0
+    misses: List[tuple[float, float, float]] = []
+    for start, end in intervals:
+        inside = sum(
+            max(0.0, min(end, we) - max(start, ws)) for ws, we in words
+            if we > start and ws < end
+        )
+        covered += inside
+        if inside <= 0.05 and end - start >= 1.0:
+            misses.append((start, end, end - start))
+    return speech, covered, misses
+
+
 def _debug_segment(dbg, seg, words: List[Word]) -> None:
     """Record one whisper segment verbatim, words and confidences included.
 
@@ -323,6 +437,7 @@ def transcribe(
                 log(f"[{seg.start:7.2f}s] {text}")
             if dbg:
                 _debug_segment(dbg, seg, words)
+        _report_coverage(wav_path, settings, results, log, debug)
         return results, info.language
     except (InterruptedError, KeyboardInterrupt):
         raise

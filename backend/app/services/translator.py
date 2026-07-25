@@ -203,6 +203,7 @@ class Translator:
         debug=None,
     ):
         self.debug = debug if debug is not None and debug.enabled else None
+        self.usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
         self.settings = settings
         self.target_language = target_language
         self.synopsis = synopsis
@@ -230,11 +231,43 @@ class Translator:
             temperature=self.settings.temperature,
         )
         content = resp.choices[0].message.content or ""
+        self._account(resp)
         if self.debug:
             self.debug.block(f"翻译响应 #{self._chat_seq}", content)
         if not content.strip():
             raise TranslationError("LLM 返回了空响应")
         return content
+
+    def _account(self, resp) -> None:
+        """Tally the provider's own token counts.
+
+        Estimating them from the transcript is guesswork — the conversation
+        accumulates, and providers cache prefixes — so when the question is
+        "did that change cost more?", only the reported numbers answer it.
+        """
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return
+        cached = getattr(usage, "prompt_tokens_details", None)
+        self.usage["calls"] += 1
+        self.usage["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+        self.usage["completion"] += getattr(usage, "completion_tokens", 0) or 0
+        self.usage["cached"] += getattr(cached, "cached_tokens", 0) or 0
+        if self.debug:
+            self.debug.line(
+                f"    tokens: 输入 {getattr(usage, 'prompt_tokens', 0)}"
+                f"（缓存命中 {getattr(cached, 'cached_tokens', 0) or 0}）"
+                f" 输出 {getattr(usage, 'completion_tokens', 0)}"
+            )
+
+    def report_usage(self) -> str:
+        u = self.usage
+        if not u["calls"]:
+            return "未记录 token 用量（服务端未返回 usage）"
+        return (
+            f"翻译共 {u['calls']} 次请求：输入 {u['prompt']:,} tokens"
+            f"（其中缓存命中 {u['cached']:,}）、输出 {u['completion']:,} tokens"
+        )
 
     def _system_prompt(self) -> str:
         return build_system_prompt(

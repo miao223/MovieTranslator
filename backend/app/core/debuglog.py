@@ -25,6 +25,7 @@ never its value — same rule as the job log.
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -54,6 +55,7 @@ class DebugLog:
 
     def __init__(self, path: Optional[Path] = None, enabled: bool = False):
         self._lock = threading.Lock()
+        self._started = time.monotonic()
         self.enabled = bool(enabled and path is not None)
         self.path: Optional[Path] = path if self.enabled else None
         if not self.enabled:
@@ -85,7 +87,11 @@ class DebugLog:
             self.enabled = False  # disk full / unplugged: stop trying
 
     def section(self, title: str) -> None:
-        self._write(f"\n\n{'=' * 78}\n== {title}\n{'=' * 78}\n")
+        elapsed = time.monotonic() - self._started
+        self._write(
+            f"\n\n{'=' * 78}\n== {title}"
+            f"    [任务开始后 {elapsed / 60:.1f} 分钟]\n{'=' * 78}\n"
+        )
 
     def line(self, text: str = "") -> None:
         self._write(text + "\n")

@@ -270,3 +270,43 @@ def test_the_alignment_check_does_not_fire_on_a_well_aligned_batch():
     for line in lines:
         line.translation = zh_for(line.text)
     assert _length_correlation(lines) > ALIGNMENT_MIN_CORRELATION + 0.2
+
+
+# ------------------------------------------------------------ token accounting
+
+
+class UsageClient(FakeClient):
+    """FakeClient whose responses carry a provider usage block."""
+
+    def create(self, model, messages, temperature, **kw):
+        resp = super().create(model, messages, temperature, **kw)
+
+        class Details:
+            cached_tokens = 100
+
+        class Usage:
+            prompt_tokens = 1000
+            completion_tokens = 300
+            prompt_tokens_details = Details()
+
+        resp.usage = Usage()
+        return resp
+
+
+def test_token_usage_is_tallied_from_the_provider():
+    lines = make_lines(2)
+    tr = Translator(settings(batch_size=5), "简体中文",
+                    client=UsageClient(["glossary", "[1] 一\n[2] 二"]))
+    tr.translate(lines)
+    assert tr.usage == {"calls": 2, "prompt": 2000, "completion": 600, "cached": 200}
+    assert "2 次请求" in tr.report_usage()
+    assert "2,000" in tr.report_usage()
+
+
+def test_a_provider_without_usage_is_tolerated():
+    lines = make_lines(2)
+    tr = Translator(settings(batch_size=5), "简体中文",
+                    client=FakeClient(["glossary", "[1] 一\n[2] 二"]))
+    tr.translate(lines)
+    assert tr.usage["calls"] == 0
+    assert "未记录" in tr.report_usage()

@@ -1,4 +1,5 @@
 """Debug mode must be invisible when off and complete when on."""
+import pytest
 
 from pathlib import Path
 
@@ -48,3 +49,29 @@ def test_formatting_helpers():
     assert "0:01:01.500" in fmt_cue(1, 61.5, 63.0, "hi")
     assert percentiles([]) == "（无数据）"
     assert "P50=2.00" in percentiles([1.0, 2.0, 3.0])
+
+
+def test_speech_coverage_finds_intervals_with_no_words():
+    """The metric that turns "some lines feel missing" into a number."""
+    from app.services.asr import Segment, Word, coverage_report
+
+    intervals = [(0.0, 5.0), (10.0, 14.0), (20.0, 23.0)]
+    segments = [
+        Segment(0.0, 5.0, "spoken", words=[Word(0.2, 4.8, "spoken")]),
+        # nothing at all for 10-14 — a miss
+        Segment(20.0, 23.0, "also", words=[Word(20.1, 22.9, "also")]),
+    ]
+    speech, covered, misses = coverage_report(intervals, segments)
+    assert speech == 12.0
+    assert covered == pytest.approx(7.4)  # 4.6s + 2.8s of words
+    assert [round(m[0]) for m in misses] == [10]
+
+
+def test_coverage_ignores_intervals_shorter_than_a_second():
+    """Sub-second gaps are breaths, not missing dialogue."""
+    from app.services.asr import Segment, Word, coverage_report
+
+    intervals = [(0.0, 5.0), (10.0, 10.4)]
+    segments = [Segment(0.0, 5.0, "x", words=[Word(0.2, 4.8, "x")])]
+    _, _, misses = coverage_report(intervals, segments)
+    assert misses == []
