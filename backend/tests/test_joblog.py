@@ -125,3 +125,16 @@ def test_download_log_rejects_paths_outside_the_folder(logdir):
         with pytest.raises(HTTPException) as err:
             download_log(name)
         assert err.value.status_code == 404
+
+
+def test_version_endpoint_reports_the_running_build():
+    """The header reads this to show which build answered the request."""
+    from fastapi.testclient import TestClient
+
+    from app.core.joblog import APP_VERSION
+    from app.main import app
+
+    with TestClient(app) as client:
+        body = client.get("/api/version").json()
+    assert body["version"] == APP_VERSION
+    assert body["version"][0].isdigit()

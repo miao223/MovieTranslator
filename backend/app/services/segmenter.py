@@ -31,16 +31,30 @@ MIN_LINE_DURATION = 0.5  # seconds
 GAP_BREAK = 1.5  # silence between words that forces a new line (s)
 NO_HARD_SPLIT_BELOW = 12  # never character-cut texts shorter than this
 CHARS_PER_SECOND = 3.0  # conservative speaking-rate floor for bogus-duration cap
-MERGE_FRAGMENT_CHARS = 2  # trailing fragments this short get merged back
-# ...regardless of the measured gap: a cue holding one or two characters is
-# precisely the cue whose word timestamps cannot be trusted, so a large gap
-# next to it is evidence the timing is wrong, not that the speech is apart.
-# Trusting the gap here is what produced 「て」/「かこれ…」 → "什" / "么…".
+# How short is "too short to mean anything"? The number depends on the
+# script, because scripts delimit differently — see text_units(). Counting
+# characters everywhere is what let English fragments through every rule
+# here: "around" is six characters but one word, and left on its own it has
+# no counterpart in the target language, so the translator folds it into the
+# previous line and shifts the rest of the film.
+FRAGMENT_CJK_CHARS = 2
+FRAGMENT_LATIN_WORDS = 2
+# ...and a latin fragment has to be short in characters too. Word count
+# alone would call a single 60-character token a fragment; whatever that
+# is (a URL, a run-on transcription artefact), it is not the tail of a
+# sentence. Real ones sit far below: "around" 6, "holding on" 10,
+# "legal counsel" 13.
+FRAGMENT_LATIN_MAX_CHARS = 20
+# ...and a fragment gets merged back regardless of the measured gap: a cue
+# that short is precisely the cue whose word timestamps cannot be trusted,
+# so a large gap next to it is evidence the timing is wrong, not that the
+# speech is apart. Trusting the gap produced 「て」/「かこれ…」 → "什" / "么…".
 MERGE_FRAGMENT_GAP = GAP_BREAK
-# a time-driven break must never strand a piece shorter than this: whisper
+# a time-driven break must never strand a piece this short: whisper
 # occasionally reports a multi-second gap in the middle of a single word
 # (「伊」…25s…「勢が6票」), and honouring it splits the word in half
-MIN_PIECE_CHARS = 3
+MIN_PIECE_CJK_CHARS = 3
+MIN_PIECE_LATIN_WORDS = 1
 
 # A cue may occupy two display lines (the 42-chars figure of subtitle style
 # guides is per DISPLAY line, not per cue), so accumulation gets twice the
@@ -54,6 +68,56 @@ MERGE_MAX_DURATION = 7.0  # a merged cue never lasts longer than this (s)
 # a clause-boundary break must leave at least this share of the buffer behind,
 # otherwise breaking at the overflowing word is the lesser evil
 MIN_CLAUSE_BREAK_RATIO = 0.4
+
+
+def is_cjk_text(text: str) -> bool:
+    """Is this written in a script that does not separate words with spaces?"""
+    counted = [ch for ch in text if not ch.isspace()]
+    if not counted:
+        return False
+    cjk = sum(
+        1
+        for ch in counted
+        if "぀" <= ch <= "ヿ" or "㐀" <= ch <= "鿿" or "가" <= ch <= "힯"
+    )
+    return cjk >= len(counted) * 0.5
+
+
+def text_units(text: str) -> int:
+    """Length of *text* in the units its script actually delimits.
+
+    Chinese and Japanese write without spaces, so a character is the
+    meaningful unit. Latin scripts delimit words, and there a character
+    count says nothing about whether a line can stand on its own.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    return len(stripped) if is_cjk_text(stripped) else len(stripped.split())
+
+
+def is_short_text(text: str, cjk_chars: int, latin_words: int) -> bool:
+    """Is *text* at or below the given limit, in its own script's units?"""
+    size = text_units(text)
+    if size == 0:
+        return False
+    return size <= (cjk_chars if is_cjk_text(text.strip()) else latin_words)
+
+
+def is_fragment_text(text: str) -> bool:
+    """Too short to carry meaning on its own, whatever the script.
+
+    Sentence punctuation is the veto: "Okay." and "Yeah." are one word
+    each and are complete lines, while "around" and "years" are the tail
+    of a sentence whose head is in the previous cue. Ending on a full stop
+    is the ASR telling us which of the two this is.
+    """
+    stripped = text.strip()
+    if _SENTENCE_END.search(stripped):
+        return False
+    if not is_cjk_text(stripped) and len(stripped) > FRAGMENT_LATIN_MAX_CHARS:
+        return False
+    return is_short_text(stripped, FRAGMENT_CJK_CHARS, FRAGMENT_LATIN_WORDS)
 
 
 def _cap_bogus_duration(text: str, start: float, end: float) -> float:
@@ -102,7 +166,7 @@ def _trustworthy_start(take: Sequence[Word]) -> float:
     """
     for i in range(1, len(take)):
         head = "".join(w.text for w in take[:i]).strip()
-        if len(head) >= MIN_PIECE_CHARS:
+        if not is_short_text(head, MIN_PIECE_CJK_CHARS, MIN_PIECE_LATIN_WORDS):
             break
         if take[i].start - take[i - 1].end > GAP_BREAK:
             return take[i].start
@@ -149,7 +213,9 @@ def _lines_from_words(words: Sequence[Word], settings: SubtitleSettings) -> List
             # a break here would leave `head` alone as a cue; below a few
             # characters that is not a line but half a word, and the
             # translator has no choice but to render it as half a word
-            strands_fragment = len(head) < MIN_PIECE_CHARS
+            strands_fragment = is_short_text(
+                head, MIN_PIECE_CJK_CHARS, MIN_PIECE_LATIN_WORDS
+            )
             if (gap or too_slow) and not strands_fragment:
                 flush()  # time-driven breaks always cut the whole buffer
             elif too_long:
@@ -275,10 +341,14 @@ def _can_merge(
 ) -> bool:
     gap = line.start - prev.end
     # a fragment on EITHER side makes this pair a fragment pair: whichever
-    # cue holds one or two characters is the one whose timing is suspect
-    fragment = min(len(prev.text.strip()), len(line.text.strip()))
-    if fragment <= MERGE_FRAGMENT_CHARS:
-        if gap > MERGE_FRAGMENT_GAP:  # stray 1-2 char fragment (CJK)
+    # cue is too short to stand alone is the one whose timing is suspect
+    if is_fragment_text(prev.text) or is_fragment_text(line.text):
+        if is_fragment_text(line.text) and _SENTENCE_END.search(prev.text.strip()):
+            # the fragment opens the NEXT utterance, so gluing it backwards
+            # splits a word across cues just as surely: "I'm gonna call
+            # Odessa PD. I" + "understand it now…"
+            return False
+        if gap > MERGE_FRAGMENT_GAP:  # a stray fragment, not a separate line
             return False
     else:
         if not punctuated:
@@ -381,7 +451,7 @@ def fragment_count(lines: Sequence[SubtitleLine]) -> int:
     return sum(
         1
         for l in lines
-        if len(l.text.strip()) <= MERGE_FRAGMENT_CHARS
+        if is_fragment_text(l.text)
         and not _SENTENCE_END.search(l.text.strip())
     )
 
@@ -439,7 +509,7 @@ def _report(
     )
     debug.kv("未完句结尾占比", f"{open_ended_ratio(merged):.0%}")
     debug.kv(
-        f"≤{MERGE_FRAGMENT_CHARS} 字的碎片 cue",
+        f"碎片 cue（中日文≤{FRAGMENT_CJK_CHARS}字／西文≤{FRAGMENT_LATIN_WORDS}词）",
         f"{fragment_count(merged)} / {len(merged)}",
     )
     gaps = [b.start - a.end for a, b in zip(merged, merged[1:])]

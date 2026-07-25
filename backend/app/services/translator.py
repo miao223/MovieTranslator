@@ -18,7 +18,7 @@ Protocol (the core idea of this project):
 from __future__ import annotations
 
 import re
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 from app.models.schemas import (
     LLMSettings,
@@ -125,6 +125,31 @@ _LINE_RE = re.compile(r"^\s*\[?(\d+)\]?[.、:：]?\s*(.*\S)\s*$")
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*$")
 
 MAX_BATCH_RETRIES = 2
+# Alignment check (see Translator._verify_alignment). Measured on real runs:
+# correctly aligned batches sit at r=+0.91..+0.93, a shifted one at +0.12.
+# Nothing lands near the middle, so the cut is placed there.
+ALIGNMENT_MIN_CORRELATION = 0.45
+# below this many lines the correlation is noise, not evidence
+ALIGNMENT_MIN_LINES = 20
+
+
+def _length_correlation(lines: Sequence[SubtitleLine]) -> Optional[float]:
+    """Pearson r between source and translation length across *lines*.
+
+    None when the batch is too small, or when one side has no variation in
+    length at all (a run of "Yeah." / "Okay." says nothing either way).
+    """
+    pairs = [(len(l.text), len(l.translation)) for l in lines if l.translation]
+    if len(pairs) < ALIGNMENT_MIN_LINES:
+        return None
+    n = len(pairs)
+    mx = sum(p[0] for p in pairs) / n
+    my = sum(p[1] for p in pairs) / n
+    dx = sum((p[0] - mx) ** 2 for p in pairs) ** 0.5
+    dy = sum((p[1] - my) ** 2 for p in pairs) ** 0.5
+    if not dx or not dy:
+        return None
+    return sum((p[0] - mx) * (p[1] - my) for p in pairs) / (dx * dy)
 
 
 class TranslationError(Exception):
@@ -276,7 +301,14 @@ class Translator:
                     "role": "user",
                     "content": (
                         f"请输出第 {first} 行到第 {last} 行的译文，"
-                        "每行格式 `[行号] 译文`，逐行对应，勿遗漏。"
+                        "每行格式 `[行号] 译文`，逐行对应，勿遗漏。\n"
+                        # The transcript is already in the conversation, but
+                        # locating line 601 in it means counting through
+                        # thousands of lines. Restating this batch removes
+                        # that from the model's job: one English film came
+                        # out 82% misaligned because the count slipped.
+                        "以下是这些行的原文，请严格按行号逐行对应翻译：\n"
+                        + _numbered(chunk)
                     ),
                 }
             )
@@ -321,7 +353,61 @@ class Translator:
             raise TranslationError(
                 f"多次重试后仍缺失第 {missing[:10]} 等 {len(missing)} 行译文"
             )
-        return reply
+        return self._verify_alignment(messages, chunk, reply)
+
+    # --------------------------------------------------- alignment check
+
+    def _verify_alignment(
+        self, messages: List[dict], chunk: List[SubtitleLine], reply: str
+    ) -> str:
+        """Catch a batch whose translations sit one or more lines off.
+
+        Every line coming back with the right number proves nothing about
+        whether its *content* belongs there: the model can lose its place
+        and still number its output correctly, which is how one film went
+        out 82% misaligned with every check passing. Line length is the
+        signal that survives translation — a long source line stays long —
+        so the correlation across a batch collapses as soon as the rows
+        slide against each other.
+        """
+        first, last = chunk[0].index, chunk[-1].index
+        before = _length_correlation(chunk)
+        if self.debug:
+            self.debug.line(
+                f"批次 [{first}-{last}] 原文/译文长度相关性 r="
+                + ("（样本不足，未校验）" if before is None else f"{before:+.2f}")
+            )
+        if before is None or before >= ALIGNMENT_MIN_CORRELATION:
+            return reply
+
+        self.log(
+            f"⚠ 第 {first}-{last} 行译文疑似整批错位（长度相关性 {before:+.2f}），重新请求…"
+        )
+        kept = {line.index: line.translation for line in chunk}
+        ask = (
+            "上一次输出的译文与原文没有逐行对应，疑似整批错开了一行或多行。"
+            "请重新输出这些行的译文，逐行核对行号与原文，不要合并或跳过任何一行：\n"
+            + _numbered(chunk)
+        )
+        retry = self._chat(
+            messages
+            + [{"role": "assistant", "content": reply}, {"role": "user", "content": ask}]
+        )
+        parsed = parse_translations(retry)
+        for line in chunk:
+            line.translation = parsed.get(line.index) or kept.get(line.index, "")
+
+        after = _length_correlation(chunk)
+        if after is None or after <= before:
+            for line in chunk:  # the retry was no better; keep the first answer
+                line.translation = kept.get(line.index, line.translation)
+            self.log(
+                f"⚠ 第 {first}-{last} 行重试后仍未对齐，已保留首次结果；"
+                "该段译文可能与原文错位，建议人工核对"
+            )
+            return reply
+        self.log(f"第 {first}-{last} 行重新请求后对齐正常（{after:+.2f}）")
+        return retry
 
     # ------------------------------------------------------ chunked mode
 

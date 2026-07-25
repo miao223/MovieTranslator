@@ -28,6 +28,16 @@ from app.services.pipeline import manager
 router = APIRouter(prefix="/api")
 
 
+@router.get("/version")
+def get_version() -> dict:
+    """Shown in the page header: which build is actually running.
+
+    The app is distributed as a zip and updated by replacing files, so
+    "did the update take?" is a question that comes up on every release.
+    """
+    return {"version": joblog.APP_VERSION}
+
+
 # ------------------------------------------------------------------- jobs
 
 

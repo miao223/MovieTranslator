@@ -15,6 +15,7 @@ async function request(url, options = {}) {
 }
 
 export const api = {
+  getVersion: () => request('/api/version'),
   createJob: (payload) =>
     request('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
   getJob: (id) => request(`/api/jobs/${id}`),

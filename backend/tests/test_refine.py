@@ -461,3 +461,28 @@ def test_single_sentence_detection(text, single):
     from app.services.refine import _is_single_sentence
 
     assert _is_single_sentence(text) is single
+
+
+def test_a_fragment_merge_may_run_past_the_width_budget():
+    """A wide cue is a readability cost; a stranded fragment shifts the film.
+
+    Verbatim from the run where this decided it: the merge came to 85
+    characters against an 84 budget, was rejected, and "around" was left as
+    its own cue — after which every translation was one line late.
+    """
+    head = "I can't remember if he hit me and then threw me on the ground or the other way"
+    lines = [L(1, 0.0, 2.7, head), L(2, 2.8, 3.4, "around")] + tight_filler(10, 3)
+    reply = f"[1-2] {head} around.\n" + "\n".join(
+        f"[{l.index}] {l.text}" for l in lines[2:]
+    )
+    out, _ = run([reply], lines=lines, subtitle=SubtitleSettings(max_chars_per_line=42))
+    assert out[0].text.endswith("or the other way around.")
+
+
+def test_a_non_fragment_merge_still_obeys_the_width_budget():
+    a = "This is a perfectly ordinary subtitle line of some length here"
+    b = "and this is another perfectly ordinary line of similar length"
+    lines = [L(1, 0.0, 2.0, a), L(2, 2.2, 4.0, b)] + tight_filler(10, 3)
+    reply = f"[1-2] {a} {b}.\n" + "\n".join(f"[{l.index}] {l.text}" for l in lines[2:])
+    out, _ = run([reply], lines=lines, subtitle=SubtitleSettings(max_chars_per_line=42))
+    assert [out[0].text, out[1].text] == [a, b]  # 123 chars: rejected

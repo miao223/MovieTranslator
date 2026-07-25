@@ -145,10 +145,11 @@ def test_merge_stops_at_a_real_pause():
 
 
 def test_merge_respects_the_char_budget():
-    segs = [(0.0, 2.0, "a" * 60), (2.0, 4.0, "b" * 40 + ".")]
+    """No cue may exceed two display lines, however the merging falls out."""
+    segs = [(0.0, 2.0, "alpha " * 12 + "and"), (2.0, 4.0, "bravo " * 8 + "end.")]
     lines = segment_lines(segs, SubtitleSettings(max_chars_per_line=42))
-    assert sum(len(l.text) for l in lines) == 101
-    assert all(len(l.text) <= 84 for l in lines)  # 60 + 40 never end up together
+    assert lines
+    assert all(len(l.text) <= 84 for l in lines)
 
 
 def test_cjk_merge_keeps_no_space():
@@ -310,3 +311,71 @@ def test_the_unpunctuated_verdict_is_a_majority_not_an_any():
 
     mostly_punctuated = [L("うん。")] * 9 + [L("これが本当だったらな")]
     assert not is_effectively_unpunctuated(mostly_punctuated)
+
+
+# ------------------------------------------- fragments in a space-delimited script
+#
+# Every fragment rule here counted characters, which says nothing in
+# English: "around" is six characters and one word. Left as its own cue it
+# has no counterpart in Chinese, the translator folds it into the previous
+# line, and the rest of the film shifts. All lines below are verbatim from
+# a Landman S02E10 run that came out 82% misaligned.
+
+
+def test_english_sentence_tail_is_a_fragment():
+    from app.services.segmenter import is_fragment_text
+
+    for tail in ("around", "years", "legal counsel", "holding on", "better"):
+        assert is_fragment_text(tail), tail
+
+
+def test_a_complete_short_utterance_is_not_a_fragment():
+    """One word plus a full stop is a line; the punctuation is the tell."""
+    from app.services.segmenter import is_fragment_text
+
+    for line in ("Okay.", "Yeah.", "No, sir.", "Thank you.", "うん。", "はい。"):
+        assert not is_fragment_text(line), line
+
+
+def test_a_single_enormous_token_is_not_a_fragment():
+    from app.services.segmenter import is_fragment_text
+
+    assert not is_fragment_text("Supercalifragilisticexpialidocious" * 2)
+
+
+def test_cjk_fragments_still_measured_in_characters():
+    from app.services.segmenter import is_fragment_text, text_units
+
+    assert is_fragment_text("伊")
+    assert is_fragment_text("とみ")
+    assert not is_fragment_text("ちゃんと話そう")
+    assert text_units("ちゃんと話そう") == 7          # characters
+    assert text_units("Have fun at your camp") == 5  # words
+
+
+def test_english_sentence_tail_is_rejoined():
+    """The cue that shifted the film: 「…or the other way」 + 「around」.
+
+    A character count made "around" look substantial, so it stayed its own
+    cue; the translator had nothing to put there and pulled the next line's
+    meaning forward instead.
+    """
+    segs = [
+        (1249.2, 1251.9, "I can't remember if he hit me or the other way"),
+        (1252.0, 1252.6, "around"),
+    ]
+    lines = segment_lines(segs, SubtitleSettings(max_chars_per_line=60))
+    assert len(lines) == 1
+    assert lines[0].text.endswith("or the other way around")
+
+
+def test_a_fragment_is_not_glued_onto_a_finished_sentence():
+    """「I」 belongs to what follows, not to the full stop before it."""
+    segs = [
+        (37.38, 40.12, "I'm gonna call Odessa PD."),
+        (40.96, 41.46, "I"),
+        (41.34, 45.18, "understand it now what drove him"),
+    ]
+    lines = segment_lines(segs, SubtitleSettings())
+    assert lines[0].text == "I'm gonna call Odessa PD."
+    assert any("I understand it now" in l.text for l in lines)

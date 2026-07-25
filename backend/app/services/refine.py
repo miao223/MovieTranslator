@@ -33,6 +33,7 @@ from app.services.segmenter import (
     MERGE_MAX_DURATION,
     _join_text,
     has_sentence_punctuation,
+    is_fragment_text,
     open_ended_ratio,
 )
 from app.services.translator import estimate_tokens, make_openai_client
@@ -63,11 +64,14 @@ MAX_INTERNAL_GAP_CEILING = 2.5
 # fixed 1.2s, one film had 70% of its cue pairs vetoed before the model's
 # proposal was even looked at, and the whole pass merged 6 lines out of 764.
 GAP_PERCENTILE = 0.40
-# a cue this short cannot carry meaning on its own, so a "pause" measured
-# against it is not evidence of anything: its timestamps are the least
-# reliable in the file. Vetoing those merges is what left 「伊」 and
-# 「勢が6票」 as separate cues, translated as "伊" and "势 6票".
-FRAGMENT_CHARS = 3
+# How much a fragment merge may overflow the per-cue character budget.
+# The budget protects readability; a fragment left alone breaks
+# correctness — it has no counterpart in the target language, so the
+# translator folds it into the neighbouring line and every line after it
+# shifts. A third display line is the price, and it is the cheaper one:
+# 32 of one English film's 70 budget rejections stranded a fragment, and
+# the file came out 82% misaligned.
+FRAGMENT_BUDGET_RATIO = 1.5
 # how many lines of the previous chunk are shown as read-only context
 CONTEXT_LINES = 2
 # consecutive chunk failures after which the pass gives up entirely — an
@@ -195,9 +199,12 @@ def _covers_exactly(units: Sequence[tuple[int, int, str]], lines: Sequence[Subti
 
 
 def _is_fragment(line: SubtitleLine) -> bool:
-    """Too short to be a line of its own — so its timing means nothing."""
-    text = line.text.strip()
-    return 0 < len(text) <= FRAGMENT_CHARS and not _SENTENCE_END_RE.search(text)
+    """Too short to be a line of its own — so its timing means nothing.
+
+    Sized in the units the script delimits (see segmenter.text_units): a
+    character count called "around" a substantial line and let it through.
+    """
+    return is_fragment_text(line.text)
 
 
 def _is_single_sentence(text: str) -> bool:
@@ -289,8 +296,15 @@ def _apply_units(
                     continue
                 reason = f"[{a.index}]-[{b.index}] 间隔 {gap:.1f}s > {limit:.1f}s"
                 break
-            if not reason and len(text) > budget:
-                reason = f"合并后 {len(text)} 字 > 每条上限 {budget} 字"
+            # A merge that rescues a fragment may run past the width budget:
+            # a wide cue is a readability cost, a stranded fragment is a
+            # correctness one. The allowance is bounded so the cue still
+            # fits on screen.
+            width = budget
+            if any(_is_fragment(s) for s in sources):
+                width = int(budget * FRAGMENT_BUDGET_RATIO)
+            if not reason and len(text) > width:
+                reason = f"合并后 {len(text)} 字 > 每条上限 {width} 字"
             if not reason and end - start > max_duration:
                 # An over-long span with a fragment on one edge is that
                 # fragment's bogus timestamp, not a genuinely long cue:
