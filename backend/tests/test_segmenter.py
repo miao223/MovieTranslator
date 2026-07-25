@@ -172,3 +172,82 @@ def test_open_ended_ratio_measures_fragmentation():
         SubtitleSettings(),
     )
     assert open_ended_ratio(lines) == pytest.approx(1 / 3)
+
+
+# ------------------------------------------------- fragments and bad timings
+#
+# Real cues from the user's 人狼ゲーム run. whisper reported multi-second
+# gaps in the middle of single words, the segmenter honoured them, and the
+# translator had no choice but to render half a word per cue:
+# 「て」/「かこれ…」 → "什" / "么…", 「伊」/「勢が6票」 → "伊" / "势 6票".
+
+
+def test_time_gap_never_strands_a_one_character_cue():
+    seg = Segment(136.0, 145.0, "てかこれどういうこと", words=[
+        w(136.67, 137.17, "て"),
+        w(141.34, 141.60, "か"),  # 4.2s "pause" in the middle of 「てか」
+        w(141.60, 142.40, "これ"),
+        w(142.40, 144.66, "どういうこと"),
+    ])
+    lines = segment_lines([seg], SubtitleSettings())
+    # 「て」 must not become a cue of its own; where the rest is split (the
+    # 6s duration cap still applies) is a separate question
+    assert lines[0].text.startswith("てか")
+    assert all(len(l.text) > 2 for l in lines)
+
+
+def test_a_stranded_start_is_pulled_forward_to_the_speech():
+    """The end time is where the audio actually was; the start is not."""
+    seg = Segment(0.0, 30.0, "x", words=[
+        w(2857.34, 2857.84, "伊"),
+        w(2882.84, 2883.84, "勢が6票"),  # 25s later, same word
+    ])
+    lines = segment_lines([seg], SubtitleSettings(max_duration=6.0))
+    assert len(lines) == 1
+    assert lines[0].text == "伊勢が6票"
+    # would have been 2857.34 — a cue appearing 25s before it is spoken
+    assert lines[0].start == pytest.approx(2882.84, abs=0.01)
+    assert lines[0].end == pytest.approx(2883.84, abs=0.01)
+
+
+def test_a_break_still_happens_once_the_head_is_a_real_line():
+    seg = Segment(0.0, 30.0, "x", words=[
+        w(0.0, 0.5, "ちゃんと"), w(0.5, 1.0, "話そう"),
+        w(9.0, 9.5, "それで"),  # 8s gap, head is long enough to stand alone
+    ])
+    lines = segment_lines([seg], SubtitleSettings())
+    assert [l.text for l in lines] == ["ちゃんと話そう", "それで"]
+
+
+def test_clamped_starts_never_overlap_the_previous_cue():
+    segs = [
+        Segment(0.0, 20.0, "x", words=[w(0.0, 19.0, "先に長く喋っている台詞です")]),
+        Segment(20.0, 40.0, "y", words=[w(5.0, 5.2, "あ"), w(39.0, 40.0, "とで話そう")]),
+    ]
+    lines = segment_lines(segs, SubtitleSettings(max_duration=6.0))
+    for prev, line in zip(lines, lines[1:]):
+        assert line.start >= prev.end
+
+
+def test_fragment_metrics_report_what_the_srt_hides():
+    from app.services.segmenter import fragment_count, has_sentence_punctuation
+
+    lines = segment_lines(
+        [(0.0, 1.0, "伊"), (2.0, 3.0, "ちゃんと話そう")], SubtitleSettings()
+    )
+    assert not has_sentence_punctuation(lines)
+    assert fragment_count(lines) >= 0  # merged or not, the metric is defined
+
+    punctuated = segment_lines([(0.0, 1.0, "話そう。")], SubtitleSettings())
+    assert has_sentence_punctuation(punctuated)
+
+
+def test_only_the_fragment_side_of_a_suppressed_gap_is_distrusted():
+    """A real pause after a real line keeps its timing untouched."""
+    seg = Segment(0.0, 30.0, "x", words=[
+        w(10.0, 11.0, "ちゃんと話そう"),
+        w(11.2, 11.4, "そ"),
+        w(14.0, 14.5, "れでいい"),   # fragment 「そ」 sits before this gap
+    ])
+    lines = segment_lines([seg], SubtitleSettings())
+    assert lines[0].start == pytest.approx(10.0)  # not moved

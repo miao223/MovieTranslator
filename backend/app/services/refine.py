@@ -32,6 +32,7 @@ from app.services.segmenter import (
     CUE_CHAR_BUDGET_RATIO,
     MERGE_MAX_DURATION,
     _join_text,
+    has_sentence_punctuation,
     open_ended_ratio,
 )
 from app.services.translator import estimate_tokens, make_openai_client
@@ -51,8 +52,22 @@ MAX_ADDED_FLOOR = 2  # ...but always allow a couple, so short lines can be fixed
 # OUTPUT limit (commonly 4k-16k tokens), not just its context window
 REFINE_CHUNK_TOKENS = 1_500
 # lines further apart than this are separate utterances no matter what the
-# grammar suggests — the model cannot know, it never sees timestamps
+# grammar suggests — the model cannot know, it never sees timestamps.
+# A floor, not the value actually used: see _gap_limit().
 MAX_INTERNAL_GAP = 1.2
+# ...and however inflated a film's timings are, a pause this long between
+# two SUBSTANTIAL lines is a real one
+MAX_INTERNAL_GAP_CEILING = 2.5
+# share of the film's own inter-cue gaps the limit is placed at, so a
+# transcript whose timings are uniformly padded still gets merged. With a
+# fixed 1.2s, one film had 70% of its cue pairs vetoed before the model's
+# proposal was even looked at, and the whole pass merged 6 lines out of 764.
+GAP_PERCENTILE = 0.40
+# a cue this short cannot carry meaning on its own, so a "pause" measured
+# against it is not evidence of anything: its timestamps are the least
+# reliable in the file. Vetoing those merges is what left 「伊」 and
+# 「勢が6票」 as separate cues, translated as "伊" and "势 6票".
+FRAGMENT_CHARS = 3
 # how many lines of the previous chunk are shown as read-only context
 CONTEXT_LINES = 2
 # consecutive chunk failures after which the pass gives up entirely — an
@@ -60,28 +75,44 @@ CONTEXT_LINES = 2
 GIVE_UP_AFTER = 3
 
 _WORD_RE = re.compile(r"[0-9A-Za-z']+|[^\sA-Za-z0-9']")
+_PUNCT = set("。、，,.!?！？…‥：:；;「」『』（）()[]【】\"“”'‘’-—―~～·・/\\|*&#")
+_SENTENCE_END_RE = re.compile(r"[.!?。！？…]$")
 
 
-def build_refine_prompt(language_hint: str = "") -> str:
+def build_refine_prompt(language_hint: str = "", glossary: str = "") -> str:
     lang = f"（原文语言：{language_hint}）" if language_hint else ""
-    return "\n".join([
+    parts = [
         f"你是字幕转写整理员{lang}。输入是语音识别产生的字幕行，格式 `[行号] 原文`。",
-        "你的任务只有三件事：",
-        "1. 把被错误切断的同一句话合并成一行（这是最重要的任务）；",
+        "你的任务只有四件事：",
+        "1. 把被错误切断的同一句话合并成一行（这是最重要的任务）。"
+        "只有一两个字的行几乎一定是上一行或下一行的一部分，务必合并；",
         "2. 修正明显的语音识别错误：同音/近音词、漏词、错词；",
-        "3. 删除口吃、重复词、语气噪音等明显的识别杂音。",
+        "3. 删除口吃、重复词、语气噪音等明显的识别杂音；",
+        "4. 补回缺失的句末标点（。？！等）和必要的停顿标点。"
+        "语音识别常常整片不输出标点，而断句、换行、合并都依赖标点。"
+        "只增删标点，一个字都不要改。",
         "严格禁止：",
         "- 禁止翻译，输出必须与输入是同一种语言；",
         "- 禁止改写措辞、润色文风、增加或删减实质内容；",
         "- 禁止把一行拆成多行；",
-        "- 人名、地名、专有名词保持原样，不要改动。",
+    ]
+    if glossary.strip():
+        parts += [
+            "- 专有名词按下面的对照表纠正（识别结果与表中某个词读音相近时，"
+            "改成表中的原文写法）；表中没有的人名、地名保持原样。",
+            "专有名词对照表：\n" + glossary.strip(),
+        ]
+    else:
+        parts.append("- 人名、地名、专有名词保持原样，不要改动。")
+    parts += [
         "输出格式：每行 `[行号] 整理后的原文`；合并多行时写成 `[起始行号-结束行号] 整理后的原文`。",
         "必须覆盖输入的全部行号，顺序递增，不得跳过、重复或新增行号。",
         "不要输出解释、注释、代码块标记或任何多余内容。",
         "示例：",
-        "输入: [7] Yeah, like that thought never entered my / [8] mind. / [9] Okay, come on.",
+        "输入: [7] Yeah, like that thought never entered my / [8] mind / [9] Okay, come on",
         "输出: [7-8] Yeah, like that thought never entered my mind. / [9] Okay, come on.",
-    ])
+    ]
+    return "\n".join(parts)
 
 
 def _numbered(lines: Sequence[SubtitleLine]) -> str:
@@ -107,7 +138,15 @@ def parse_units(text: str) -> List[tuple[int, int, str]]:
 
 
 def _words(text: str) -> List[str]:
-    return _WORD_RE.findall(text.lower())
+    """Content tokens only.
+
+    Punctuation is excluded on purpose: the pass is now asked to restore
+    the sentence punctuation the ASR omitted, and counting a added 「。」as
+    an invented word would spend the hallucination budget on exactly the
+    edit we requested — while a rewrite that only reshuffles punctuation
+    was never something the check needed to catch.
+    """
+    return [w for w in _WORD_RE.findall(text.lower()) if w not in _PUNCT]
 
 
 def _overlap(candidate: str, source: str) -> tuple[int, int, int]:
@@ -153,12 +192,44 @@ def _covers_exactly(units: Sequence[tuple[int, int, str]], lines: Sequence[Subti
     return expected == lines[-1].index + 1
 
 
+def _is_fragment(line: SubtitleLine) -> bool:
+    """Too short to be a line of its own — so its timing means nothing."""
+    text = line.text.strip()
+    return 0 < len(text) <= FRAGMENT_CHARS and not _SENTENCE_END_RE.search(text)
+
+
+def _gap_limit(lines: Sequence[SubtitleLine]) -> float:
+    """The pause length that counts as a real pause *in this transcript*.
+
+    Cue boundaries come from whisper, and how much silence it leaves around
+    speech varies wildly with the VAD settings and the film. A constant
+    tuned on one transcript vetoes almost every merge on another, and the
+    veto happens before the model's judgement is even consulted. Reading
+    the limit off the file's own gap distribution keeps the rule's meaning
+    ("shorter than most pauses here") stable across films.
+    """
+    gaps = sorted(
+        b.start - a.end for a, b in zip(lines, lines[1:]) if b.start > a.end
+    )
+    if not gaps:
+        return MAX_INTERNAL_GAP
+    nth = gaps[min(int(len(gaps) * GAP_PERCENTILE), len(gaps) - 1)]
+    return min(max(nth, MAX_INTERNAL_GAP), MAX_INTERNAL_GAP_CEILING)
+
+
 def _apply_units(
     units: Sequence[tuple[int, int, str]],
     lines: Sequence[SubtitleLine],
     settings: SubtitleSettings,
+    gap_limit: float = MAX_INTERNAL_GAP,
+    rejections: Optional[List[str]] = None,
 ) -> tuple[List[SubtitleLine], int, int]:
-    """Turn validated units into cues. Returns (lines, merged, corrected)."""
+    """Turn validated units into cues. Returns (lines, merged, corrected).
+
+    *rejections* collects a human-readable reason per discarded unit; the
+    debug log prints them, because "the pass merged 6 lines out of 764" is
+    only actionable once you can see which rule threw the rest away.
+    """
     by_index = {line.index: line for line in lines}
     budget = max(settings.max_chars_per_line * CUE_CHAR_BUDGET_RATIO, 1)
     max_duration = max(settings.max_duration, MERGE_MAX_DURATION)
@@ -171,18 +242,36 @@ def _apply_units(
         for src in sources:
             joined = _join_text(joined, src.text)
 
-        reject = not _is_faithful(text, joined)
-        if not reject and len(sources) > 1:
+        reason = "" if _is_faithful(text, joined) else "改写幅度过大（保真校验未通过）"
+        start, end = sources[0].start, sources[-1].end
+        if not reason and len(sources) > 1:
             # constraints the model could not check: it never sees timestamps
-            spans_pause = any(
-                b.start - a.end > MAX_INTERNAL_GAP for a, b in zip(sources, sources[1:])
-            )
-            reject = (
-                spans_pause
-                or len(text) > budget
-                or sources[-1].end - sources[0].start > max_duration
-            )
-        if reject:
+            for a, b in zip(sources, sources[1:]):
+                gap = b.start - a.end
+                if gap <= gap_limit:
+                    continue
+                # a pause measured against a one-or-two-character cue is not
+                # a pause, it is a bad timestamp — the model reading the words
+                # is the better judge there, so let its merge stand
+                if _is_fragment(a) or _is_fragment(b):
+                    continue
+                reason = f"[{a.index}]-[{b.index}] 间隔 {gap:.1f}s > {gap_limit:.1f}s"
+                break
+            if not reason and len(text) > budget:
+                reason = f"合并后 {len(text)} 字 > 每条上限 {budget} 字"
+            if not reason and end - start > max_duration:
+                # An over-long span with a fragment on one edge is that
+                # fragment's bogus timestamp, not a genuinely long cue:
+                # drop the untrustworthy edge instead of the whole merge.
+                if _is_fragment(sources[0]):
+                    start = end - max_duration
+                elif _is_fragment(sources[-1]):
+                    end = start + max_duration
+                else:
+                    reason = f"跨度 {end - start:.1f}s > 单条上限 {max_duration:.1f}s"
+        if reason:
+            if rejections is not None:
+                rejections.append(f"[{first}-{last}] {reason} | {text}")
             out.extend(sources)  # keep the local result for this range
             continue
 
@@ -193,8 +282,8 @@ def _apply_units(
         out.append(
             SubtitleLine(
                 index=0,
-                start=sources[0].start,
-                end=sources[-1].end,
+                start=round(start, 3),
+                end=round(end, 3),
                 text=text,
             )
         )
@@ -234,6 +323,8 @@ def refine_lines(
     should_cancel: Optional[Callable[[], bool]] = None,
     client=None,  # injectable for tests
     network: Optional[NetworkSettings] = None,
+    glossary: str = "",
+    debug=None,
 ) -> List[SubtitleLine]:
     """Rejoin and clean up *lines*; returns renumbered cues.
 
@@ -247,13 +338,23 @@ def refine_lines(
         return lines
 
     client = client if client is not None else make_openai_client(llm, network)
-    system = build_refine_prompt(language_hint)
+    system = build_refine_prompt(language_hint, glossary)
     chunks = _chunks(lines, llm.context_limit)
     before = open_ended_ratio(lines)
+    gap_limit = _gap_limit(lines)
+    dbg = debug if debug is not None and debug.enabled else None
+
+    if dbg:
+        dbg.section("转写预处理（refine）")
+        dbg.kv("分块数", len(chunks))
+        dbg.kv("间隔阈值 gap_limit", f"{gap_limit:.2f}s（本片自适应，下限 {MAX_INTERNAL_GAP}s）")
+        dbg.kv("输入是否有句末标点", "是" if has_sentence_punctuation(lines) else "否 ⚠")
+        dbg.block("system prompt", system)
 
     result: List[SubtitleLine] = []
     merged = corrected = failed = 0
     consecutive_failures = 0
+    all_rejections: List[str] = []
     for n, chunk in enumerate(chunks, start=1):
         if should_cancel and should_cancel():
             raise InterruptedError("cancelled")
@@ -285,10 +386,18 @@ def refine_lines(
                 temperature=0,  # mechanical task: no creativity wanted
             )
             reply = resp.choices[0].message.content or ""
+            if dbg:
+                dbg.block(f"第 {n} 块 请求", user)
+                dbg.block(f"第 {n} 块 响应", reply)
             units = parse_units(reply)
             if not units or not _covers_exactly(units, chunk):
                 raise ValueError("行号覆盖校验未通过")
-            applied, m, c = _apply_units(units, chunk, subtitle)
+            rejections: List[str] = []
+            applied, m, c = _apply_units(units, chunk, subtitle, gap_limit, rejections)
+            if dbg and rejections:
+                dbg.line(f"\n第 {n} 块 被本地约束否决的合并（{len(rejections)} 条）：")
+                dbg.lines("  " + r for r in rejections)
+            all_rejections.extend(rejections)
             consecutive_failures = 0
         except InterruptedError:
             raise
@@ -298,6 +407,8 @@ def refine_lines(
             log(f"⚠ 第 {chunk[0].index}-{chunk[-1].index} 行预处理未生效（{exc}），沿用原始分行")
             if consecutive_failures >= GIVE_UP_AFTER:
                 log(f"⚠ 连续 {GIVE_UP_AFTER} 块预处理失败，跳过剩余部分，直接进入翻译")
+            if dbg:
+                dbg.line(f"\n⚠ 第 {n} 块失败并回退：{exc}")
             applied, m, c = list(chunk), 0, 0
 
         result.extend(applied)
@@ -308,10 +419,21 @@ def refine_lines(
     for i, line in enumerate(result, start=1):
         line.index = i
 
+    punctuated = has_sentence_punctuation(result)
     log(
         f"预处理完成：{len(lines)} 行 → {len(result)} 条"
         f"（合并 {merged} 处、纠错 {corrected} 处"
         + (f"、{failed} 块回退" if failed else "")
+        + (f"、{len(all_rejections)} 处合并被时间约束否决" if all_rejections else "")
         + f"），未完句结尾占比 {before:.0%} → {open_ended_ratio(result):.0%}"
+        + ("" if punctuated else "（⚠ 全片无句末标点，该比例仅供参考）")
     )
+    if dbg:
+        from app.core.debuglog import fmt_cue
+
+        dbg.line(f"\n预处理结果：{len(lines)} → {len(result)} 条，"
+                 f"合并 {merged}、纠错 {corrected}、否决 {len(all_rejections)}、回退 {failed} 块")
+        dbg.kv("输出是否有句末标点", "是" if punctuated else "否 ⚠")
+        dbg.line("\n预处理后（送入翻译的内容）：")
+        dbg.lines(fmt_cue(l.index, l.start, l.end, l.text) for l in result)
     return result

@@ -311,3 +311,78 @@ def test_a_dead_endpoint_gives_up_instead_of_timing_out_every_chunk():
     assert len(attempts) == 3  # GIVE_UP_AFTER, not one per chunk
     assert [l.text for l in out] == [l.text for l in lines]
     assert [l.index for l in out] == list(range(1, 601))
+
+
+# ------------------------------------- when the pause itself is not evidence
+#
+# A cue holding one or two characters has the least reliable timestamps in
+# the file: whisper puts 「伊」 25 seconds before 「勢が6票」, which is the
+# same word. Vetoing that merge on the measured gap left one film with 131
+# fragment cues translated into half a word each.
+
+
+def test_pause_next_to_a_fragment_does_not_veto_the_merge():
+    lines = [
+        L(1, 2857.34, 2857.84, "伊"),
+        L(2, 2882.84, 2883.84, "勢が6票"),
+    ]
+    out, _ = run(["[1-2] 伊勢が6票"], lines=lines)
+    assert [l.text for l in out] == ["伊勢が6票"]
+    # the fragment's start is the bogus one, so it is dropped, not honoured
+    assert out[0].end == 2883.84
+    assert out[0].start > 2857.34
+
+
+def test_pause_between_two_real_lines_still_vetoes():
+    lines = [
+        L(1, 0.0, 2.0, "Something happens and"),
+        L(2, 20.0, 22.0, "then more happens."),
+    ]
+    out, _ = run(["[1-2] Something happens and then more happens."], lines=lines)
+    assert len(out) == 2
+
+
+def test_gap_limit_adapts_to_a_uniformly_padded_transcript():
+    from app.services.refine import MAX_INTERNAL_GAP_CEILING, _gap_limit
+
+    tight = [L(i, i * 2.0, i * 2.0 + 1.8, "x") for i in range(1, 20)]
+    assert _gap_limit(tight) == pytest.approx(1.2)  # floor, gaps are 0.2s
+
+    padded = [L(i, i * 5.0, i * 5.0 + 3.0, "x") for i in range(1, 20)]
+    assert _gap_limit(padded) == pytest.approx(2.0)  # follows the 2s gaps
+
+    wide = [L(i, i * 10.0, i * 10.0 + 2.0, "x") for i in range(1, 20)]
+    assert _gap_limit(wide) == MAX_INTERNAL_GAP_CEILING  # 8s gaps, capped
+
+
+def test_restored_punctuation_is_not_counted_as_invention():
+    lines = [L(1, 0.0, 2.0, "ちゃんと話そう"), L(2, 2.2, 4.0, "それでいいよね")]
+    out, _ = run(["[1] ちゃんと話そう。\n[2] それでいいよね？"], lines=lines)
+    assert [l.text for l in out] == ["ちゃんと話そう。", "それでいいよね？"]
+
+
+def test_glossary_reaches_the_refine_prompt():
+    from app.services.refine import build_refine_prompt
+
+    prompt = build_refine_prompt("ja", "藤堂 → 藤堂\n亜希子 → 亚希子")
+    assert "藤堂" in prompt
+    assert "保持原样，不要改动" not in prompt  # replaced by the correcting rule
+
+    plain = build_refine_prompt("ja")
+    assert "保持原样，不要改动" in plain
+
+
+def test_rejections_are_reported_for_the_debug_log():
+    from app.services.refine import _apply_units
+
+    lines = [
+        L(1, 0.0, 2.0, "Something happens and"),
+        L(2, 20.0, 22.0, "then more happens."),
+    ]
+    rejections = []
+    out, merged, _ = _apply_units(
+        [(1, 2, "Something happens and then more happens.")],
+        lines, SUB, gap_limit=1.2, rejections=rejections,
+    )
+    assert merged == 0 and len(out) == 2
+    assert rejections and "间隔" in rejections[0]

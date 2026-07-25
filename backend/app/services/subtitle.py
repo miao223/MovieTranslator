@@ -86,8 +86,28 @@ def wrap_display_text(text: str, max_chars: int) -> List[str]:
     # two overlong lines still beat one very long line
     cut = best if best is not None else fallback
     if cut is None:
+        # No punctuation and no spaces anywhere. Latin text must not be cut
+        # mid-word, but CJK writes without word separators, so breaking at
+        # the middle character is exactly what a player would do — and is
+        # far better than one 56-character line running off the screen,
+        # which is what an ASR pass that emits no punctuation produces.
+        if _is_cjk_run(text):
+            mid = len(text) // 2
+            return [text[:mid].strip(), text[mid:].strip()]
         return [text]
     return [text[:cut].strip(), text[cut:].strip()]
+
+
+def _is_cjk_run(text: str) -> bool:
+    """Unbroken CJK: no spaces, and mostly ideographs/kana."""
+    if " " in text:
+        return False
+    cjk = sum(
+        1
+        for ch in text
+        if "぀" <= ch <= "ヿ" or "㐀" <= ch <= "鿿" or "가" <= ch <= "힯"
+    )
+    return cjk >= len(text) * 0.6
 
 
 def build_ass(

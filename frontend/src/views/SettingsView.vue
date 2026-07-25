@@ -23,7 +23,7 @@ let pollTimer = null
 // size = download size in MB (from the HuggingFace repos, model.bin + config)
 // VAD presets: [threshold, speech_pad_ms, min_speech_ms, min_silence_ms]
 const VAD_PRESETS = [
-  { name: '宽松·防漏（默认）', desc: '适合大多数电影：阈值 0.35 对偏小声的对白也能捕捉', v: [0.35, 400, 250, 2000] },
+  { name: '宽松·防漏（默认）', desc: '适合大多数电影：阈值 0.35 对偏小声的对白也能捕捉，最短语音 100ms 保住短促的应答词', v: [0.35, 400, 100, 2000] },
   { name: '标准', desc: 'faster-whisper 原始默认值（阈值 0.5），语音清晰、录音质量好的片源', v: [0.5, 400, 250, 2000] },
   { name: '极宽松·气声对白', desc: '悄悄话/气声仍被漏掉时用（阈值 0.25 + 加大填充）；嘈杂片源可能误检', v: [0.25, 800, 100, 1500] },
   { name: '严格·防噪', desc: '配乐音效嘈杂、出现幻听字幕时用（阈值 0.6）；小声对白可能被丢弃', v: [0.6, 300, 300, 2500] },
@@ -276,6 +276,17 @@ async function testLLM() {
           <el-switch v-model="settings.asr.word_timestamps" />
           <span class="hint">按每个词的真实时间切分字幕行，时间轴更准、可杜绝碎行（推荐开启，速度略降 10-20%）</span>
         </el-form-item>
+        <el-form-item label="识别提示词">
+          <el-input
+            v-model="settings.asr.initial_prompt"
+            type="textarea" :rows="2"
+            placeholder="例：藤堂、亜希子、柳川、樺山、人狼ゲーム"
+          />
+          <span class="hint">
+            把片中反复出现的人名/专有名词写在这里，能显著减少人名识别错误（如「藤堂」被听成「どうぞ」）。
+            <strong>必须用影片的原始语言书写</strong>——写成中文会把整篇转写结果带偏，因此剧情简介和译名对照表不会自动用作提示词。
+          </span>
+        </el-form-item>
         <el-form-item label="VAD 语音检测">
           <el-switch v-model="settings.asr.vad_filter" />
           <span class="hint">过滤无语音片段，减少幻听字幕</span>
@@ -305,7 +316,7 @@ async function testLLM() {
           </el-form-item>
           <el-form-item label="最短语音时长">
             <el-input-number v-model="settings.asr.vad_min_speech_ms" :min="0" :max="5000" :step="50" />
-            <span class="hint">毫秒，默认 250；短促的感叹词被丢弃时调低</span>
+            <span class="hint">毫秒，默认 100；短促的感叹词（「诶」「嗯」）被整句丢弃时调低</span>
           </el-form-item>
           <el-form-item label="最短静默时长">
             <el-input-number v-model="settings.asr.vad_min_silence_ms" :min="100" :max="10000" :step="100" />
@@ -349,6 +360,16 @@ async function testLLM() {
             </div>
             <span v-else class="hint" style="margin-left: 0">（暂无日志，运行一次任务后生成）</span>
           </div>
+        </el-form-item>
+        <el-form-item label="调试模式">
+          <el-switch v-model="settings.debug_mode" />
+          <span class="hint">
+            开启后，每个任务会在<strong>字幕输出的同一文件夹</strong>生成一个
+            <code>视频名.debug.log</code>：语音识别的原始结果与词级时间戳、
+            每一步断句/合并的判定与被否决的原因、以及全部 AI 请求与回复。
+            字幕出现断句错乱、半个词、漏译等问题时开启它，把该文件发给开发者即可定位。
+            <br />文件较大（两小时影片约数 MB），平时建议关闭。不含 API key。
+          </span>
         </el-form-item>
       </el-form>
     </el-card>

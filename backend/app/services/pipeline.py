@@ -19,7 +19,8 @@ from typing import Dict, Iterator, List, Optional
 
 from app.core import config
 from app.core.cache import job_dir
-from app.core.joblog import JobLogWriter
+from app.core.debuglog import DebugLog, debug_path_for
+from app.core.joblog import JobLogWriter, _settings_lines as joblog_settings_lines
 from app.models.schemas import (
     JobRequest,
     JobStatus,
@@ -317,6 +318,25 @@ class JobManager:
             self._execute_frame_only(job, req, workdir)
             return
 
+        # deep diagnostics: written next to the subtitle we are about to
+        # produce, so the user finds it without hunting for a cache dir
+        video = Path(req.video_path)
+        debug = DebugLog(
+            debug_path_for(video.parent / f"{video.stem}.srt", workdir),
+            enabled=settings.debug_mode,
+        )
+        if debug.enabled:
+            job.publish(
+                "extracting", 0,
+                log=f"调试模式已开启，诊断日志: {debug.path}",
+            )
+            debug.section("任务与设置")
+            debug.kv("视频", req.video_path)
+            debug.kv("源语言 / 目标语言", f"{req.source_language} → {req.target_language}")
+            debug.kv("输出模式", req.output_mode)
+            debug.kv("剧情简介", req.synopsis.strip() or "（未填写）")
+            debug.lines(joblog_settings_lines(settings))
+
         def check_cancel():
             if job.cancel_event.is_set():
                 raise InterruptedError
@@ -394,10 +414,19 @@ class JobManager:
             log=asr_log,
             should_cancel=job.cancel_event.is_set,
             network=settings.network,
+            debug=debug,
         )
         if not segments:
             raise RuntimeError("未识别到任何语音内容")
-        lines = segmenter.segment_lines(segments, settings.subtitle)
+        lines = segmenter.segment_lines(segments, settings.subtitle, debug=debug)
+        if not segmenter.has_sentence_punctuation(lines):
+            # everything downstream that decides where a sentence ends reads
+            # punctuation; without it those rules quietly stop working
+            job.publish(
+                "transcribing", job.status.progress,
+                log="⚠ 语音识别未输出任何句末标点，断句/合并/换行的判断会受影响，"
+                    "已交由转写预处理补回",
+            )
         (workdir / "transcript.json").write_text(
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
             encoding="utf-8",
@@ -426,6 +455,8 @@ class JobManager:
                 ),
                 should_cancel=job.cancel_event.is_set,
                 network=settings.network,
+                glossary=settings.prompts.glossary,
+                debug=debug,
             )
             (workdir / "transcript_refined.json").write_text(
                 json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
@@ -452,6 +483,7 @@ class JobManager:
             prompts=settings.prompts,
             max_line_chars=settings.subtitle.max_chars_per_line,
             network=settings.network,
+            debug=debug,
         )
         translator.translate(lines)
         (workdir / "translation.json").write_text(
@@ -474,7 +506,6 @@ class JobManager:
             srt_text = subtitle.build_ass(lines, settings.subtitle, mode=req.output_mode)
         else:
             srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
-        video = Path(req.video_path)
         target = video.parent / f"{video.stem}{ext}"
         try:
             target.write_text(srt_text, encoding="utf-8")
@@ -491,7 +522,39 @@ class JobManager:
                 log=f"⚠ 无法写入视频所在目录（{exc}），字幕已保存到工作目录，可用下载按钮获取",
             )
         job.status.srt_filename = str(job.srt_path)
+        self._debug_final(debug, lines, settings)
         job.publish("done", 100, message=f"完成，字幕已保存: {job.srt_path}")
+
+    @staticmethod
+    def _debug_final(debug: DebugLog, lines: List[SubtitleLine], settings) -> None:
+        """Final cues plus the checks that only apply to the finished file."""
+        if not debug.enabled:
+            return
+        from app.core.debuglog import fmt_cue, percentiles
+
+        wrap = settings.subtitle.max_chars_per_line
+        overflow = [
+            l for l in lines
+            if any(
+                len(part) > wrap
+                for text in (l.text, l.translation)
+                for part in subtitle.wrap_display_text(text, wrap)
+            )
+        ]
+        debug.section("最终字幕")
+        debug.kv("条数", len(lines))
+        debug.kv("cue 时长(s)", percentiles([l.end - l.start for l in lines]))
+        debug.kv("相邻间隔(s)", percentiles(
+            [b.start - a.end for a, b in zip(lines, lines[1:])]
+        ))
+        debug.kv(f"换行后仍超过 {wrap} 字的 cue", f"{len(overflow)} / {len(lines)}")
+        debug.kv("未完句结尾占比", f"{segmenter.open_ended_ratio(lines):.0%}")
+        debug.kv("碎片 cue", f"{segmenter.fragment_count(lines)} / {len(lines)}")
+        debug.line("\n最终结果（原文 ⇒ 译文）：")
+        debug.lines(
+            fmt_cue(l.index, l.start, l.end, f"{l.text}  ⇒  {l.translation}")
+            for l in lines
+        )
 
 
 manager = JobManager()

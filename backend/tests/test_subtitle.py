@@ -103,3 +103,26 @@ def test_ass_wraps_with_backslash_n():
     # the original wraps into two balanced halves joined by an ASS line break
     assert "thought\\Nnever" in dialogue
     assert "{" not in line.text  # sanity: escaping untouched by the wrap
+
+
+def test_unpunctuated_cjk_wraps_at_the_middle():
+    """An ASR pass that emits no punctuation leaves nothing to break on.
+
+    One film ended up with display lines of up to 50 characters, because
+    every break candidate is a punctuation mark or a space and CJK supplies
+    neither.
+    """
+    from app.services.subtitle import wrap_display_text
+
+    text = "人数がだんだん減ってきて自分が人狼ってバレるのも時間の問題と思ったんでしょあんなにいきなり説明されて"
+    parts = wrap_display_text(text, 42)
+    assert len(parts) == 2
+    assert "".join(parts) == text
+    assert all(len(p) <= 42 for p in parts)
+
+
+def test_unbreakable_latin_is_never_cut_mid_word():
+    from app.services.subtitle import wrap_display_text
+
+    text = "Supercalifragilisticexpialidocious" * 2
+    assert wrap_display_text(text, 20) == [text]

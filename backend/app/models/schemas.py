@@ -45,9 +45,17 @@ class ASRSettings(BaseModel):
     # silero-VAD tuning; threshold defaults below faster-whisper's 0.5
     # because movie dialog is often quiet and gets skipped at 0.5
     vad_threshold: float = Field(0.35, ge=0.05, le=0.95)
-    vad_min_speech_ms: int = Field(250, ge=0, le=5000)
+    # short interjections ("えっ", "うん", "喂") are real subtitle lines and
+    # were being dropped wholesale at 250ms
+    vad_min_speech_ms: int = Field(100, ge=0, le=5000)
     vad_min_silence_ms: int = Field(2000, ge=100, le=10000)
     vad_speech_pad_ms: int = Field(400, ge=0, le=3000)
+    # source-language hint fed to whisper as `initial_prompt`: proper nouns
+    # it keeps mis-hearing (character names above all). MUST be written in
+    # the spoken language — a prompt in another language drags the whole
+    # transcript toward that language, which is why the plot synopsis and
+    # the translation glossary are deliberately NOT reused here.
+    initial_prompt: str = ""
 
 
 class SubtitleSettings(BaseModel):
@@ -96,6 +104,10 @@ class AppSettings(BaseModel):
     # where downloaded whisper models are stored; empty = HuggingFace default
     # cache (~/.cache/huggingface/hub). changing it does NOT move old models
     model_cache_dir: str = ""
+    # deep-diagnostics log next to the subtitle output (core/debuglog.py):
+    # raw ASR output, every segmentation/merge decision, full LLM traffic.
+    # off by default because the file runs to several MB per film
+    debug_mode: bool = False
     llm: LLMSettings = LLMSettings()
     asr: ASRSettings = ASRSettings()
     subtitle: SubtitleSettings = SubtitleSettings()

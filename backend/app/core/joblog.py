@@ -21,7 +21,7 @@ from typing import Optional
 
 from app.core.cache import _base_dir
 
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.7.2"
 LOG_DIR_NAME = "logs"
 KEEP_LOGS = 20  # newest job logs to retain
 
@@ -85,11 +85,13 @@ def _settings_lines(settings) -> list[str]:
         f"VAD           : {'开' if asr.vad_filter else '关'} 阈值={asr.vad_threshold} "
         f"填充={asr.vad_speech_pad_ms}ms 最短语音={asr.vad_min_speech_ms}ms "
         f"最短静默={asr.vad_min_silence_ms}ms",
+        f"识别提示词    : {asr.initial_prompt.strip() or '（未设置）'}",
         f"翻译模型      : {llm.model} @ {llm.base_url} "
         f"(API key: {'已配置' if llm.api_key.strip() else '未配置'}) "
         f"temp={llm.temperature} 每批={llm.batch_size} 上下文={llm.context_limit}",
         f"视觉模型      : {llm.vision_model or '（同主模型）'}",
         f"转写预处理    : {'开' if settings.prompts.refine_enabled else '关'}",
+        f"调试模式      : {'开（字幕同目录生成 .debug.log）' if settings.debug_mode else '关'}",
         f"字幕          : 每行{sub.max_chars_per_line}字 单条≤{sub.max_duration}s "
         f"{'样式(.ass)' if sub.style_enabled else '标准(.srt)'} {sub.bilingual_layout}",
         f"代理          : {net.proxy_url or '（未设置）'} "

@@ -223,6 +223,30 @@ def _get_model(
     return _model
 
 
+def _debug_segment(dbg, seg, words: List[Word]) -> None:
+    """Record one whisper segment verbatim, words and confidences included.
+
+    The word timestamps are the point: a several-second gap reported in the
+    middle of a single word is what makes the segmenter break there, and
+    nothing downstream can tell that apart from a real pause afterwards.
+    """
+    dbg.line(
+        f"\n[{seg.start:8.2f} → {seg.end:8.2f}] "
+        f"logprob={getattr(seg, 'avg_logprob', float('nan')):.2f} "
+        f"no_speech={getattr(seg, 'no_speech_prob', float('nan')):.2f} "
+        f"compress={getattr(seg, 'compression_ratio', float('nan')):.2f}"
+        f"\n    {seg.text.strip()}"
+    )
+    if not words:
+        return
+    parts = []
+    for i, w in enumerate(words):
+        gap = w.start - words[i - 1].end if i else 0.0
+        flag = f" ⟨间隔{gap:.1f}s⟩" if gap > 1.0 else ""
+        parts.append(f"{w.start:.2f}-{w.end:.2f}{w.text}{flag}")
+    dbg.line("    词: " + "  ".join(parts))
+
+
 def transcribe(
     wav_path: str,
     settings: ASRSettings,
@@ -231,6 +255,7 @@ def transcribe(
     log: Optional[LogFn] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     network: Optional[NetworkSettings] = None,
+    debug=None,
 ) -> tuple[List[Segment], str]:
     """Transcribe *wav_path*; returns (segments, detected_language).
 
@@ -257,11 +282,28 @@ def transcribe(
             word_timestamps=settings.word_timestamps,
             vad_filter=settings.vad_filter,
             vad_parameters=vad_parameters,
+            initial_prompt=settings.initial_prompt.strip() or None,
         )
         total = info.duration or 0.0
+        after_vad = getattr(info, "duration_after_vad", None)
         if log:
             lang = language or f"{info.language} (置信度 {info.language_probability:.0%})"
             log(f"检测语言: {lang}，音频时长 {total:.0f}s")
+            if after_vad and total:
+                log(f"VAD 保留语音 {after_vad:.0f}s（占音频 {after_vad / total:.0%}）")
+
+        dbg = debug if debug is not None and debug.enabled else None
+        if dbg:
+            dbg.section("语音识别原始输出（faster-whisper）")
+            dbg.kv("语言", f"{info.language} ({info.language_probability:.0%})")
+            dbg.kv("音频时长", f"{total:.1f}s")
+            dbg.kv("VAD 后语音时长", f"{after_vad:.1f}s" if after_vad else "（未提供）")
+            dbg.kv("initial_prompt", settings.initial_prompt.strip() or "（未设置）")
+            dbg.line(
+                "\n每个 segment：起止、平均对数概率、无语音概率、压缩比"
+                "（压缩比高或 no_speech 高 = 可疑/幻觉），随后是词级时间戳。"
+                "\n词级时间戳里出现的异常大间隔，正是字幕被切成半个词的直接原因。\n"
+            )
 
         results: List[Segment] = []
         for seg in segments_iter:
@@ -279,6 +321,8 @@ def transcribe(
                 progress(min(seg.end / total, 1.0))
             if log:
                 log(f"[{seg.start:7.2f}s] {text}")
+            if dbg:
+                _debug_segment(dbg, seg, words)
         return results, info.language
     except (InterruptedError, KeyboardInterrupt):
         raise

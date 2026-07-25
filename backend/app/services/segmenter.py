@@ -32,7 +32,15 @@ GAP_BREAK = 1.5  # silence between words that forces a new line (s)
 NO_HARD_SPLIT_BELOW = 12  # never character-cut texts shorter than this
 CHARS_PER_SECOND = 3.0  # conservative speaking-rate floor for bogus-duration cap
 MERGE_FRAGMENT_CHARS = 2  # trailing fragments this short get merged back
-MERGE_FRAGMENT_GAP = 0.6  # ...when the time gap to the previous line is below (s)
+# ...regardless of the measured gap: a cue holding one or two characters is
+# precisely the cue whose word timestamps cannot be trusted, so a large gap
+# next to it is evidence the timing is wrong, not that the speech is apart.
+# Trusting the gap here is what produced 「て」/「かこれ…」 → "什" / "么…".
+MERGE_FRAGMENT_GAP = GAP_BREAK
+# a time-driven break must never strand a piece shorter than this: whisper
+# occasionally reports a multi-second gap in the middle of a single word
+# (「伊」…25s…「勢が6票」), and honouring it splits the word in half
+MIN_PIECE_CHARS = 3
 
 # A cue may occupy two display lines (the 42-chars figure of subtitle style
 # guides is per DISPLAY line, not per cue), so accumulation gets twice the
@@ -80,6 +88,27 @@ def _clause_break_index(buf: Sequence[Word]) -> Optional[int]:
     return None
 
 
+def _trustworthy_start(take: Sequence[Word]) -> float:
+    """When does this cue's speech really begin?
+
+    A cue can only contain a gap longer than ``GAP_BREAK`` because the
+    break there was suppressed to avoid stranding a fragment — i.e. because
+    whisper claimed several seconds of silence in the middle of one word.
+    One of the two timestamps around that gap is wrong, and it is the
+    fragment's: a word transcribed as a single character is what whisper
+    misplaces. So step over such gaps while the text before them is still
+    too short to be a line, and start the cue where the rest is spoken.
+    Otherwise 「伊勢が6票」 appears on screen 25 seconds early.
+    """
+    for i in range(1, len(take)):
+        head = "".join(w.text for w in take[:i]).strip()
+        if len(head) >= MIN_PIECE_CHARS:
+            break
+        if take[i].start - take[i - 1].end > GAP_BREAK:
+            return take[i].start
+    return take[0].start
+
+
 def _lines_from_words(words: Sequence[Word], settings: SubtitleSettings) -> List[SubtitleLine]:
     lines: List[SubtitleLine] = []
     buf: List[Word] = []
@@ -93,12 +122,16 @@ def _lines_from_words(words: Sequence[Word], settings: SubtitleSettings) -> List
         rest = buf[split_at:] if split_at is not None else []
         text = "".join(w.text for w in take).strip()
         if text:
+            end = max(take[-1].end, take[0].start + MIN_LINE_DURATION)
+            start = _trustworthy_start(take)
+            # backstop for anything the scan above did not catch: a span far
+            # beyond max_duration is a bad timestamp, not a long line, and
+            # the end is the trustworthy side of it (that is where the audio
+            # just was)
+            start = max(start, end - settings.max_duration)
             lines.append(
                 SubtitleLine(
-                    index=0,
-                    start=round(take[0].start, 3),
-                    end=round(max(take[-1].end, take[0].start + MIN_LINE_DURATION), 3),
-                    text=text,
+                    index=0, start=round(start, 3), end=round(end, 3), text=text
                 )
             )
         else:
@@ -108,11 +141,16 @@ def _lines_from_words(words: Sequence[Word], settings: SubtitleSettings) -> List
 
     for word in words:
         if buf:
-            candidate_len = len("".join(w.text for w in buf) + word.text.rstrip())
+            head = "".join(w.text for w in buf).strip()
+            candidate_len = len(head + word.text.rstrip())
             too_long = candidate_len > budget
             too_slow = word.end - buf[0].start > settings.max_duration
             gap = word.start - buf[-1].end > GAP_BREAK
-            if gap or too_slow:
+            # a break here would leave `head` alone as a cue; below a few
+            # characters that is not a line but half a word, and the
+            # translator has no choice but to render it as half a word
+            strands_fragment = len(head) < MIN_PIECE_CHARS
+            if (gap or too_slow) and not strands_fragment:
                 flush()  # time-driven breaks always cut the whole buffer
             elif too_long:
                 flush(_clause_break_index(buf))
@@ -232,7 +270,10 @@ def _can_merge(
     prev: SubtitleLine, line: SubtitleLine, budget: int, max_duration: float
 ) -> bool:
     gap = line.start - prev.end
-    if len(line.text) <= MERGE_FRAGMENT_CHARS:
+    # a fragment on EITHER side makes this pair a fragment pair: whichever
+    # cue holds one or two characters is the one whose timing is suspect
+    fragment = min(len(prev.text.strip()), len(line.text.strip()))
+    if fragment <= MERGE_FRAGMENT_CHARS:
         if gap > MERGE_FRAGMENT_GAP:  # stray 1-2 char fragment (CJK)
             return False
     else:
@@ -266,20 +307,64 @@ def _merge_sentence_units(
     return merged
 
 
+def _fix_overlaps(lines: List[SubtitleLine]) -> int:
+    """Keep cues strictly ordered after a start time has been pulled back.
+
+    Clamping a bogus start (see ``flush``) can move a cue behind its
+    predecessor; two cues on screen at once is the one artefact a player
+    cannot recover from. Returns how many cues had to be nudged.
+    """
+    fixed = 0
+    for prev, line in zip(lines, lines[1:]):
+        if line.start < prev.end:
+            line.start = round(min(prev.end, line.end - 0.05), 3)
+            fixed += 1
+    return fixed
+
+
+def has_sentence_punctuation(lines: Sequence[SubtitleLine]) -> bool:
+    """Did the ASR punctuate at all?
+
+    Almost every heuristic downstream — where to break a line, whether a
+    cue is a complete sentence, where to wrap the display text — reads
+    sentence punctuation. Whisper sometimes returns a whole film without a
+    single one, and then all of them silently become no-ops instead of
+    misbehaving visibly. Callers use this to say so in the log.
+    """
+    return any(_SENTENCE_END.search(l.text.strip()) for l in lines)
+
+
 def open_ended_ratio(lines: Sequence[SubtitleLine]) -> float:
     """Share of cues not ending on sentence punctuation — the fragmentation
-    metric reported in the job log (a healthy film sits below ~0.1)."""
+    metric reported in the job log (a healthy film sits below ~0.1).
+
+    Meaningless when the ASR emitted no punctuation at all; check
+    ``has_sentence_punctuation`` before reading anything into it.
+    """
     if not lines:
         return 0.0
     open_ended = sum(1 for l in lines if not _SENTENCE_END.search(l.text.strip()))
     return open_ended / len(lines)
 
 
+def fragment_count(lines: Sequence[SubtitleLine]) -> int:
+    """Cues too short to carry meaning on their own — the metric that would
+    have exposed the "half a word per cue" bug (17% of one film's cues)."""
+    return sum(
+        1
+        for l in lines
+        if len(l.text.strip()) <= MERGE_FRAGMENT_CHARS
+        and not _SENTENCE_END.search(l.text.strip())
+    )
+
+
 # ---------------------------------------------------------------- public
 
 
 def segment_lines(
-    segments: Sequence[Union[Segment, tuple]], settings: SubtitleSettings
+    segments: Sequence[Union[Segment, tuple]],
+    settings: SubtitleSettings,
+    debug=None,
 ) -> List[SubtitleLine]:
     lines: List[SubtitleLine] = []
     for seg in segments:
@@ -292,8 +377,40 @@ def segment_lines(
         else:
             lines.extend(_lines_from_text(seg.start, seg.end, seg.text, settings))
 
+    raw = [l.model_copy() for l in lines] if debug is not None and debug.enabled else []
     merged = _merge_sentence_units(lines, settings)
+    nudged = _fix_overlaps(merged)
 
     for i, line in enumerate(merged, start=1):
         line.index = i
+
+    if debug is not None and debug.enabled:
+        _report(debug, raw, merged, nudged)
     return merged
+
+
+def _report(debug, raw: List[SubtitleLine], merged: List[SubtitleLine], nudged: int):
+    from app.core.debuglog import fmt_cue, percentiles
+
+    debug.section("分句结果（segmenter）")
+    debug.kv("断行后条数", len(raw))
+    debug.kv("句子合并后条数", len(merged))
+    debug.kv("因起点夹紧而顺延的 cue", nudged)
+    debug.kv("ASR 是否输出句末标点", "是" if has_sentence_punctuation(merged) else "否 ⚠")
+    debug.kv("未完句结尾占比", f"{open_ended_ratio(merged):.0%}")
+    debug.kv(
+        f"≤{MERGE_FRAGMENT_CHARS} 字的碎片 cue",
+        f"{fragment_count(merged)} / {len(merged)}",
+    )
+    gaps = [b.start - a.end for a, b in zip(merged, merged[1:])]
+    debug.kv("相邻 cue 间隔(s)", percentiles(gaps))
+    debug.kv("cue 时长(s)", percentiles([l.end - l.start for l in merged]))
+    debug.kv(
+        "语音总时长/覆盖",
+        f"{sum(l.end - l.start for l in merged):.0f}s"
+        + (f"，末尾 {merged[-1].end:.0f}s" if merged else ""),
+    )
+    debug.line("\n合并前（断行直出）：")
+    debug.lines(fmt_cue(i, l.start, l.end, l.text) for i, l in enumerate(raw, 1))
+    debug.line("\n合并后（送入预处理的内容）：")
+    debug.lines(fmt_cue(l.index, l.start, l.end, l.text) for l in merged)

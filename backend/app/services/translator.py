@@ -175,7 +175,9 @@ class Translator:
         prompts: Optional[PromptSettings] = None,
         max_line_chars: int = 42,
         network: Optional[NetworkSettings] = None,
+        debug=None,
     ):
+        self.debug = debug if debug is not None and debug.enabled else None
         self.settings = settings
         self.target_language = target_language
         self.synopsis = synopsis
@@ -191,12 +193,20 @@ class Translator:
     def _chat(self, messages: List[dict]) -> str:
         if self.should_cancel():
             raise InterruptedError("cancelled")
+        if self.debug:
+            self._chat_seq = getattr(self, "_chat_seq", 0) + 1
+            self.debug.block(
+                f"翻译请求 #{self._chat_seq}（最后一条 user 消息）",
+                messages[-1].get("content", ""),
+            )
         resp = self.client.chat.completions.create(
             model=self.settings.model,
             messages=messages,
             temperature=self.settings.temperature,
         )
         content = resp.choices[0].message.content or ""
+        if self.debug:
+            self.debug.block(f"翻译响应 #{self._chat_seq}", content)
         if not content.strip():
             raise TranslationError("LLM 返回了空响应")
         return content
@@ -214,6 +224,13 @@ class Translator:
             return
         full_text = _numbered(lines)
         est = estimate_tokens(full_text)
+        if self.debug:
+            self.debug.section("翻译（translator）")
+            self.debug.kv("行数", len(lines))
+            self.debug.kv("估算 tokens", est)
+            self.debug.kv("模式", "全局上下文" if est * 3 <= self.settings.context_limit
+                          else "滑动窗口分块")
+            self.debug.block("system prompt", self._system_prompt())
         # conversation will hold: input once + all translations + overhead ≈ 3x
         if est * 3 <= self.settings.context_limit:
             self.log(f"全局上下文模式（约 {est} tokens）")

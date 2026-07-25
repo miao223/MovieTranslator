@@ -2,6 +2,9 @@
 CLAUDE.md
 .claude/
 
+# 本地字幕质量比对素材（人工翻译 / 软件输出 / 日志），仅供本机测试
+text/
+
 # Python
 backend/.venv/
 __pycache__/
