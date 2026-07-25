@@ -250,8 +250,19 @@ def _get_model(
 def _blank_regions(
     segments: Sequence[Segment], duration: float, min_blank: float
 ) -> List[tuple[float, float]]:
-    """Stretches of the timeline the first pass produced nothing for."""
-    spans = sorted((s.start, s.end) for s in segments)
+    """Stretches of the timeline the first pass produced no WORDS for.
+
+    Word positions, not segment spans: whisper's segment boundaries are
+    routinely stretched across silence it never transcribed — one segment
+    on a real film spanned 577 seconds while holding fifteen words, all of
+    them at the far end. Measured by spans, that 9.6-minute hole counted as
+    covered and the second pass never looked at it, which is exactly where
+    the missing dialogue was. Measured by words, the same film's blanks go
+    from 3563s to 5606s.
+    """
+    spans = sorted(
+        (w.start, w.end) for seg in segments for w in seg.words
+    ) or sorted((s.start, s.end) for s in segments)
     out: List[tuple[float, float]] = []
     cursor = 0.0
     for start, end in spans:

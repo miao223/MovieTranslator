@@ -149,3 +149,22 @@ def test_recovered_segments_never_overwrite_the_first_pass():
     existing = [Segment(10.0, 20.0, "already here")]
     assert _overlaps_any(Segment(15.0, 25.0, "x"), existing)
     assert not _overlaps_any(Segment(20.0, 25.0, "x"), existing)
+
+
+def test_a_stretched_segment_does_not_hide_a_blank():
+    """A segment spanning silence it never transcribed must not count as
+    covered — that is how a 9.6-minute hole full of dialogue was skipped."""
+    from app.services.asr import Segment, Word, _blank_regions
+
+    stretched = Segment(0.0, 600.0, "x", words=[
+        Word(0.0, 0.4, "マ"), Word(0.4, 0.8, "ッ"),
+        Word(590.0, 600.0, "ションは建て直されたものなんだそうです"),
+    ])
+    assert _blank_regions([stretched], 600.0, 15.0) == [(0.8, 590.0)]
+
+
+def test_blanks_fall_back_to_spans_without_word_timestamps():
+    from app.services.asr import Segment, _blank_regions
+
+    segs = [Segment(0.0, 10.0, "a"), Segment(60.0, 70.0, "b")]
+    assert _blank_regions(segs, 100.0, 15.0) == [(10.0, 60.0), (70.0, 100.0)]
