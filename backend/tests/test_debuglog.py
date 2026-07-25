@@ -120,3 +120,32 @@ def test_level_profile_is_one_value_per_second():
     assert len(levels) == 3
     assert levels[0] < -100          # digital silence
     assert math.isclose(levels[1], -6.0, abs_tol=0.5)  # 0.5 full scale ≈ -6 dBFS
+
+
+# ------------------------------------------------------ second ASR pass
+
+
+def test_blank_regions_are_what_the_first_pass_left_empty():
+    from app.services.asr import Segment, _blank_regions
+
+    segs = [Segment(40.0, 50.0, "a"), Segment(55.0, 60.0, "b")]
+    # the 5s hole between them is a pause, not a blank; the 40s lead-in and
+    # the tail both qualify
+    assert _blank_regions(segs, 100.0, 15.0) == [(0.0, 40.0), (60.0, 100.0)]
+
+
+def test_long_blanks_are_sliced_into_bounded_windows():
+    """Unbounded VAD-free decoding is what looped; slices cannot."""
+    from app.services.asr import _windows
+
+    assert list(_windows([(0.0, 750.0)], 300.0)) == [
+        (0.0, 300.0), (300.0, 600.0), (600.0, 750.0)
+    ]
+
+
+def test_recovered_segments_never_overwrite_the_first_pass():
+    from app.services.asr import Segment, _overlaps_any
+
+    existing = [Segment(10.0, 20.0, "already here")]
+    assert _overlaps_any(Segment(15.0, 25.0, "x"), existing)
+    assert not _overlaps_any(Segment(20.0, 25.0, "x"), existing)

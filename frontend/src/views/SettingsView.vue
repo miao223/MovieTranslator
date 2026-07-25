@@ -279,6 +279,16 @@ async function testLLM() {
           <el-switch v-model="settings.asr.word_timestamps" />
           <span class="hint">按每个词的真实时间切分字幕行，时间轴更准、可杜绝碎行（推荐开启，速度略降 10-20%）</span>
         </el-form-item>
+        <el-form-item label="二次识别">
+          <el-switch v-model="settings.asr.second_pass" />
+          <span class="hint">
+            语音检测判定为「无语音」的段落，关闭检测后再识别一遍，只保留通过质量校验的结果。
+            对白压在配乐下的片源（纪录片、恐怖片、综艺）常被整段漏掉——实测一部日本恐怖片
+            9 分钟的剧情段落一句都没识别到，开启后找回了完整对话。
+            <br />代价：识别时间约翻倍，且因为文字变多，后续翻译的 token 消耗也会同比增加。
+            片源对白清晰、字幕数量正常时可关闭。
+          </span>
+        </el-form-item>
         <el-form-item label="识别提示词">
           <el-input
             v-model="settings.asr.initial_prompt"

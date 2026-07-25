@@ -26,6 +26,7 @@ class Segment:
     end: float
     text: str
     words: List[Word] = field(default_factory=list)  # empty without word_timestamps
+    recovered: bool = False  # came from the second pass, not the VAD-filtered one
 
 ProgressFn = Callable[[float], None]  # 0..1
 LogFn = Callable[[str], None]
@@ -43,6 +44,15 @@ MIN_UNDETECTED_SECONDS = 5.0
 # how close to the level of known speech a stretch has to be before
 # "Silero heard nothing there" becomes suspicious rather than expected
 LEVEL_SUSPICIOUS_DB = 12.0
+# Second pass (see second_pass): only revisit a blank at least this long —
+# shorter ones are pauses, and a slice of a few seconds gives the decoder
+# nothing to work with.
+SECOND_PASS_MIN_BLANK = 15.0
+SECOND_PASS_WINDOW = 300.0  # bounded slices; see _windows()
+# gates for what the second pass is allowed to keep. no_speech_prob is
+# deliberately absent — music inflates it on genuine dialogue.
+SECOND_PASS_MAX_COMPRESSION = 2.4   # whisper's own repetition tell
+SECOND_PASS_MIN_LOGPROB = -1.0      # whisper's own confidence floor
 
 _model = None
 _model_key: Optional[tuple] = None
@@ -237,8 +247,143 @@ def _get_model(
     return _model
 
 
+def _blank_regions(
+    segments: Sequence[Segment], duration: float, min_blank: float
+) -> List[tuple[float, float]]:
+    """Stretches of the timeline the first pass produced nothing for."""
+    spans = sorted((s.start, s.end) for s in segments)
+    out: List[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in spans:
+        if start - cursor >= min_blank:
+            out.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor >= min_blank:
+        out.append((cursor, duration))
+    return out
+
+
+def _windows(regions: Sequence[tuple[float, float]], size: float):
+    """Split regions into slices no longer than *size*.
+
+    Bounded slices are what makes a VAD-free pass safe: transcribing two
+    hours with the VAD off collapsed into one sentence repeating, because
+    each window primes the next. A few minutes at a time, with the priming
+    turned off, cannot run away like that.
+    """
+    for start, end in regions:
+        cursor = start
+        while cursor < end:
+            yield cursor, min(cursor + size, end)
+            cursor += size
+
+
+def second_pass(
+    model,
+    audio,
+    segments: List[Segment],
+    settings: ASRSettings,
+    language: Optional[str],
+    log: Optional[LogFn] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    debug=None,
+) -> List[Segment]:
+    """Re-transcribe what the VAD threw away, and merge what survives.
+
+    Silero is a small model trained on clean speech; dialogue mixed under a
+    music bed scores below any workable threshold, and lowering it only
+    admits more music. Whisper's own encoder has no such trouble — on the
+    film that prompted this, a stretch Silero called silent for nine and a
+    half minutes transcribed into 35 lines of ordinary conversation once it
+    was handed over directly.
+    """
+    duration = len(audio) / 16000.0
+    regions = _blank_regions(segments, duration, SECOND_PASS_MIN_BLANK)
+    if not regions:
+        return segments
+    todo = list(_windows(regions, SECOND_PASS_WINDOW))
+    total = sum(e - s for s, e in todo)
+    if log:
+        log(f"二次识别：对 VAD 判定无语音的 {len(regions)} 段（共 {total:.0f}s）"
+            "关闭 VAD 重新识别…")
+    if debug is not None and debug.enabled:
+        debug.section("二次识别（对 VAD 丢弃的区间关 VAD 重跑）")
+        debug.kv("空白区间", f"{len(regions)} 段，切成 {len(todo)} 个窗口")
+        debug.kv("重新识别时长", f"{total:.0f}s")
+
+    recovered: List[Segment] = []
+    dropped = 0
+    for start, end in todo:
+        if should_cancel and should_cancel():
+            raise InterruptedError("cancelled")
+        chunk = audio[int(start * 16000):int(end * 16000)]
+        if len(chunk) < 16000:
+            continue
+        try:
+            found, _info = model.transcribe(
+                chunk,
+                language=language,
+                beam_size=settings.beam_size,
+                word_timestamps=settings.word_timestamps,
+                vad_filter=False,
+                # each window must stand alone: priming from the previous one
+                # is exactly what turns a quiet stretch into a repeat loop
+                condition_on_previous_text=False,
+                initial_prompt=settings.initial_prompt.strip() or None,
+            )
+            for seg in found:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                # A music bed pushes no_speech_prob up even where the
+                # dialogue is perfectly clear (0.85 on lines that turned out
+                # to be ordinary conversation), so it cannot be a gate here.
+                # Repetition and decoder confidence can.
+                if getattr(seg, "compression_ratio", 0) > SECOND_PASS_MAX_COMPRESSION:
+                    dropped += 1
+                    continue
+                if getattr(seg, "avg_logprob", 0) < SECOND_PASS_MIN_LOGPROB:
+                    dropped += 1
+                    continue
+                words = [
+                    Word(float(w.start) + start, float(w.end) + start, w.word)
+                    for w in (seg.words or [])
+                ]
+                recovered.append(Segment(
+                    float(seg.start) + start, float(seg.end) + start,
+                    text, words, recovered=True,
+                ))
+                if debug is not None and debug.enabled:
+                    _debug_segment(debug, seg, words, offset=start)
+        except (InterruptedError, KeyboardInterrupt):
+            raise
+        except Exception as exc:  # noqa: BLE001 — a bad window must not kill the job
+            if log:
+                log(f"⚠ 二次识别 {start:.0f}-{end:.0f}s 失败（跳过）: {exc}")
+
+    # never overwrite what the first pass already covered
+    kept = [s for s in recovered if not _overlaps_any(s, segments)]
+    merged = sorted(segments + kept, key=lambda s: s.start)
+    if log:
+        log(f"二次识别完成：找回 {len(kept)} 段 / "
+            f"{sum(s.end - s.start for s in kept):.0f}s"
+            + (f"，另丢弃 {dropped} 段可疑输出" if dropped else ""))
+    if debug is not None and debug.enabled:
+        debug.kv("采纳", f"{len(kept)} 段 / {sum(s.end - s.start for s in kept):.0f}s")
+        debug.kv("丢弃（重复或置信度过低）", dropped)
+        debug.kv("因与第一遍重叠而丢弃", len(recovered) - len(kept))
+    return merged
+
+
+def _overlaps_any(seg: Segment, existing: Sequence[Segment]) -> bool:
+    return any(
+        min(seg.end, other.end) - max(seg.start, other.start) > 0.2
+        for other in existing
+    )
+
+
 def _report_coverage(
-    wav_path: str,
+    audio,
     settings: ASRSettings,
     segments: List[Segment],
     log: Optional[LogFn],
@@ -254,14 +399,10 @@ def _report_coverage(
     try:
         import time
 
-        from faster_whisper.audio import decode_audio
-
         started = time.monotonic()
-        audio = decode_audio(wav_path, sampling_rate=16000)
         duration = len(audio) / 16000.0
         intervals = speech_intervals_of(audio, settings)
         levels = level_profile(audio)
-        del audio
         if not intervals:
             return
         speech, covered, misses = coverage_report(intervals, segments)
@@ -313,6 +454,12 @@ def _report_coverage(
             debug.kv("覆盖率", f"{share:.0%}")
             debug.kv("区间时长(s)", percentiles([e - s for s, e in intervals]))
             debug.kv("已知人声电平中位", f"{speech_db:.1f} dBFS")
+            found = [g for g in segments if g.recovered]
+            if found:
+                debug.kv(
+                    "其中来自二次识别",
+                    f"{len(found)} 段 / {sum(g.end - g.start for g in found):.0f}s",
+                )
             debug.kv("本次检测耗时", f"{elapsed:.1f}s")
 
             debug.line(
@@ -478,7 +625,7 @@ def coverage_report(
     return speech, covered, misses
 
 
-def _debug_segment(dbg, seg, words: List[Word]) -> None:
+def _debug_segment(dbg, seg, words: List[Word], offset: float = 0.0) -> None:
     """Record one whisper segment verbatim, words and confidences included.
 
     The word timestamps are the point: a several-second gap reported in the
@@ -486,7 +633,7 @@ def _debug_segment(dbg, seg, words: List[Word]) -> None:
     nothing downstream can tell that apart from a real pause afterwards.
     """
     dbg.line(
-        f"\n[{seg.start:8.2f} → {seg.end:8.2f}] "
+        f"\n[{seg.start + offset:8.2f} → {seg.end + offset:8.2f}] "
         f"logprob={getattr(seg, 'avg_logprob', float('nan')):.2f} "
         f"no_speech={getattr(seg, 'no_speech_prob', float('nan')):.2f} "
         f"compress={getattr(seg, 'compression_ratio', float('nan')):.2f}"
@@ -578,7 +725,23 @@ def transcribe(
                 log(f"[{seg.start:7.2f}s] {text}")
             if dbg:
                 _debug_segment(dbg, seg, words)
-        _report_coverage(wav_path, settings, results, log, debug)
+
+        # one decode serves both the second pass and the coverage report
+        audio = None
+        try:
+            from faster_whisper.audio import decode_audio
+
+            audio = decode_audio(wav_path, sampling_rate=16000)
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                log(f"（音频复核未能加载: {exc}）")
+        if audio is not None and settings.second_pass and settings.vad_filter:
+            results = second_pass(
+                model, audio, results, settings,
+                language or info.language, log, should_cancel, debug,
+            )
+        if audio is not None:
+            _report_coverage(audio, settings, results, log, debug)
         return results, info.language
     except (InterruptedError, KeyboardInterrupt):
         raise

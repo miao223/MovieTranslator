@@ -57,6 +57,13 @@ class ASRSettings(BaseModel):
     vad_min_speech_ms: int = Field(100, ge=0, le=5000)
     vad_min_silence_ms: int = Field(2000, ge=100, le=10000)
     vad_speech_pad_ms: int = Field(400, ge=0, le=3000)
+    # Second ASR pass over the stretches the VAD rejected. Silero misses
+    # speech that sits under music — one film's narration transcribed fine
+    # while every dramatised scene came back empty, and re-running just
+    # those stretches with the VAD off recovered 35 lines where the normal
+    # pass produced none. Costs roughly a second transcription in time, and
+    # more LLM tokens downstream because there is more text to process.
+    second_pass: bool = True
     # source-language hint fed to whisper as `initial_prompt`: proper nouns
     # it keeps mis-hearing (character names above all). MUST be written in
     # the spoken language — a prompt in another language drags the whole
