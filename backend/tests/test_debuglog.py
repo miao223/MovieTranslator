@@ -75,3 +75,48 @@ def test_coverage_ignores_intervals_shorter_than_a_second():
     segments = [Segment(0.0, 5.0, "x", words=[Word(0.2, 4.8, "x")])]
     _, _, misses = coverage_report(intervals, segments)
     assert misses == []
+
+
+def test_coverage_denominator_ignores_the_job_s_own_threshold():
+    """Otherwise lowering the threshold inflates the denominator and the
+    ratio falls even when the transcription got better — as it did on a
+    real run: speech 1044s→1378s, transcribed 893s→953s, ratio 77%→63%."""
+    import inspect
+
+    from app.services import asr
+
+    src = inspect.getsource(asr.speech_intervals_of)
+    assert "REFERENCE_VAD_THRESHOLD" in src
+    assert "settings.vad_threshold" not in src
+
+
+def test_short_uncovered_runs_are_pauses_not_misses():
+    from app.services.asr import Segment, Word, coverage_report
+
+    # one 10s interval, words with a 1s pause and a 3s hole
+    intervals = [(0.0, 10.0)]
+    segments = [Segment(0.0, 10.0, "x", words=[
+        Word(0.0, 3.0, "a"), Word(4.0, 5.0, "b"), Word(8.0, 10.0, "c"),
+    ])]
+    _, _, misses = coverage_report(intervals, segments)
+    assert [(round(s), round(e)) for s, e, _ in misses] == [(5, 8)]
+
+
+def test_stretches_outside_every_interval_are_found():
+    from app.services.asr import _outside_intervals
+
+    gaps = _outside_intervals([(10.0, 20.0), (40.0, 50.0)], 100.0, 5.0)
+    assert [(round(s), round(e)) for s, e in gaps] == [(0, 10), (20, 40), (50, 100)]
+
+
+def test_level_profile_is_one_value_per_second():
+    import math
+
+    from app.services.asr import level_profile
+
+    quiet = [0.0] * 16000
+    loud = [0.5] * 16000
+    levels = level_profile(quiet + loud + quiet)
+    assert len(levels) == 3
+    assert levels[0] < -100          # digital silence
+    assert math.isclose(levels[1], -6.0, abs_tol=0.5)  # 0.5 full scale ≈ -6 dBFS

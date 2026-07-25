@@ -8,7 +8,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 from app.models.schemas import ASRSettings, NetworkSettings
 
@@ -29,6 +29,20 @@ class Segment:
 
 ProgressFn = Callable[[float], None]  # 0..1
 LogFn = Callable[[str], None]
+
+# The coverage figure must stay comparable between runs, so its denominator
+# is measured at a FIXED threshold rather than whatever the job used. With
+# the user's setting, lowering the threshold inflated Silero's "speech"
+# total by 334s of noise and the ratio fell from 77% to 63% — while the
+# transcription had in fact improved by 60s.
+REFERENCE_VAD_THRESHOLD = 0.35
+# an uncovered run shorter than this is a pause, not a missing line
+MIN_MISS_SECONDS = 2.0
+# ...and outside the speech intervals, only report a stretch this long
+MIN_UNDETECTED_SECONDS = 5.0
+# how close to the level of known speech a stretch has to be before
+# "Silero heard nothing there" becomes suspicious rather than expected
+LEVEL_SUSPICIOUS_DB = 12.0
 
 _model = None
 _model_key: Optional[tuple] = None
@@ -240,17 +254,49 @@ def _report_coverage(
     try:
         import time
 
+        from faster_whisper.audio import decode_audio
+
         started = time.monotonic()
-        intervals = speech_intervals(wav_path, settings)
+        audio = decode_audio(wav_path, sampling_rate=16000)
+        duration = len(audio) / 16000.0
+        intervals = speech_intervals_of(audio, settings)
+        levels = level_profile(audio)
+        del audio
         if not intervals:
             return
         speech, covered, misses = coverage_report(intervals, segments)
         share = covered / speech if speech else 1.0
         elapsed = time.monotonic() - started
+
+        # what does speech look like, level-wise, where we know there is some?
+        speech_db = _median_level(
+            levels, intervals[0][0], intervals[0][1]
+        ) if levels else -140.0
+        if levels:
+            import statistics
+
+            spoken = [
+                _median_level(levels, s, e) for s, e in intervals if e - s >= 2.0
+            ]
+            if spoken:
+                speech_db = statistics.median(spoken)
+
+        # stretches Silero never called speech, but which are as loud as the
+        # speech it did find — the case a threshold cannot reach
+        undetected = []
+        for s, e in _outside_intervals(intervals, duration, MIN_UNDETECTED_SECONDS):
+            db = _median_level(levels, s, e) if levels else -140.0
+            if db >= speech_db - LEVEL_SUSPICIOUS_DB:
+                undetected.append((s, e, e - s, db))
+
         summary = (
             f"识别覆盖率 {share:.0%}（语音 {speech:.0f}s，转写 {covered:.0f}s，"
-            f"完全未转写的语音段 {len(misses)} 处 / {sum(d for _, _, d in misses):.0f}s）"
+            f"漏识别 {len(misses)} 处 / {sum(d for _, _, d in misses):.0f}s）"
         )
+        # `undetected` deliberately stays out of this line: on a film that is
+        # 59% score and ambience, "as loud as speech" flags every music cue,
+        # and a warning nobody can act on is worse than none. It is a lead to
+        # follow in the debug log, not a verdict.
         if log:
             log(summary if share >= 0.9 else "⚠ " + summary)
         if debug is not None and debug.enabled:
@@ -258,23 +304,51 @@ def _report_coverage(
 
             debug.section("语音检测覆盖（silero VAD vs 实际转写）")
             debug.line(
-                "silero 认定为语音、却一个字都没转写出来的区间，就是漏识别。\n"
-                "部分覆盖是正常的：silero 会把短于「最短静默」的停顿留在同一区间内。\n"
+                f"分母固定用阈值 {REFERENCE_VAD_THRESHOLD} 测量，与本次任务的设置无关，\n"
+                "否则调低阈值会同时抬高分母，覆盖率反而下降，跨配置无法比较。\n"
+                f"区间内短于 {MIN_MISS_SECONDS}s 的空缺算正常停顿，不计入漏识别。\n"
             )
             debug.kv("silero 语音区间", f"{len(intervals)} 段，合计 {speech:.0f}s")
             debug.kv("实际转写覆盖", f"{covered:.0f}s")
             debug.kv("覆盖率", f"{share:.0%}")
             debug.kv("区间时长(s)", percentiles([e - s for s, e in intervals]))
+            debug.kv("已知人声电平中位", f"{speech_db:.1f} dBFS")
             debug.kv("本次检测耗时", f"{elapsed:.1f}s")
-            debug.line(f"\n完全未转写的语音段（{len(misses)} 处，按时长排序）：")
+
+            debug.line(
+                f"\n① 有语音但没转写出来（{len(misses)} 处，"
+                f"≥{MIN_MISS_SECONDS}s，按时长排序）："
+            )
             debug.lines(
-                f"  {fmt_time(s)} → {fmt_time(e)}  {d:6.1f}s"
+                f"  {fmt_time(s)} → {fmt_time(e)}  {d:6.1f}s  "
+                f"{_median_level(levels, s, e):6.1f} dBFS"
                 for s, e, d in sorted(misses, key=lambda m: -m[2])
+            )
+            debug.line(
+                f"\n② 音量接近人声、却未被判定为语音（{len(undetected)} 处，"
+                f"≥{MIN_UNDETECTED_SECONDS}s）——"
+                "调阈值够不着的漏检就在这里："
+            )
+            debug.line(
+                "  注意：配乐/环境音同样能达到人声响度，音乐多的片源这里会有很多条，"
+                "不能直接当作漏识别，需结合时间点回看确认。"
+            )
+            debug.lines(
+                f"  {fmt_time(s)} → {fmt_time(e)}  {d:6.1f}s  {db:6.1f} dBFS  "
+                f"（比人声{'高' if db >= speech_db else '低'} "
+                f"{abs(db - speech_db):.1f} dB）"
+                for s, e, d, db in sorted(undetected, key=lambda m: -m[2])[:60]
             )
             debug.line("\nsilero 全部语音区间：")
             debug.lines(
-                f"  {fmt_time(s)} → {fmt_time(e)}  {e - s:6.2f}s"
+                f"  {fmt_time(s)} → {fmt_time(e)}  {e - s:6.2f}s  "
+                f"{_median_level(levels, s, e):6.1f} dBFS"
                 for s, e in intervals
+            )
+            debug.line("\n每分钟音量剖面（dBFS，用于判断某段是否真的有声音）：")
+            debug.lines(
+                f"  {i:3d}min  {_median_level(levels, i * 60, (i + 1) * 60):6.1f}"
+                for i in range(int(duration // 60) + 1)
             )
     except Exception as exc:  # noqa: BLE001 — diagnostics must never fail a job
         if log:
@@ -297,8 +371,15 @@ def speech_intervals(wav_path: str, settings: ASRSettings) -> List[tuple[float, 
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
     audio = decode_audio(wav_path, sampling_rate=16000)
+    return speech_intervals_of(audio, settings)
+
+
+def speech_intervals_of(audio, settings: ASRSettings) -> List[tuple[float, float]]:
+    """As above, for audio already decoded."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
     options = VadOptions(
-        threshold=settings.vad_threshold,
+        threshold=REFERENCE_VAD_THRESHOLD,
         min_speech_duration_ms=settings.vad_min_speech_ms,
         min_silence_duration_ms=settings.vad_min_silence_ms,
         speech_pad_ms=0,
@@ -309,31 +390,91 @@ def speech_intervals(wav_path: str, settings: ASRSettings) -> List[tuple[float, 
     ]
 
 
+def _uncovered_within(
+    intervals: Sequence[tuple[float, float]],
+    words: Sequence[tuple[float, float]],
+    min_gap: float,
+) -> List[tuple[float, float]]:
+    """Stretches inside a speech interval where no word landed.
+
+    Only runs above *min_gap* count. Silero keeps pauses shorter than
+    min_silence_duration_ms inside one interval, so short uncovered runs
+    are breathing room, not missing dialogue — on one film they were 341
+    of the 349 uncovered runs and 90% of the uncovered seconds.
+    """
+    out: List[tuple[float, float]] = []
+    for start, end in intervals:
+        inside = sorted(
+            (max(start, ws), min(end, we)) for ws, we in words
+            if we > start and ws < end
+        )
+        cursor = start
+        for ws, we in inside:
+            if ws - cursor >= min_gap:
+                out.append((cursor, ws))
+            cursor = max(cursor, we)
+        if end - cursor >= min_gap:
+            out.append((cursor, end))
+    return out
+
+
+def _outside_intervals(
+    intervals: Sequence[tuple[float, float]], duration: float, min_gap: float
+) -> List[tuple[float, float]]:
+    """Stretches Silero did not call speech at all."""
+    out: List[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in intervals:
+        if start - cursor >= min_gap:
+            out.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor >= min_gap:
+        out.append((cursor, duration))
+    return out
+
+
+def level_profile(audio) -> "list":
+    """RMS in dBFS for every second of *audio* (16 kHz mono float32)."""
+    import numpy as np
+
+    usable = len(audio) - len(audio) % 16000
+    if usable <= 0:
+        return []
+    frames = np.asarray(audio[:usable], dtype=np.float32).reshape(-1, 16000)
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
+    return (20.0 * np.log10(np.maximum(rms, 1e-7))).tolist()
+
+
+def _median_level(levels: Sequence[float], start: float, end: float) -> float:
+    import statistics
+
+    window = levels[int(start):max(int(end), int(start) + 1)]
+    return statistics.median(window) if window else -140.0
+
+
 def coverage_report(
     intervals: List[tuple[float, float]], segments: List[Segment]
 ) -> tuple[float, float, List[tuple[float, float, float]]]:
     """(speech total, transcribed total, misses) — all in seconds.
 
-    A "miss" is an interval Silero calls speech that received no words at
-    all, with the share of it left uncovered. Partial coverage is normal:
-    Silero keeps pauses shorter than min_silence_duration_ms inside one
-    interval, and no words land in those.
+    A "miss" is a run of at least MIN_MISS_SECONDS inside a speech interval
+    that received no words.
     """
     words = sorted(
         (w.start, w.end) for seg in segments for w in seg.words
     ) or sorted((s.start, s.end) for s in segments)
 
     speech = sum(e - s for s, e in intervals)
-    covered = 0.0
-    misses: List[tuple[float, float, float]] = []
-    for start, end in intervals:
-        inside = sum(
-            max(0.0, min(end, we) - max(start, ws)) for ws, we in words
-            if we > start and ws < end
-        )
-        covered += inside
-        if inside <= 0.05 and end - start >= 1.0:
-            misses.append((start, end, end - start))
+    covered = sum(
+        max(0.0, min(end, we) - max(start, ws))
+        for start, end in intervals
+        for ws, we in words
+        if we > start and ws < end
+    )
+    misses = [
+        (s, e, e - s)
+        for s, e in _uncovered_within(intervals, words, MIN_MISS_SECONDS)
+    ]
     return speech, covered, misses
 
 

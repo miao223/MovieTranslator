@@ -121,6 +121,29 @@ def build_refine_prompt(language_hint: str = "", glossary: str = "") -> str:
     return "\n".join(parts)
 
 
+def _tally(usage: Optional[dict], resp, dbg) -> None:
+    """Add this call's reported tokens to the shared tally.
+
+    Preprocessing restates every chunk in full, which made it 65% of one
+    film's runtime — leaving it out of the accounting hid the bulk of both
+    the time and the cost.
+    """
+    reported = getattr(resp, "usage", None)
+    if usage is None or reported is None:
+        return
+    cached = getattr(reported, "prompt_tokens_details", None)
+    usage["calls"] += 1
+    usage["prompt"] += getattr(reported, "prompt_tokens", 0) or 0
+    usage["completion"] += getattr(reported, "completion_tokens", 0) or 0
+    usage["cached"] += getattr(cached, "cached_tokens", 0) or 0
+    if dbg:
+        dbg.line(
+            f"    tokens: 输入 {getattr(reported, 'prompt_tokens', 0)}"
+            f"（缓存命中 {getattr(cached, 'cached_tokens', 0) or 0}）"
+            f" 输出 {getattr(reported, 'completion_tokens', 0)}"
+        )
+
+
 def _numbered(lines: Sequence[SubtitleLine]) -> str:
     return "\n".join(f"[{line.index}] {line.text}" for line in lines)
 
@@ -371,6 +394,7 @@ def refine_lines(
     network: Optional[NetworkSettings] = None,
     glossary: str = "",
     debug=None,
+    usage: Optional[dict] = None,
 ) -> List[SubtitleLine]:
     """Rejoin and clean up *lines*; returns renumbered cues.
 
@@ -432,6 +456,7 @@ def refine_lines(
                 temperature=0,  # mechanical task: no creativity wanted
             )
             reply = resp.choices[0].message.content or ""
+            _tally(usage, resp, dbg)
             if dbg:
                 dbg.block(f"第 {n} 块 请求", user)
                 dbg.block(f"第 {n} 块 响应", reply)

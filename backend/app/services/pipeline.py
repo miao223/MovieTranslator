@@ -452,6 +452,7 @@ class JobManager:
         # with mechanical verification — a line holding only a fragment has
         # no counterpart in the target language, and the translator fills it
         # with the next line's content, shifting everything after it
+        refine_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
         if settings.prompts.refine_enabled:
             job.publish("refining", 60, message="转写预处理中（断句整理 + 识别纠错）…")
             lines = refine.refine_lines(
@@ -468,6 +469,7 @@ class JobManager:
                 network=settings.network,
                 glossary=settings.prompts.glossary,
                 debug=debug,
+                usage=refine_usage,
             )
             (workdir / "transcript_refined.json").write_text(
                 json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
@@ -497,7 +499,11 @@ class JobManager:
             debug=debug,
         )
         translator.translate(lines)
-        job.publish("translating", 95, log=translator.report_usage())
+        job.publish(
+            "translating", 95,
+            log=_usage_line("转写预处理", refine_usage)
+            + "\n" + translator.report_usage(),
+        )
         (workdir / "translation.json").write_text(
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
             encoding="utf-8",
@@ -569,4 +575,14 @@ class JobManager:
         )
 
 
+
+
+
+def _usage_line(label: str, usage: dict) -> str:
+    if not usage["calls"]:
+        return f"{label}未记录 token 用量（服务端未返回 usage）"
+    return (
+        f"{label}共 {usage['calls']} 次请求：输入 {usage['prompt']:,} tokens"
+        f"（其中缓存命中 {usage['cached']:,}）、输出 {usage['completion']:,} tokens"
+    )
 manager = JobManager()
