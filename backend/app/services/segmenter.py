@@ -208,7 +208,13 @@ def _lines_from_words(words: Sequence[Word], settings: SubtitleSettings) -> List
             head = "".join(w.text for w in buf).strip()
             candidate_len = len(head + word.text.rstrip())
             too_long = candidate_len > budget
-            too_slow = word.end - buf[0].start > settings.max_duration
+            # measure the cue's length from where its speech really starts,
+            # not from a timestamp already known to be wrong: with a bogus
+            # leading word 577s early, every following word looks "too slow"
+            # and the buffer gets cut after four kana — 「マッショ」 + 「ンは…」
+            too_slow = (
+                word.end - _trustworthy_start(buf) > settings.max_duration
+            )
             gap = word.start - buf[-1].end > GAP_BREAK
             # a break here would leave `head` alone as a cue; below a few
             # characters that is not a line but half a word, and the

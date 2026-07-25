@@ -373,6 +373,14 @@ class JobManager:
                 "extracting", 0,
                 log=f"选用 {audio.describe_track(track)}（{reason}）",
             )
+        if debug.enabled:
+            # a sparse transcript on a multi-track disc rip is the wrong
+            # track more often than it is a quiet film, and that question
+            # cannot be answered from the transcript alone
+            debug.section("音轨")
+            debug.kv("选用", audio.describe_track(track))
+            debug.line("\n全部音轨：")
+            debug.lines("  " + audio.describe_track(t) for t in tracks)
         audio.extract_audio(
             req.video_path, wav,
             progress=extract_progress,

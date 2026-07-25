@@ -379,3 +379,33 @@ def test_a_fragment_is_not_glued_onto_a_finished_sentence():
     lines = segment_lines(segs, SubtitleSettings())
     assert lines[0].text == "I'm gonna call Odessa PD."
     assert any("I understand it now" in l.text for l in lines)
+
+
+def test_a_bogus_leading_timestamp_does_not_shred_the_rest_of_the_cue():
+    """Verbatim from a DVD rip: 「マ」「ッ」 land 577s before 「シ」「ョ」「ン」…
+
+    _trustworthy_start already moved the cue's start to the real speech, but
+    the duration test still measured from the bogus one, so every following
+    word looked too slow and the buffer was cut after four kana —
+    「マッショ」 (0.08s) + 「ンは建て直された…」.
+    """
+    seg = Segment(2633.24, 3214.19, "マンションは建て直されたものなんだそうです", words=[
+        w(2633.24, 2633.64, "マ"), w(2633.64, 2634.00, "ッ"),
+        w(3211.41, 3211.45, "シ"), w(3211.45, 3211.49, "ョ"),
+        w(3211.49, 3211.57, "ン"), w(3211.57, 3211.71, "は"),
+        w(3211.71, 3212.55, "建て直され"), w(3212.55, 3214.19, "たものなんだそうです"),
+    ])
+    lines = segment_lines([seg], SubtitleSettings())
+    assert len(lines) == 1
+    assert lines[0].text == "マッションは建て直されたものなんだそうです"
+    assert lines[0].start == pytest.approx(3211.41, abs=0.01)
+    assert lines[0].end - lines[0].start < 3.0  # not 581s, and not 0.08s
+
+
+def test_a_genuinely_long_utterance_is_still_split():
+    """The duration cap must keep working where the timestamps are sound."""
+    words = [w(i * 0.8, i * 0.8 + 0.7, f"語{i}") for i in range(20)]
+    lines = segment_lines([Segment(0, 16, "x", words=words)],
+                          SubtitleSettings(max_duration=6.0, max_chars_per_line=120))
+    assert len(lines) > 1
+    assert all(l.end - l.start <= 6.5 for l in lines)

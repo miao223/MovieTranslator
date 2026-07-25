@@ -60,9 +60,11 @@ class DebugLog:
             return
         try:
             assert self.path is not None
+            from app.core.joblog import APP_VERSION
+
             self.path.write_text("", encoding="utf-8")
             self._write(
-                f"=== MovieTranslator 调试日志 ===\n"
+                f"=== MovieTranslator {APP_VERSION} 调试日志 ===\n"
                 f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n"
                 f"说明: 本文件用于排查字幕质量问题，可直接发给开发者。\n"
                 f"      不含 API key 等敏感信息。\n"
