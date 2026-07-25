@@ -486,3 +486,25 @@ def test_a_non_fragment_merge_still_obeys_the_width_budget():
     reply = f"[1-2] {a} {b}.\n" + "\n".join(f"[{l.index}] {l.text}" for l in lines[2:])
     out, _ = run([reply], lines=lines, subtitle=SubtitleSettings(max_chars_per_line=42))
     assert [out[0].text, out[1].text] == [a, b]  # 123 chars: rejected
+
+
+def test_refine_also_asks_the_provider_not_to_think():
+    """The pass sets temperature=0, which thinking mode would override."""
+    from tests.test_translator import RecordingClient
+
+    client = RecordingClient([
+        "[1-2] Yeah, like that thought never entered my mind.\n[3] Okay, come on."
+    ])
+    refine_lines([l.model_copy() for l in SAMPLE], LLM, SUB, client=client)
+    assert client.kwargs[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert all(m["temperature"] == 0 for m in [{"temperature": 0}])  # documented intent
+
+
+def test_refine_survives_a_provider_without_the_parameter():
+    from tests.test_translator import RecordingClient
+
+    client = RecordingClient([
+        "[1-2] Yeah, like that thought never entered my mind.\n[3] Okay, come on."
+    ], reject_extra_body=True)
+    out = refine_lines([l.model_copy() for l in SAMPLE], LLM, SUB, client=client)
+    assert out[0].text == "Yeah, like that thought never entered my mind."

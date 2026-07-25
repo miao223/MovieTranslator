@@ -36,7 +36,7 @@ from app.services.segmenter import (
     is_fragment_text,
     open_ended_ratio,
 )
-from app.services.translator import estimate_tokens, make_openai_client
+from app.services.translator import chat_completion, estimate_tokens, make_openai_client
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[float], None]  # 0..1
@@ -424,6 +424,7 @@ def refine_lines(
     result: List[SubtitleLine] = []
     merged = corrected = failed = 0
     consecutive_failures = 0
+    no_thinking = llm.disable_thinking
     all_rejections: List[str] = []
     for n, chunk in enumerate(chunks, start=1):
         if should_cancel and should_cancel():
@@ -447,13 +448,15 @@ def refine_lines(
         user += "请整理以下字幕行：\n" + _numbered(chunk)
 
         try:
-            resp = client.chat.completions.create(
+            resp, no_thinking = chat_completion(
+                client,
                 model=llm.model,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
                 temperature=0,  # mechanical task: no creativity wanted
+                no_thinking=no_thinking,
             )
             reply = resp.choices[0].message.content or ""
             _tally(usage, resp, dbg)

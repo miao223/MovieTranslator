@@ -27,6 +27,12 @@ class LLMSettings(BaseModel):
     # for alignment (see translator.py), that risk is covered, and the
     # check's own margin is wider at 200 than at 120 on real runs.
     batch_size: int = Field(200, ge=1, le=500)
+    # Ask the provider to skip its reasoning pass. Both jobs here are
+    # mechanical, and DeepSeek documents that thinking mode also disables
+    # temperature — so the temperature=0 the preprocessing pass requests
+    # only takes effect once this is on. Providers that do not know the
+    # parameter are detected and stop being sent it.
+    disable_thinking: bool = True
     # approximate context window of the model, in tokens; beyond this the
     # translator falls back to sliding-window chunking
     context_limit: int = Field(100_000, ge=1_000)

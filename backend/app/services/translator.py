@@ -156,6 +156,46 @@ class TranslationError(Exception):
     pass
 
 
+# DeepSeek (and several other OpenAI-compatible providers) run a reasoning
+# pass by default. Both jobs here are mechanical — restate these lines with
+# the sentence breaks fixed, translate these lines one for one — and the
+# reasoning is pure overhead: on one film the preprocessing pass emitted
+# 42,723 completion tokens against 9,575 of input, where the text it was
+# asked to restate is worth about 7,000. Worse, DeepSeek documents that
+# thinking mode *disables* temperature, so the temperature=0 the refine
+# pass asks for was never in effect.
+_THINKING_OFF = {"thinking": {"type": "disabled"}}
+# error wording that means the endpoint does not know this parameter
+_UNSUPPORTED_HINTS = ("thinking", "extra_body", "unknown", "unrecognized",
+                      "unsupported", "not allowed", "invalid_request")
+
+
+def _rejects_thinking(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(hint in text for hint in _UNSUPPORTED_HINTS)
+
+
+def chat_completion(client, *, model, messages, temperature, no_thinking=True):
+    """One chat call, asking the provider not to think first.
+
+    Returns ``(response, still_supported)``. A provider that rejects the
+    parameter gets one retry without it, and the caller stops sending it —
+    the switch must never turn a working endpoint into a broken one.
+    """
+    if no_thinking:
+        try:
+            return client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                extra_body=_THINKING_OFF,
+            ), True
+        except Exception as exc:  # noqa: BLE001
+            if not _rejects_thinking(exc):
+                raise
+    return client.chat.completions.create(
+        model=model, messages=messages, temperature=temperature,
+    ), False
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate: CJK ≈ 1 token/char, other text ≈ 1 token/4 chars."""
     cjk = sum(1 for c in text if "⺀" <= c <= "鿿" or "　" <= c <= "ヿ")
@@ -204,6 +244,7 @@ class Translator:
     ):
         self.debug = debug if debug is not None and debug.enabled else None
         self.usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
+        self._no_thinking = settings.disable_thinking
         self.settings = settings
         self.target_language = target_language
         self.synopsis = synopsis
@@ -225,10 +266,12 @@ class Translator:
                 f"翻译请求 #{self._chat_seq}（最后一条 user 消息）",
                 messages[-1].get("content", ""),
             )
-        resp = self.client.chat.completions.create(
+        resp, self._no_thinking = chat_completion(
+            self.client,
             model=self.settings.model,
             messages=messages,
             temperature=self.settings.temperature,
+            no_thinking=self._no_thinking,
         )
         content = resp.choices[0].message.content or ""
         self._account(resp)

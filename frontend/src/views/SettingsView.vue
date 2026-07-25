@@ -202,6 +202,15 @@ async function testLLM() {
           <el-input v-model="settings.llm.vision_model" placeholder="（可选）qwen-vl-plus / gpt-4o-mini / glm-4v …" />
           <span class="hint">仅画面翻译功能使用，留空则用上方主模型；DeepSeek 等纯文本模型不支持画面翻译</span>
         </el-form-item>
+        <el-form-item label="关闭思考模式">
+          <el-switch v-model="settings.llm.disable_thinking" />
+          <span class="hint">
+            字幕整理和逐行翻译都是机械任务，模型的思考过程属于纯开销——实测转写预处理的
+            输出 token 是它需要重述内容的 5～6 倍。而且 DeepSeek 文档说明思考模式会
+            <strong>使 temperature 失效</strong>，本程序给预处理设定的 temperature=0 只有关掉思考才生效。
+            <br />不支持该参数的服务会被自动识别并跳过，不影响使用。
+          </span>
+        </el-form-item>
         <el-form-item label="Temperature">
           <el-slider v-model="settings.llm.temperature" :min="0" :max="1.5" :step="0.1" show-input style="width: 400px" />
         </el-form-item>

@@ -310,3 +310,58 @@ def test_a_provider_without_usage_is_tolerated():
     tr.translate(lines)
     assert tr.usage["calls"] == 0
     assert "未记录" in tr.report_usage()
+
+
+# ----------------------------------------------- provider reasoning switch
+
+
+class RecordingClient(FakeClient):
+    """Records the kwargs of every call, not just the messages."""
+
+    def __init__(self, responses, reject_extra_body=False):
+        super().__init__(responses)
+        self.kwargs = []
+        self.reject = reject_extra_body
+
+    def create(self, model, messages, temperature, **kw):
+        self.kwargs.append(kw)
+        if self.reject and "extra_body" in kw:
+            raise RuntimeError("400 Unrecognized request argument: thinking")
+        return super().create(model, messages, temperature, **kw)
+
+
+def test_thinking_is_switched_off_by_default():
+    lines = make_lines(2)
+    client = RecordingClient(["glossary", "[1] 一\n[2] 二"])
+    Translator(settings(batch_size=5), "简体中文", client=client).translate(lines)
+    assert all(
+        kw["extra_body"] == {"thinking": {"type": "disabled"}} for kw in client.kwargs
+    )
+
+
+def test_a_provider_that_rejects_the_parameter_still_works():
+    """The switch must never turn a working endpoint into a broken one."""
+    lines = make_lines(2)
+    client = RecordingClient(["glossary", "[1] 一\n[2] 二"], reject_extra_body=True)
+    Translator(settings(batch_size=5), "简体中文", client=client).translate(lines)
+    assert [l.translation for l in lines] == ["一", "二"]
+    # first call tries it, is refused, retries without — and never tries again
+    assert "extra_body" in client.kwargs[0]
+    assert "extra_body" not in client.kwargs[1]
+    assert not any("extra_body" in kw for kw in client.kwargs[1:])
+
+
+def test_a_real_error_is_not_mistaken_for_an_unsupported_parameter():
+    from app.services.translator import _rejects_thinking
+
+    assert not _rejects_thinking(RuntimeError("connection reset by peer"))
+    assert not _rejects_thinking(RuntimeError("rate limit exceeded"))
+    assert _rejects_thinking(RuntimeError("Unrecognized request argument: thinking"))
+
+
+def test_the_setting_turns_it_off():
+    lines = make_lines(2)
+    client = RecordingClient(["glossary", "[1] 一\n[2] 二"])
+    Translator(settings(batch_size=5, disable_thinking=False), "简体中文",
+               client=client).translate(lines)
+    assert not any("extra_body" in kw for kw in client.kwargs)
