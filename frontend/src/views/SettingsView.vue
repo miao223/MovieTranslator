@@ -206,8 +206,11 @@ async function testLLM() {
           <el-slider v-model="settings.llm.temperature" :min="0" :max="1.5" :step="0.1" show-input style="width: 400px" />
         </el-form-item>
         <el-form-item label="每批翻译行数">
-          <el-input-number v-model="settings.llm.batch_size" :min="10" :max="300" :step="10" />
-          <span class="hint">受模型单次输出上限约束，一般 50~120</span>
+          <el-input-number v-model="settings.llm.batch_size" :min="10" :max="500" :step="10" />
+          <span class="hint">
+            默认 200。调大可减少请求次数、缩短耗时并降低 token 消耗；
+            受模型单次输出上限约束，若出现响应被截断（日志报「行号覆盖校验未通过」或反复补翻）则调小。
+          </span>
         </el-form-item>
         <el-form-item label="模型上下文上限">
           <el-input-number v-model="settings.llm.context_limit" :min="4000" :max="1000000" :step="1000" />

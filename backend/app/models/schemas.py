@@ -18,8 +18,15 @@ class LLMSettings(BaseModel):
     # (needed because strong text models like DeepSeek have no vision)
     vision_model: str = ""
     temperature: float = Field(0.3, ge=0.0, le=2.0)
-    # lines translated per output batch (limited by the model's max output tokens)
-    batch_size: int = Field(80, ge=1, le=500)
+    # Lines translated per output batch, bounded by the model's max output
+    # tokens. Bigger batches mean fewer round trips and a conversation that
+    # grows more slowly, so a film costs less time and fewer tokens. The
+    # reason to keep them small used to be that a long batch gives the model
+    # more room to lose its place and shift every line after it — now that
+    # each request restates its own source lines and every batch is checked
+    # for alignment (see translator.py), that risk is covered, and the
+    # check's own margin is wider at 200 than at 120 on real runs.
+    batch_size: int = Field(200, ge=1, le=500)
     # approximate context window of the model, in tokens; beyond this the
     # translator falls back to sliding-window chunking
     context_limit: int = Field(100_000, ge=1_000)

@@ -398,6 +398,11 @@ class Translator:
             line.translation = parsed.get(line.index) or kept.get(line.index, "")
 
         after = _length_correlation(chunk)
+        if self.debug:
+            self.debug.line(
+                f"批次 [{first}-{last}] 重发后相关性 r="
+                + ("（无法计算）" if after is None else f"{after:+.2f}")
+            )
         if after is None or after <= before:
             for line in chunk:  # the retry was no better; keep the first answer
                 line.translation = kept.get(line.index, line.translation)

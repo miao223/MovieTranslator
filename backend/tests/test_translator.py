@@ -251,3 +251,22 @@ def test_the_batch_request_restates_its_own_source_lines():
     )
     assert "[1] Yes." in batch_request
     assert f"[{lines[-1].index}]" in batch_request
+
+
+def test_batch_size_default_matches_the_documented_value():
+    """The default is part of the time/token story; keep them in step."""
+    assert LLMSettings().batch_size == 200
+
+
+def test_the_alignment_check_does_not_fire_on_a_well_aligned_batch():
+    """A false positive costs a whole extra batch, so the margin matters.
+
+    Real runs: the worst aligned batch across two Japanese films and one
+    English one sits at r=+0.66, against a 0.45 threshold.
+    """
+    from app.services.translator import ALIGNMENT_MIN_CORRELATION, _length_correlation
+
+    lines = aligned_lines(200)
+    for line in lines:
+        line.translation = zh_for(line.text)
+    assert _length_correlation(lines) > ALIGNMENT_MIN_CORRELATION + 0.2
