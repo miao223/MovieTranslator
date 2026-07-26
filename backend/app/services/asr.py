@@ -54,37 +54,15 @@ SECOND_PASS_WINDOW = 300.0  # bounded slices; see _windows()
 SECOND_PASS_MAX_COMPRESSION = 2.4   # whisper's own repetition tell
 SECOND_PASS_MIN_LOGPROB = -1.0      # whisper's own confidence floor
 
-# Whisper was trained on subtitle files, and over non-speech it emits the
-# outro lines those files end with. The second pass looks precisely where
-# the VAD found no speech, so it meets them constantly: one film came back
-# with "ご視聴ありがとうございました" twelve times, at compression ratios
-# of 0.86 — perfectly ordinary sentences, invisible to a repetition check.
-#
-# The list stays to phrases that are artefacts of that training data and
-# essentially never real dialogue. Notably absent: 「おやすみなさい」, which
-# also showed up four times and is also suspicious, but "good night" is an
-# ordinary line and blocking it would cost more than it saves.
-HALLUCINATION_PHRASES = (
-    "ご視聴ありがとうございました",
-    "ご視聴ありがとうございます",
-    "最後までご視聴いただき",
-    "チャンネル登録",
-    "高評価",
-    "thank you for watching",
-    "thanks for watching",
-    "subtitles by",
-    "subtitled by",
-    "amara.org",
-    "字幕由",
-    "请订阅",
-    "感谢观看",
-)
-
-
-def is_hallucinated(text: str) -> bool:
-    """A subtitle-file outro line, not something anyone said."""
-    lowered = text.strip().lower()
-    return any(phrase.lower() in lowered for phrase in HALLUCINATION_PHRASES)
+# Whisper was trained on subtitle files, and over non-speech it emits what
+# those files contain: closing lines, station announcements, encyclopedia
+# entries, cooking instructions. The second pass looks precisely where the
+# VAD found no speech, so it meets them constantly — one film came back
+# with "ご視聴ありがとうございました" twelve times at compression ratios of
+# 0.86, perfectly ordinary sentences that no confidence gate can see
+# through. Sorting those from the genuine dialogue the pass recovers takes
+# knowledge of what the film is about, so it happens afterwards and
+# elsewhere: see services/vet.py.
 
 _model = None
 _model_key: Optional[tuple] = None
@@ -355,7 +333,7 @@ def second_pass(
         debug.kv("重新识别时长", f"{total:.0f}s")
 
     recovered: List[Segment] = []
-    dropped = hallucinated = 0
+    dropped = 0
     for start, end in todo:
         if should_cancel and should_cancel():
             raise InterruptedError("cancelled")
@@ -388,9 +366,6 @@ def second_pass(
                 if getattr(seg, "avg_logprob", 0) < SECOND_PASS_MIN_LOGPROB:
                     dropped += 1
                     continue
-                if is_hallucinated(text):
-                    hallucinated += 1
-                    continue
                 words = [
                     Word(float(w.start) + start, float(w.end) + start, w.word)
                     for w in (seg.words or [])
@@ -414,11 +389,10 @@ def second_pass(
         log(f"二次识别完成：找回 {len(kept)} 段 / "
             f"{sum(s.end - s.start for s in kept):.0f}s"
             + (f"，丢弃 {dropped} 段可疑输出" if dropped else "")
-            + (f"，滤掉 {hallucinated} 段幻觉短语" if hallucinated else ""))
+            + "（待复核）")
     if debug is not None and debug.enabled:
         debug.kv("采纳", f"{len(kept)} 段 / {sum(s.end - s.start for s in kept):.0f}s")
         debug.kv("丢弃（重复或置信度过低）", dropped)
-        debug.kv("滤掉（whisper 片尾幻觉短语）", hallucinated)
         debug.kv("因与第一遍重叠而丢弃", len(recovered) - len(kept))
     return merged
 

@@ -27,7 +27,7 @@ from app.models.schemas import (
     ProgressEvent,
     SubtitleLine,
 )
-from app.services import asr, audio, refine, segmenter, subtitle
+from app.services import asr, audio, refine, segmenter, subtitle, vet
 from app.services.translator import Translator
 
 # overall progress ranges per stage: (start%, end%)
@@ -426,6 +426,31 @@ class JobManager:
         )
         if not segments:
             raise RuntimeError("未识别到任何语音内容")
+
+        # 2b-2. vet what the second pass recovered ---------------------------
+        # It re-transcribes exactly where the VAD heard nothing, which is
+        # where whisper emits its subtitle-file training residue. Only a
+        # model holding the film's own transcript can tell that apart from
+        # the real dialogue the pass also recovers, so ask one — before
+        # segmentation, while each recovered segment is still a whole
+        # sentence with its provenance intact.
+        vet_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
+        if any(s.recovered for s in segments):
+            job.publish("transcribing", job.status.progress, message="二次识别结果复核中…")
+            segments = vet.vet_recovered(
+                segments,
+                settings.llm,
+                language_hint=detected or "",
+                synopsis=req.synopsis,
+                log=lambda msg: job.publish("transcribing", job.status.progress, log=msg),
+                should_cancel=job.cancel_event.is_set,
+                network=settings.network,
+                debug=debug,
+                usage=vet_usage,
+            )
+            if not segments:
+                raise RuntimeError("未识别到任何语音内容")
+
         lines = segmenter.segment_lines(segments, settings.subtitle, debug=debug)
         if segmenter.is_effectively_unpunctuated(lines):
             # everything that decides where a sentence ends reads punctuation;
@@ -501,8 +526,11 @@ class JobManager:
         translator.translate(lines)
         job.publish(
             "translating", 95,
-            log=_usage_line("转写预处理", refine_usage)
-            + "\n" + translator.report_usage(),
+            log=(
+                (_usage_line("二次识别复核", vet_usage) + "\n" if vet_usage["calls"] else "")
+                + _usage_line("转写预处理", refine_usage)
+                + "\n" + translator.report_usage()
+            ),
         )
         (workdir / "translation.json").write_text(
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
