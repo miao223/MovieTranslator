@@ -409,3 +409,41 @@ def test_a_genuinely_long_utterance_is_still_split():
                           SubtitleSettings(max_duration=6.0, max_chars_per_line=120))
     assert len(lines) > 1
     assert all(l.end - l.start <= 6.5 for l in lines)
+
+
+def test_a_relocated_start_does_not_leave_the_cues_out_of_order():
+    """Whisper pins a word it could not align to the end of the previous
+    utterance, so a segment can claim to start minutes before it speaks.
+    _trustworthy_start moves the cue to where the words are — after which
+    it may belong behind cues that were listed later. Everything downstream
+    reads this list as chronological, and _fix_overlaps would "resolve" the
+    inversion by collapsing the following cue to 0.05s.
+    """
+    from app.services.asr import Segment, Word
+
+    stretched = Segment(143.3, 423.8, "いいですか?", words=[
+        Word(143.3, 143.5, "いい"), Word(423.46, 423.8, "ですか?"),
+    ])
+    recovered = Segment(236.0, 238.5, "どんな顔?", words=[
+        Word(236.0, 236.8, "どんな"), Word(236.8, 238.5, "顔?"),
+    ])
+    lines = segment_lines([stretched, recovered], SubtitleSettings())
+
+    assert [round(l.start, 2) for l in lines] == sorted(round(l.start, 2) for l in lines)
+    assert all(l.end - l.start > 0.1 for l in lines), \
+        [(l.start, l.end, l.text) for l in lines]
+    assert lines[0].text.startswith("どんな顔")
+
+
+def test_ordinary_cues_are_left_in_the_order_they_arrived():
+    """The sort must be a no-op on a film whose timestamps behave."""
+    from app.services.asr import Segment, Word
+
+    segs = [
+        Segment(0.0, 2.0, "ちゃんと話そう", words=[
+            Word(0.0, 1.0, "ちゃんと"), Word(1.0, 2.0, "話そう")]),
+        Segment(2.5, 4.0, "それでいいよね", words=[
+            Word(2.5, 3.2, "それで"), Word(3.2, 4.0, "いいよね")]),
+    ]
+    lines = segment_lines(segs, SubtitleSettings())
+    assert [l.text for l in lines] == ["ちゃんと話そう", "それでいいよね"]

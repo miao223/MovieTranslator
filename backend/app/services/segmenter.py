@@ -481,6 +481,16 @@ def segment_lines(
         else:
             lines.extend(_lines_from_text(seg.start, seg.end, seg.text, settings))
 
+    # A cue's real start is only known once flush() has discounted whisper's
+    # bogus ones (see _trustworthy_start), and that can move a cue minutes
+    # past where its segment claimed to begin — behind cues that genuinely
+    # come first. Everything below reads this list as chronological: merging
+    # joins neighbours, _fix_overlaps compares each cue against the previous
+    # one, and the translator takes context from line order. So restore time
+    # order here, where the starts are final. A film whose timestamps behave
+    # is already sorted, and this is then a no-op.
+    lines.sort(key=lambda l: (l.start, l.end))
+
     raw = [l.model_copy() for l in lines] if debug is not None and debug.enabled else []
     punctuated = not is_effectively_unpunctuated(lines)
     merged = _merge_sentence_units(lines, settings, punctuated)
