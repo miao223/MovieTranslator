@@ -53,6 +53,10 @@ SECOND_PASS_WINDOW = 300.0  # bounded slices; see _windows()
 # deliberately absent — music inflates it on genuine dialogue.
 SECOND_PASS_MAX_COMPRESSION = 2.4   # whisper's own repetition tell
 SECOND_PASS_MIN_LOGPROB = -1.0      # whisper's own confidence floor
+# Silence between two words longer than this is not a pause inside an
+# utterance — it is a misplaced timestamp. Same value the segmenter breaks
+# lines at (segmenter.GAP_BREAK), so both agree on what a real gap is.
+COVERED_GAP_BRIDGE = 1.5
 
 # Whisper was trained on subtitle files, and over non-speech it emits what
 # those files contain: closing lines, station announcements, encyclopedia
@@ -257,6 +261,36 @@ def _get_model(
     return _model
 
 
+def _word_spans(segments: Sequence[Segment]) -> List[tuple[float, float]]:
+    """Where each word sits — or each segment, without word timestamps.
+
+    The single source of truth for "the first pass has text here". Segment
+    spans cannot answer that: whisper routinely pins a word it failed to
+    align to the end of the previous utterance, leaving a segment that
+    claims minutes of timeline it never transcribed.
+    """
+    return sorted(
+        (w.start, w.end) for seg in segments for w in seg.words
+    ) or sorted((s.start, s.end) for s in segments)
+
+
+def _covered_intervals(segments: Sequence[Segment]) -> List[tuple[float, float]]:
+    """The timeline the first pass really put words on, gaps bridged.
+
+    Silence up to ``COVERED_GAP_BRIDGE`` between two words is a pause
+    inside an utterance: nothing is missing there even though no word
+    occupies the instant. Anything longer is a misplaced timestamp, and
+    what lies in it is genuinely untranscribed.
+    """
+    merged: List[tuple[float, float]] = []
+    for start, end in _word_spans(segments):
+        if merged and start - merged[-1][1] <= COVERED_GAP_BRIDGE:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _blank_regions(
     segments: Sequence[Segment], duration: float, min_blank: float
 ) -> List[tuple[float, float]]:
@@ -270,9 +304,7 @@ def _blank_regions(
     the missing dialogue was. Measured by words, the same film's blanks go
     from 3563s to 5606s.
     """
-    spans = sorted(
-        (w.start, w.end) for seg in segments for w in seg.words
-    ) or sorted((s.start, s.end) for s in segments)
+    spans = _word_spans(segments)
     out: List[tuple[float, float]] = []
     cursor = 0.0
     for start, end in spans:
@@ -382,8 +414,13 @@ def second_pass(
             if log:
                 log(f"⚠ 二次识别 {start:.0f}-{end:.0f}s 失败（跳过）: {exc}")
 
-    # never overwrite what the first pass already covered
-    kept = [s for s in recovered if not _overlaps_any(s, segments)]
+    # never overwrite what the first pass already covered — measured by
+    # where its words are, the same way _blank_regions chose where to look.
+    # Read as spans instead, one film's 29 stretched segments claimed 2180s
+    # they never transcribed and this line discarded 147 recovered segments
+    # (377s) found inside them, a twelve-turn conversation among them.
+    covered = _covered_intervals(segments)
+    kept = [s for s in recovered if not _overlaps_any(s, covered)]
     merged = sorted(segments + kept, key=lambda s: s.start)
     if log:
         log(f"二次识别完成：找回 {len(kept)} 段 / "
@@ -397,10 +434,11 @@ def second_pass(
     return merged
 
 
-def _overlaps_any(seg: Segment, existing: Sequence[Segment]) -> bool:
+def _overlaps_any(seg: Segment, covered: Sequence[tuple[float, float]]) -> bool:
+    """Does *seg* land on timeline the first pass already has text for?"""
     return any(
-        min(seg.end, other.end) - max(seg.start, other.start) > 0.2
-        for other in existing
+        min(seg.end, end) - max(seg.start, start) > 0.2
+        for start, end in covered
     )
 
 

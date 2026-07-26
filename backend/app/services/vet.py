@@ -59,6 +59,11 @@ _DROP_WORDS = {"丢弃", "drop"}
 # can be far larger than the refine pass's. A two-hour film's whole
 # transcript measured 4,900 tokens, i.e. a single call.
 VET_CHUNK_TOKENS = 12_000
+# cost of the "*[R123] " / "[123] " prefix each line is rendered with.
+# Guessing high here is not harmless: it splits a film that would have fit
+# in one request, and the second chunk then judges its lines with only the
+# tail of the transcript for context — which is the whole point of the pass.
+MARKER_TOKENS = 3
 # consecutive chunk failures after which we stop calling: an unreachable
 # endpoint must not cost one timeout per chunk
 GIVE_UP_AFTER = 2
@@ -158,7 +163,7 @@ def _chunks(segments: Sequence[Segment], context_limit: int) -> List[List[Segmen
     current: List[Segment] = []
     used = 0
     for seg in segments:
-        cost = estimate_tokens(seg.text) + 8  # + the "[R12] " marker
+        cost = estimate_tokens(seg.text) + MARKER_TOKENS
         if current and used + cost > budget:
             out.append(current)
             current, used = [], 0

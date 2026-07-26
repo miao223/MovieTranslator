@@ -191,14 +191,14 @@ def test_chunks_without_anything_to_review_send_no_request():
 
 def test_a_long_transcript_splits_and_each_chunk_is_judged():
     segments = []
-    for i in range(600):
+    for i in range(900):
         segments.append(S(float(i), i + 0.5, f"これは何番目かの台詞です {i}"))
-        if i in (10, 590):
+        if i in (10, 890):
             segments.append(S(i + 0.5, i + 0.9, f"recovered {i}", recovered=True))
     out, client = run(["[R1] 保留", "[R2] 丢弃 無関係"], segments=segments)
     assert len(client.calls) == 2
     assert "recovered 10" in texts(out)
-    assert "recovered 590" not in texts(out)
+    assert "recovered 890" not in texts(out)
     # the unmarked lines keep counting up across chunks: a second chunk that
     # restarts at [1] reads like a second transcript
     second_chunk = client.calls[1][1]["content"]

@@ -144,11 +144,57 @@ def test_long_blanks_are_sliced_into_bounded_windows():
 
 
 def test_recovered_segments_never_overwrite_the_first_pass():
-    from app.services.asr import Segment, _overlaps_any
+    from app.services.asr import Segment, _covered_intervals, _overlaps_any
 
-    existing = [Segment(10.0, 20.0, "already here")]
-    assert _overlaps_any(Segment(15.0, 25.0, "x"), existing)
-    assert not _overlaps_any(Segment(20.0, 25.0, "x"), existing)
+    covered = _covered_intervals([Segment(10.0, 20.0, "already here")])
+    assert _overlaps_any(Segment(15.0, 25.0, "x"), covered)
+    assert not _overlaps_any(Segment(20.0, 25.0, "x"), covered)
+
+
+def test_a_stretched_segment_does_not_shadow_what_was_recovered_inside_it():
+    """The other half of the span-vs-word bug.
+
+    _blank_regions already looked inside such a segment; the overlap test
+    then threw the findings away because the span said "covered". On one
+    film that discarded 147 recovered segments (377s), including a
+    twelve-turn conversation the first pass had missed entirely.
+    """
+    from app.services.asr import Segment, Word, _covered_intervals, _overlaps_any
+
+    stretched = Segment(143.3, 423.8, "いいですか?", words=[
+        Word(143.3, 143.5, "いい"), Word(423.46, 423.8, "ですか?"),
+    ])
+    covered = _covered_intervals([stretched])
+    assert covered == [(143.3, 143.5), (423.46, 423.8)]
+    # found in the 280s the segment claims but never transcribed
+    assert not _overlaps_any(Segment(200.0, 202.0, "嫌だね、それ。"), covered)
+    # ...while the words themselves stay off limits
+    assert _overlaps_any(Segment(423.5, 424.5, "x"), covered)
+    # The 0.20s stub cannot reach the 0.2s tolerance, so it blocks nothing.
+    # That is harmless: the segmenter relocates such a cue to where the rest
+    # of its words are (_trustworthy_start), so nothing is displayed here to
+    # collide with in the first place.
+    assert not _overlaps_any(Segment(143.0, 144.0, "x"), covered)
+
+
+def test_pauses_inside_an_utterance_still_count_as_covered():
+    """Bridging matters: a recovered line landing in the breath between two
+    words of a sentence would be a duplicate, not a rescue."""
+    from app.services.asr import Segment, Word, _covered_intervals, _overlaps_any
+
+    covered = _covered_intervals([Segment(0.0, 5.0, "a b", words=[
+        Word(0.0, 1.0, "こんな"), Word(2.2, 5.0, "ことがありました"),
+    ])])
+    assert covered == [(0.0, 5.0)]
+    assert _overlaps_any(Segment(1.2, 2.0, "dup"), covered)
+
+
+def test_overlap_falls_back_to_spans_without_word_timestamps():
+    from app.services.asr import Segment, _covered_intervals, _overlaps_any
+
+    covered = _covered_intervals([Segment(10.0, 20.0, "no words here")])
+    assert covered == [(10.0, 20.0)]
+    assert _overlaps_any(Segment(12.0, 14.0, "x"), covered)
 
 
 def test_a_stretched_segment_does_not_hide_a_blank():
