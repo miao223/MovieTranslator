@@ -69,7 +69,9 @@ MARKER_TOKENS = 3
 GIVE_UP_AFTER = 2
 
 
-def build_vet_prompt(language_hint: str = "", synopsis: str = "") -> str:
+def build_vet_prompt(
+    language_hint: str = "", synopsis: str = "", mark_lyrics: bool = False
+) -> str:
     lang = f"（原文语言：{language_hint}）" if language_hint else ""
     parts = [
         f"你是字幕校对员{lang}。下面是一部影片的语音识别转写，按时间顺序排列。",
@@ -88,7 +90,23 @@ def build_vet_prompt(language_hint: str = "", synopsis: str = "") -> str:
         "（例如「はい」「うん」「ただいま」、喊人名、尖叫）；",
         "- 丢弃：与本片题材、剧情、上下文都对不上的内容，哪怕它读起来很正常；",
         "- 丢弃：没有意义的填充音（孤立的「ん」「あ」「うー」「えー」之类）；",
-        "- 丢弃：字幕文件式的音效与音乐标注（【…】、♪、(laughs) 等），它们不是台词。",
+    ]
+    if mark_lyrics:
+        # The lyrics pass (services/lyrics.py) marks songs later, over the
+        # whole film. Dropping them here would take that decision away from
+        # it — and it would take it inconsistently, since only the second
+        # pass's lines ever reach this prompt.
+        parts += [
+            "- 丢弃：**不含任何词句的**音效与音乐标记（`♪♪`、`【ドアの音】`、`(laughs)` 等）；",
+            "- 保留：有实际词句的歌词（例如 `♪ You're the only one I'll ever love`）——"
+            "影片里放出来的歌属于本片，后续会另行标注，此处不要丢弃。",
+        ]
+    else:
+        parts.append(
+            "- 丢弃：字幕文件式的音效与音乐标注（【…】、♪、(laughs) 等），以及"
+            "影片配乐的歌词——它们不是台词。"
+        )
+    parts += [
         "",
         "判断标准是「这句话是否属于这部影片」，不是「这句话是否通顺」。",
         "拿不准时：读起来像本片人物之间的对话就保留；"
@@ -200,6 +218,7 @@ def vet_recovered(
     llm: LLMSettings,
     language_hint: str = "",
     synopsis: str = "",
+    mark_lyrics: bool = False,
     log: Optional[LogFn] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     client=None,  # injectable for tests
@@ -221,7 +240,7 @@ def vet_recovered(
 
     ids = {id(s): n for n, s in enumerate(review, start=1)}
     client = client if client is not None else make_openai_client(llm, network)
-    system = build_vet_prompt(language_hint, synopsis)
+    system = build_vet_prompt(language_hint, synopsis, mark_lyrics)
     chunks = _chunks(segments, llm.context_limit)
     dbg = debug if debug is not None and debug.enabled else None
 

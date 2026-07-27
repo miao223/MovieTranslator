@@ -79,7 +79,7 @@ CONTEXT_LINES = 2
 GIVE_UP_AFTER = 3
 
 _WORD_RE = re.compile(r"[0-9A-Za-z']+|[^\sA-Za-z0-9']")
-_PUNCT = set("。、，,.!?！？…‥：:；;「」『』（）()[]【】\"“”'‘’-—―~～·・/\\|*&#")
+_PUNCT = set("。、，,.!?！？…‥：:；;「」『』（）()[]【】\"“”'‘’-—―~～·・/\\|*&#♪♫")
 _SENTENCE_CHARS = ".!?。！？…"
 _SENTENCE_END_RE = re.compile(rf"[{re.escape(_SENTENCE_CHARS)}]$")
 _SENTENCE_CHARS_RE = re.compile(rf"[{re.escape(_SENTENCE_CHARS)}]")

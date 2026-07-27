@@ -27,7 +27,7 @@ from app.models.schemas import (
     ProgressEvent,
     SubtitleLine,
 )
-from app.services import asr, audio, refine, segmenter, subtitle, vet
+from app.services import asr, audio, lyrics, refine, segmenter, subtitle, vet
 from app.services.translator import Translator
 
 # overall progress ranges per stage: (start%, end%)
@@ -442,6 +442,7 @@ class JobManager:
                 settings.llm,
                 language_hint=detected or "",
                 synopsis=req.synopsis,
+                mark_lyrics=settings.prompts.mark_lyrics,
                 log=lambda msg: job.publish("transcribing", job.status.progress, log=msg),
                 should_cancel=job.cancel_event.is_set,
                 network=settings.network,
@@ -502,6 +503,26 @@ class JobManager:
             )
             job.publish("refining", 72, message=f"预处理完成，共 {len(lines)} 条字幕")
 
+        # 2d. mark what is sung rather than spoken -------------------------
+        # After refine, because merging and splitting lines would tear a
+        # ♪ … ♪ pair apart; before translation, so the lyrics can be
+        # translated as lyrics. It only annotates — a failure marks nothing.
+        lyrics_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
+        if settings.prompts.mark_lyrics and lines:
+            job.publish("refining", 72, message="歌词识别中…")
+            lines = lyrics.mark_lyrics(
+                lines,
+                settings.llm,
+                language_hint=detected or "",
+                log=lambda msg: job.publish("refining", job.status.progress, log=msg),
+                should_cancel=job.cancel_event.is_set,
+                network=settings.network,
+                debug=debug,
+                usage=lyrics_usage,
+            )
+            lyrics.apply_marks(lines)
+            self._debug_lyric_agreement(debug, lines, segments)
+
         # 3. translate ----------------------------------------------------
         job.publish("translating", 72, message="AI 翻译中（全局上下文）…")
 
@@ -524,10 +545,16 @@ class JobManager:
             debug=debug,
         )
         translator.translate(lines)
+        if settings.prompts.mark_lyrics:
+            # the model was asked to keep the ♪; a marker it dropped or moved
+            # onto the neighbouring line would be worse than none, so the
+            # flag — not the model's output — has the last word
+            lyrics.apply_marks(lines)
         job.publish(
             "translating", 95,
             log=(
                 (_usage_line("二次识别复核", vet_usage) + "\n" if vet_usage["calls"] else "")
+                + (_usage_line("歌词识别", lyrics_usage) + "\n" if lyrics_usage["calls"] else "")
                 + _usage_line("转写预处理", refine_usage)
                 + "\n" + translator.report_usage()
             ),
@@ -570,6 +597,41 @@ class JobManager:
         job.status.srt_filename = str(job.srt_path)
         self._debug_final(debug, lines, settings)
         job.publish("done", 100, message=f"完成，字幕已保存: {job.srt_path}")
+
+    @staticmethod
+    def _debug_lyric_agreement(debug: DebugLog, lines, segments) -> None:
+        """Score our lyric judgement against whisper's own ♪ prefixes.
+
+        Whisper's marking is worthless as an answer — measured across one
+        film it appeared in 0 of 434 first-pass segments and 90 of 216
+        second-pass ones, tracking the decoding mode rather than the singing.
+        But it is an *independent* opinion, and that is enough to grade this
+        pass without a human subtitle: the agreements are the confident part,
+        and the disagreements are the list worth listening to.
+        """
+        if not debug.enabled:
+            return
+        from app.core.debuglog import fmt_time
+
+        marked = [(s.start, s.end) for s in segments if lyrics.MARK in s.text]
+        both, ours, theirs, ours_alone, theirs_alone = lyrics.whisper_agreement(
+            lines, marked
+        )
+        debug.section("歌词识别 vs whisper 自带的 ♪（交叉比对）")
+        debug.kv("whisper 标了 ♪ 的 segment", len(marked))
+        debug.kv("两边都判为歌词", both)
+        debug.kv("只有本程序判为歌词", ours)
+        debug.kv("只有 whisper 标了 ♪", theirs)
+        debug.line(
+            "\nwhisper 的 ♪ 只在关闭 VAD 的二次识别里出现，本身不可信；"
+            "\n它的价值在于是一个独立意见——下面两份分歧清单就是需要人工听的部分。\n"
+        )
+        for title, rows in (
+            ("只有本程序判为歌词（可能是它标对了 whisper 漏了，也可能是误标）", ours_alone),
+            ("只有 whisper 标了 ♪（可能是本程序漏标）", theirs_alone),
+        ):
+            debug.line(f"\n{title}：{len(rows)} 行")
+            debug.lines(f"  [{l.index}] {fmt_time(l.start)} {l.text}" for l in rows)
 
     @staticmethod
     def _debug_final(debug: DebugLog, lines: List[SubtitleLine], settings) -> None:

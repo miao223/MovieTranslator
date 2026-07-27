@@ -431,6 +431,15 @@ def second_pass(
         debug.kv("采纳", f"{len(kept)} 段 / {sum(s.end - s.start for s in kept):.0f}s")
         debug.kv("丢弃（重复或置信度过低）", dropped)
         debug.kv("因与第一遍重叠而丢弃", len(recovered) - len(kept))
+        # Whisper prefixes ♪ only with the VAD off, never with it on (0 of
+        # 434 vs 90 of 216 on one film) — so this counts the decoding mode,
+        # not the singing. Recorded because it is still a useful second
+        # opinion for the lyrics pass to be scored against.
+        debug.kv(
+            "其中 whisper 自带 ♪ 标记的",
+            f"{sum(1 for s in kept if '♪' in s.text)} 段"
+            f"（第一遍: {sum(1 for s in segments if '♪' in s.text)} 段）",
+        )
     return merged
 
 

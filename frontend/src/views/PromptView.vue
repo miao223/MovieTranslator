@@ -61,6 +61,7 @@ function resetDefaults() {
     link_fragments: true,
     normalize_loanwords: true,
     limit_length: true,
+    mark_lyrics: false,
     tone: DEFAULT_TONE,
     glossary: '',
     extra: '',
@@ -101,6 +102,18 @@ function resetDefaults() {
           <el-form-item label="译文长度限制">
             <el-switch v-model="settings.prompts.limit_length" />
             <span class="hint">按「设置→字幕→每行最大字符数」约束译文长度</span>
+          </el-form-item>
+          <el-form-item label="歌词识别">
+            <el-switch v-model="settings.prompts.mark_lyrics" />
+            <span class="hint">默认关闭</span>
+            <div class="hint" style="margin: 4px 0 0; display: block; line-height: 1.7">
+              翻译前额外用同一个模型通读全片原文，找出<strong>唱出来</strong>的内容——背景插曲、片头片尾曲，
+              以及片中人物自己唱的歌（生日歌、婚礼合唱、哼小调），在字幕里标成 <code>♪ 歌词 ♪</code>，原文与译文都加。<br>
+              语音识别自带的 ♪ 标记不可靠（实测只在关闭语音检测的二次识别里出现），所以由模型统一判断。<br>
+              识别结果逐段校验行号，校验不过的区间直接不标；这一步<strong>只加标记、不删改任何一行</strong>，失败也只是没有标记。<br>
+              代价：多一次覆盖全片原文的请求，约 1 万 tokens、十几秒。<br>
+              关闭时：二次识别里的歌词会被丢弃，而第一遍识别到的歌词仍会当作对白翻译。
+            </div>
           </el-form-item>
         </el-form>
       </el-card>

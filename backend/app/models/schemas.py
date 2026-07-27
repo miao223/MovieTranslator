@@ -107,6 +107,13 @@ class PromptSettings(BaseModel):
     link_fragments: bool = True      # cross-line coherence for fragmented lines
     normalize_loanwords: bool = True # katakana / transliterated loanword handling
     limit_length: bool = True        # keep translation subtitle-length friendly
+    # Find what is sung rather than spoken and wrap it in ♪ (services/lyrics.py).
+    # Off by default: it costs one extra pass over the whole transcript, and a
+    # film without songs gains nothing. While off, lyrics the first pass picked
+    # up stay in the subtitle as ordinary dialogue — only the second pass's are
+    # dropped, because deleting first-pass content is a power vetting
+    # deliberately does not have.
+    mark_lyrics: bool = False
     # style requirements (rule 3 of the system prompt)
     tone: str = DEFAULT_TONE
     # user-provided glossary, one "原文 → 译文" per line; always obeyed
@@ -212,6 +219,8 @@ class SubtitleLine(BaseModel):
     translation: str = ""
     # on-screen text cue (画面翻译): rendered top-left, translation only
     is_frame: bool = False
+    # sung, not spoken (services/lyrics.py) — displayed wrapped in ♪
+    is_lyric: bool = False
 
 
 class JobStatus(BaseModel):

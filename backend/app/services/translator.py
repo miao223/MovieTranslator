@@ -101,6 +101,12 @@ def build_system_prompt(
             "不得用罗马音、拼音或原文字母拼写充当译文；"
             f"仅当该词在{target_language}中习惯直接使用原文时（如品牌名、缩写）才可保留。"
         )
+    if prompts.mark_lyrics:
+        rules.append(
+            "以 ♪ 开头并以 ♪ 结尾的行是影片里唱出来的歌词，不是对白。"
+            "译文同样用 ♪ 包裹（`♪ 译文 ♪`），可以为了顺口和韵律调整措辞，"
+            "不必逐字直译；其余行一律不要加 ♪。"
+        )
     if prompts.limit_length:
         rules.append(
             f"译文是屏幕字幕，长度尽量接近原文，单行不超过 {max_line_chars} 个字符，"
