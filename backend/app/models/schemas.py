@@ -108,12 +108,15 @@ class PromptSettings(BaseModel):
     normalize_loanwords: bool = True # katakana / transliterated loanword handling
     limit_length: bool = True        # keep translation subtitle-length friendly
     # Find what is sung rather than spoken and wrap it in ♪ (services/lyrics.py).
-    # Off by default: it costs one extra pass over the whole transcript, and a
-    # film without songs gains nothing. While off, lyrics the first pass picked
-    # up stay in the subtitle as ordinary dialogue — only the second pass's are
-    # dropped, because deleting first-pass content is a power vetting
-    # deliberately does not have.
-    mark_lyrics: bool = False
+    # On by default: without it a song's fate depends only on which stage it
+    # landed in — first-pass lyrics get translated as dialogue, second-pass
+    # ones get thrown away — and that is incoherent whether or not the film
+    # has songs. Costs one extra pass over the transcript (~+22% tokens on a
+    # song-heavy film). While off, lyrics the first pass picked up stay in the
+    # subtitle as ordinary dialogue — only the second pass's are dropped,
+    # because deleting first-pass content is a power vetting deliberately does
+    # not have.
+    mark_lyrics: bool = True
     # style requirements (rule 3 of the system prompt)
     tone: str = DEFAULT_TONE
     # user-provided glossary, one "原文 → 译文" per line; always obeyed

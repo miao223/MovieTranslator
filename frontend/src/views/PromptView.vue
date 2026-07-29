@@ -61,7 +61,7 @@ function resetDefaults() {
     link_fragments: true,
     normalize_loanwords: true,
     limit_length: true,
-    mark_lyrics: false,
+    mark_lyrics: true,
     tone: DEFAULT_TONE,
     glossary: '',
     extra: '',
@@ -105,7 +105,7 @@ function resetDefaults() {
           </el-form-item>
           <el-form-item label="歌词识别">
             <el-switch v-model="settings.prompts.mark_lyrics" />
-            <span class="hint">默认关闭</span>
+            <span class="hint">推荐开启</span>
             <div class="hint" style="margin: 4px 0 0; display: block; line-height: 1.7">
               翻译前额外用同一个模型通读全片原文，找出<strong>唱出来</strong>的内容——背景插曲、片头片尾曲，
               以及片中人物自己唱的歌（生日歌、婚礼合唱、哼小调），在字幕里标成 <code>♪ 歌词 ♪</code>，原文与译文都加。<br>
