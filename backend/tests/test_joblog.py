@@ -155,8 +155,14 @@ def test_log_endpoints(logdir):
         assert "root:" not in escaped.text
         assert escaped.status_code == 404
         assert client.get("/api/nosuchendpoint").status_code == 404
-        # …while a client-side route still gets the shell
-        assert client.get("/settings").status_code == 200
+        # …while a client-side route still gets the shell. Only when there
+        # is a shell to get: CI runs the tests before building the
+        # frontend, and without frontend/dist the route is never
+        # registered at all.
+        from app.main import FRONTEND_DIST
+
+        if FRONTEND_DIST.is_dir():
+            assert client.get("/settings").status_code == 200
 
 
 def test_download_log_rejects_paths_outside_the_folder(logdir):
