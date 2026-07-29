@@ -181,11 +181,11 @@ def test_extract_audio_rejects_unknown_track(multitrack, tmp_path):
 
 
 def test_audio_tracks_endpoint(multitrack):
-    from fastapi.testclient import TestClient
+    from tests.conftest import local_client
 
     from app.main import app
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         r = client.get("/api/media/audio-tracks", params={"path": str(multitrack)})
         assert r.status_code == 200
         body = r.json()

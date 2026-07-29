@@ -20,11 +20,16 @@ if "%~1"=="--gpu" (
     if errorlevel 1 goto :error
 )
 
-rem 3 秒后自动打开浏览器（等服务就绪）
-start "" /b cmd /c "timeout /t 3 >nul & start http://127.0.0.1:8760"
+rem 端口来自设置文件（默认 8760），所以这里要问程序自己
+set PORT=8760
+for /f %%p in ('.venv\Scripts\python -c "from app.core.config import load_settings; print(load_settings().server.port)" 2^>nul') do set PORT=%%p
 
-echo [MovieTranslator] 启动中，浏览器访问 http://127.0.0.1:8760 （关闭本窗口即退出）
-.venv\Scripts\python -m uvicorn app.main:app --port 8760
+rem 3 秒后自动打开浏览器（本机回环始终免令牌）
+start "" /b cmd /c "timeout /t 3 >nul & start http://127.0.0.1:%PORT%"
+
+echo [MovieTranslator] 启动中，浏览器访问 http://127.0.0.1:%PORT% （关闭本窗口即退出）
+rem 用 python -m app.main 而不是 uvicorn：绑定地址（本机/局域网）与端口只有 main() 会读设置
+.venv\Scripts\python -m app.main
 goto :eof
 
 :error

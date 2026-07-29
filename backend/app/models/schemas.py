@@ -39,9 +39,40 @@ class LLMSettings(BaseModel):
 
 
 class NetworkSettings(BaseModel):
+    """Outbound proxy. Inbound binding lives in ServerSettings."""
+
     proxy_url: str = ""  # e.g. http://127.0.0.1:7890
     llm_via_proxy: bool = False
     model_download_via_proxy: bool = False
+
+
+class ServerSettings(BaseModel):
+    """How the app listens. Off by default: loopback only, as before.
+
+    Every endpoint here assumes the caller is the person sitting at the
+    machine — /api/fs/browse lists any directory, /api/settings returns the
+    LLM key, /api/jobs starts work on any path. So binding beyond loopback
+    and requiring a token are one feature, not two.
+    """
+
+    # bind 0.0.0.0 instead of 127.0.0.1; takes effect on restart
+    lan_access: bool = False
+    port: int = Field(8760, ge=1, le=65535)
+    # whether non-loopback requests need the token. Loopback is ALWAYS
+    # exempt, so a forgotten token can never lock the local user out.
+    require_token: bool = True
+    # generated when LAN access is switched on; never written to any log
+    access_token: str = ""
+
+
+class MCPSettings(BaseModel):
+    """MCP server (services/mcp_server.py), mounted at /mcp.
+
+    Off by default; while off the mount answers 404. Independent of
+    lan_access — it can serve a client on this same machine.
+    """
+
+    enabled: bool = False
 
 
 class ASRSettings(BaseModel):
@@ -143,6 +174,8 @@ class AppSettings(BaseModel):
     subtitle: SubtitleSettings = SubtitleSettings()
     prompts: PromptSettings = PromptSettings()
     network: NetworkSettings = NetworkSettings()
+    server: ServerSettings = ServerSettings()
+    mcp: MCPSettings = MCPSettings()
 
 
 # ---------------------------------------------------------------- jobs

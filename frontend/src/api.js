@@ -48,6 +48,9 @@ export const api = {
     request('/api/asr/download', { method: 'POST', body: JSON.stringify({ model_size: modelSize }) }),
   downloadStatus: (modelSize) =>
     request(`/api/asr/download-status?model_size=${encodeURIComponent(modelSize)}`),
+  serverInfo: () => request('/api/server/info'),
+  regenerateToken: () =>
+    request('/api/server/token/regenerate', { method: 'POST' }),
   resultUrl: (id) => `/api/jobs/${id}/result`,
   jobLogUrl: (id) => `/api/logs/job/${id}`,
   logs: () => request('/api/logs'),

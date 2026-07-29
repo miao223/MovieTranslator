@@ -39,12 +39,12 @@ def test_scan_rejects_non_directory(tmp_path):
 
 
 def test_batch_endpoints(tmp_path):
-    from fastapi.testclient import TestClient
+    from tests.conftest import local_client
 
     from app.main import app
 
     make_tree(tmp_path)
-    c = TestClient(app)
+    c = local_client(app)
 
     scan = c.get(
         "/api/batch/scan",

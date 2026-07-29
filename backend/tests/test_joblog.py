@@ -39,6 +39,43 @@ def test_api_key_is_never_written(logdir):
     assert "API key: 已配置" in text
 
 
+def test_the_access_token_is_never_written_either(logdir):
+    """The log is the file users are told to send to the developer, so a
+    token in it is the same mistake as a key in it."""
+    from app.models.schemas import AppSettings
+
+    settings = AppSettings()
+    settings.server.lan_access = True
+    settings.server.access_token = "tok-super-secret-value"
+    settings.mcp.enabled = True
+    w = joblog.JobLogWriter("k2", "x.mkv")
+    w.write_settings(settings)
+    text = w.path.read_text(encoding="utf-8")
+
+    assert "tok-super-secret-value" not in text
+    # but the posture itself must be visible: it explains a lot of reports
+    assert "局域网访问    : 开" in text and "需要令牌" in text
+    assert "MCP 服务      : 开" in text
+
+
+def test_the_shipped_defaults_are_closed(logdir):
+    """Doing nothing must leave the app exactly where it was: loopback
+    only, no MCP. This is the assertion that catches a careless default."""
+    from app.models.schemas import AppSettings
+
+    settings = AppSettings()
+    assert settings.server.lan_access is False
+    assert settings.mcp.enabled is False
+    assert settings.server.require_token is True
+    assert settings.prompts.mark_lyrics is True  # this one ships on
+
+    w = joblog.JobLogWriter("k3", "x.mkv")
+    w.write_settings(settings)
+    text = w.path.read_text(encoding="utf-8")
+    assert "局域网访问    : 关（仅本机 127.0.0.1）" in text
+    assert "MCP 服务      : 关" in text
+
+
 def test_media_section_lists_every_track(logdir, tmp_path):
     from tests.test_audio_tracks import make_multitrack_video
 
@@ -90,14 +127,14 @@ def test_logs_survive_the_cache_wipe(logdir, tmp_path, monkeypatch):
 
 
 def test_log_endpoints(logdir):
-    from fastapi.testclient import TestClient
+    from tests.conftest import local_client
 
     from app.main import app
 
     w = joblog.JobLogWriter("endpoint1", "x.mkv")
     w.event("done", 100.0, "完成", "")
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         listing = client.get("/api/logs").json()
         assert listing["dir"] == str(logdir)
         assert any(f["name"] == w.path.name for f in listing["files"])
@@ -110,9 +147,16 @@ def test_log_endpoints(logdir):
         by_name = client.get(f"/api/logs/file/{w.path.name}")
         assert by_name.status_code == 200
 
-        # a traversal attempt never yields a file from outside the folder
+        # a traversal attempt never yields a file from outside the folder,
+        # and says so rather than handing back the page shell — an /api
+        # path that answers 200 with HTML reaches api.js as a JSON syntax
+        # error instead of "no such endpoint"
         escaped = client.get("/api/logs/file/..%2F..%2Fetc%2Fpasswd")
         assert "root:" not in escaped.text
+        assert escaped.status_code == 404
+        assert client.get("/api/nosuchendpoint").status_code == 404
+        # …while a client-side route still gets the shell
+        assert client.get("/settings").status_code == 200
 
 
 def test_download_log_rejects_paths_outside_the_folder(logdir):
@@ -129,12 +173,12 @@ def test_download_log_rejects_paths_outside_the_folder(logdir):
 
 def test_version_endpoint_reports_the_running_build():
     """The header reads this to show which build answered the request."""
-    from fastapi.testclient import TestClient
+    from tests.conftest import local_client
 
     from app.core.joblog import APP_VERSION
     from app.main import app
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         body = client.get("/api/version").json()
     assert body["version"] == APP_VERSION
     assert body["version"][0].isdigit()

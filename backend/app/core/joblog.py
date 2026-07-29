@@ -21,7 +21,7 @@ from typing import Optional
 
 from app.core.cache import _base_dir
 
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 LOG_DIR_NAME = "logs"
 KEEP_LOGS = 20  # newest job logs to retain
 
@@ -76,6 +76,15 @@ def _versions() -> list[str]:
     return lines
 
 
+def _server_line(settings) -> str:
+    """The access posture, without ever naming the token itself."""
+    srv = settings.server
+    if not srv.lan_access:
+        return "局域网访问    : 关（仅本机 127.0.0.1）"
+    guard = "需要令牌" if srv.require_token else "⚠ 未要求令牌"
+    return f"局域网访问    : 开（端口 {srv.port}，{guard}）"
+
+
 def _settings_lines(settings) -> list[str]:
     asr, llm, sub, net = settings.asr, settings.llm, settings.subtitle, settings.network
     model_src = asr.model_path.strip() or asr.model_size
@@ -91,12 +100,16 @@ def _settings_lines(settings) -> list[str]:
         f"temp={llm.temperature} 每批={llm.batch_size} 上下文={llm.context_limit}",
         f"视觉模型      : {llm.vision_model or '（同主模型）'}",
         f"转写预处理    : {'开' if settings.prompts.refine_enabled else '关'}",
+        f"二次识别      : {'开（产物经 LLM 复核）' if asr.second_pass else '关'}",
+        f"歌词识别      : {'开（歌词标为 ♪ … ♪）' if settings.prompts.mark_lyrics else '关'}",
         f"调试模式      : {'开（字幕同目录生成 .debug.log）' if settings.debug_mode else '关'}",
         f"字幕          : 每行{sub.max_chars_per_line}字 单条≤{sub.max_duration}s "
         f"{'样式(.ass)' if sub.style_enabled else '标准(.srt)'} {sub.bilingual_layout}",
         f"代理          : {net.proxy_url or '（未设置）'} "
         f"LLM={'走' if net.llm_via_proxy else '不走'} "
         f"模型下载={'走' if net.model_download_via_proxy else '不走'}",
+        _server_line(settings),
+        f"MCP 服务      : {'开' if settings.mcp.enabled else '关'}",
     ]
 
 

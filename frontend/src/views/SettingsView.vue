@@ -17,8 +17,65 @@ const modelDownloaded = ref(null) // null = unknown / loading
 const cuda = ref(null) // { available, device_count }
 const storageInfo = ref(null) // { effective_dir, is_default }
 const logInfo = ref(null) // { dir, files: [{name, size, modified}] }
+const serverInfo = ref(null) // { configured, running, lan_ips, urls, mcp, token }
 const download = ref({ status: 'idle', progress: 0 })
 let pollTimer = null
+
+// Binding is read once at startup, so a saved change only lands on the next
+// launch. Comparing saved against actually-running is the only honest way to
+// say so — the alternative is a banner that lies after the user restarts.
+const bindingPending = computed(() => {
+  const info = serverInfo.value
+  if (!info || !info.running) return false // started by an external command
+  const wantHost = info.configured.lan_access ? '0.0.0.0' : '127.0.0.1'
+  return info.running.host !== wantHost || info.running.port !== info.configured.port
+})
+
+const mcpConfigSnippet = computed(() => {
+  const info = serverInfo.value
+  if (!info) return ''
+  const url = info.urls.mcp[0] || info.urls.mcp_local
+  const headers = info.token
+    ? `,\n      "headers": { "Authorization": "Bearer ${info.token}" }`
+    : ''
+  return `{
+  "mcpServers": {
+    "movietranslator": {
+      "type": "http",
+      "url": "${url}"${headers}
+    }
+  }
+}`
+})
+
+async function refreshServerInfo() {
+  try {
+    serverInfo.value = await api.serverInfo()
+  } catch {
+    serverInfo.value = null
+  }
+}
+
+async function copy(text, what = '已复制') {
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success(what)
+  } catch {
+    // clipboard access needs a secure context; over plain http on a LAN
+    // address the browser refuses, and silently failing looks like a bug
+    ElMessage.warning('浏览器不允许自动复制，请手动选中后复制')
+  }
+}
+
+async function regenerateToken() {
+  try {
+    await api.regenerateToken()
+    await refreshServerInfo()
+    ElMessage.success('已生成新令牌，已连接的其他设备需要用新链接重新打开')
+  } catch (e) {
+    ElMessage.error('生成失败: ' + e.message)
+  }
+}
 
 // size = download size in MB (from the HuggingFace repos, model.bin + config)
 // VAD presets: [threshold, speech_pad_ms, min_speech_ms, min_silence_ms]
@@ -84,6 +141,7 @@ onMounted(async () => {
     api.cudaStatus().then((r) => (cuda.value = r)).catch(() => {})
     api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
     api.logs().then((r) => (logInfo.value = r)).catch(() => {})
+    refreshServerInfo()
   } catch (e) {
     ElMessage.error('加载设置失败: ' + e.message)
   }
@@ -96,6 +154,7 @@ async function save() {
     ElMessage.success('设置已保存')
     api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
     refreshModelStatus()
+    refreshServerInfo()
   } catch (e) {
     ElMessage.error('保存失败: ' + e.message)
   } finally {
@@ -426,6 +485,101 @@ async function testLLM() {
     </el-card>
 
     <el-card shadow="never" class="section">
+      <template #header>
+        📡 局域网访问与 MCP 服务
+        <el-tag v-if="bindingPending" type="warning" size="small" class="tag">改动需重启程序后生效</el-tag>
+      </template>
+      <el-form label-width="150px">
+        <el-form-item label="局域网访问">
+          <el-switch v-model="settings.server.lan_access" />
+          <span class="hint">默认关闭，仅本机可访问</span>
+          <div class="hint" style="margin: 4px 0 0; display: block; line-height: 1.7">
+            开启后本程序会监听所有网卡，手机、笔记本等同网段设备可以直接打开网页发起翻译。
+            <strong>修改后需要重启程序才会生效。</strong>
+            <br />⚠️ 本程序的接口默认假定使用者就是本机用户：可以浏览<strong>本机任意目录</strong>、
+            对任意路径发起任务、读取任务日志（含片源路径）。因此开启后请保持下面的访问令牌开启。
+            <br />⚠️ 只提供明文 HTTP，没有加密。<strong>不要把端口直接转发到公网</strong>——
+            需要在外网使用时，请套一层反向代理（Caddy / Nginx）或用 Tailscale、Cloudflare Tunnel 之类的隧道。
+          </div>
+        </el-form-item>
+        <el-form-item label="监听端口">
+          <el-input-number v-model="settings.server.port" :min="1" :max="65535" />
+          <span class="hint">默认 8760，同样需要重启生效</span>
+        </el-form-item>
+        <el-form-item label="需要访问令牌">
+          <el-switch v-model="settings.server.require_token" />
+          <span class="hint">
+            本机（127.0.0.1）<strong>始终免验证</strong>，不会把自己锁在外面；
+            关闭后同网段任何人都能直接使用，仅建议在完全可信的网络里关闭
+          </span>
+        </el-form-item>
+        <template v-if="serverInfo">
+          <el-form-item v-if="serverInfo.token" label="访问令牌">
+            <el-input :model-value="serverInfo.token" readonly style="width: 320px" />
+            <el-button size="small" class="tag" @click="copy(serverInfo.token, '令牌已复制')">复制</el-button>
+            <el-button size="small" class="tag" @click="regenerateToken">重新生成</el-button>
+            <span class="hint">重新生成会让已放行的设备全部失效</span>
+          </el-form-item>
+          <el-form-item v-if="settings.server.lan_access" label="其他设备访问">
+            <div style="width: 100%">
+              <div v-if="!serverInfo.lan_ips.length" class="hint" style="margin-left: 0">
+                （未检测到局域网地址，请确认本机已连接网络）
+              </div>
+              <div v-for="url in serverInfo.urls.lan" :key="url" class="url-row">
+                <code>{{ url }}</code>
+                <el-button size="small" text type="primary" @click="copy(url, '链接已复制')">复制</el-button>
+              </div>
+              <div class="hint" style="margin: 4px 0 0; display: block">
+                在别的设备上用这条<strong>带令牌的链接</strong>打开一次即可，之后该设备无需再带令牌。
+              </div>
+            </div>
+          </el-form-item>
+        </template>
+
+        <el-divider />
+
+        <el-form-item label="MCP 服务">
+          <el-switch v-model="settings.mcp.enabled" :disabled="serverInfo && !serverInfo.mcp.available" />
+          <span class="hint">默认关闭，开关立即生效无需重启</span>
+          <el-tag v-if="serverInfo && !serverInfo.mcp.available" type="danger" size="small" class="tag">
+            依赖未安装，请重新执行 pip install -e .
+          </el-tag>
+          <div class="hint" style="margin: 4px 0 0; display: block; line-height: 1.7">
+            开启后，Claude 等支持 MCP 的客户端可以直接驱动本机完成翻译：列出目录里的视频、
+            选音轨、发起单片或整目录翻译、查询进度、取回字幕全文与任务日志。
+            <br />任务在后台运行，发起后立刻返回任务号，客户端自行轮询进度——一部影片要跑几十分钟到几小时。
+            <br /><strong>不提供修改设置的能力</strong>：识别模型、API key 等只能在本页改，远程无法改动。
+            <br />在局域网/公网使用时，MCP 与网页共用上面的访问令牌（请求头 <code>Authorization: Bearer …</code>）。
+          </div>
+        </el-form-item>
+        <template v-if="serverInfo && settings.mcp.enabled">
+          <el-form-item label="MCP 地址">
+            <div style="width: 100%">
+              <div class="url-row">
+                <code>{{ serverInfo.urls.mcp_local }}</code>
+                <span class="hint">本机</span>
+              </div>
+              <div v-for="url in serverInfo.urls.mcp" :key="url" class="url-row">
+                <code>{{ url }}</code>
+                <el-button size="small" text type="primary" @click="copy(url, '地址已复制')">复制</el-button>
+              </div>
+            </div>
+          </el-form-item>
+          <el-form-item label="客户端配置">
+            <div style="width: 100%">
+              <pre class="snippet">{{ mcpConfigSnippet }}</pre>
+              <el-button size="small" @click="copy(mcpConfigSnippet, '配置已复制')">复制配置</el-button>
+              <span class="hint">
+                Claude Code 可直接执行：
+                <code>claude mcp add --transport http movietranslator {{ serverInfo.urls.mcp[0] || serverInfo.urls.mcp_local }}</code>
+              </span>
+            </div>
+          </el-form-item>
+        </template>
+      </el-form>
+    </el-card>
+
+    <el-card shadow="never" class="section">
       <template #header>📝 字幕</template>
       <el-form label-width="150px">
         <el-form-item label="每行最大字符数">
@@ -597,6 +751,32 @@ async function testLLM() {
 .log-size {
   color: var(--el-text-color-secondary);
   font-size: 12px;
+}
+.url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+.url-row code {
+  background: var(--el-fill-color);
+  font-family: var(--app-mono);
+  font-size: 12.5px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  word-break: break-all;
+}
+.snippet {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  background: var(--app-note-bg);
+  border-radius: var(--app-radius);
+  font-family: var(--app-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--el-text-color-primary);
+  white-space: pre;
+  overflow-x: auto;
 }
 .storage-path code {
   background: var(--el-fill-color);

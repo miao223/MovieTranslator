@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import string
 import sys
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
-from app.core import config, joblog
+from app.core import config, joblog, server
+from app.core.auth import MCP_PREFIX
 from app.core.media import VIDEO_EXTS, scan_videos
 from app.models.schemas import (
     AppSettings,
@@ -21,7 +23,7 @@ from app.models.schemas import (
     JobStatus,
     LLMSettings,
 )
-from app.services import audio
+from app.services import audio, mcp_server
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -143,15 +145,105 @@ def cancel_batch(batch_id: str):
 # --------------------------------------------------------------- settings
 
 
+# Stand-in for the API key when the settings are read from another machine.
+# Sent back unchanged on save, which the handler below reads as "keep the
+# stored one" — without that round trip, one save from a LAN browser would
+# overwrite the real key with these asterisks.
+MASKED = "********"
+
+
+def _is_local(request: Request) -> bool:
+    client = request.client
+    if client is None:
+        return False
+    try:
+        return ipaddress.ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
 @router.get("/settings", response_model=AppSettings)
-def get_settings() -> AppSettings:
-    return config.load_settings()
+def get_settings(request: Request) -> AppSettings:
+    settings = config.load_settings()
+    if _is_local(request):
+        return settings
+    remote = settings.model_copy(deep=True)
+    if remote.llm.api_key:
+        remote.llm.api_key = MASKED
+    return remote
 
 
 @router.put("/settings", response_model=AppSettings)
-def put_settings(settings: AppSettings) -> AppSettings:
+def put_settings(settings: AppSettings, request: Request) -> AppSettings:
+    if settings.llm.api_key == MASKED:
+        settings.llm.api_key = config.load_settings().llm.api_key
+    # a LAN user who just switched the switch on still needs a way in
+    server.ensure_token(settings)
     config.save_settings(settings)
-    return settings
+    return get_settings(request)
+
+
+# ----------------------------------------------------------------- server
+
+
+@router.get("/server/info")
+def server_info(request: Request) -> dict:
+    """Where the app listens, where it could be reached, and MCP's state.
+
+    `running` is what was actually bound and `configured` is what is saved;
+    they differ after a change until the next restart, which is the whole
+    reason both are reported.
+    """
+    settings = config.load_settings()
+    srv, local = settings.server, _is_local(request)
+    ips = server.lan_ips()
+    # only the links need the token stripped out when it is not required;
+    # the settings page still shows the stored one, so switching the
+    # requirement back on does not mean hunting for it
+    suffix = (
+        f"/?token={srv.access_token}"
+        if srv.require_token and srv.access_token
+        else "/"
+    )
+
+    return {
+        "configured": {
+            "lan_access": srv.lan_access,
+            "port": srv.port,
+            "require_token": srv.require_token,
+            "has_token": bool(srv.access_token),
+        },
+        "running": dict(server.RUNNING) or None,
+        "lan_ips": ips,
+        "urls": {
+            "local": f"http://127.0.0.1:{srv.port}/",
+            "lan": [f"http://{ip}:{srv.port}{suffix}" for ip in ips],
+            "mcp": [f"http://{ip}:{srv.port}{MCP_PREFIX}" for ip in ips],
+            "mcp_local": f"http://127.0.0.1:{srv.port}{MCP_PREFIX}",
+        },
+        "mcp": {
+            "enabled": settings.mcp.enabled,
+            "available": mcp_server.AVAILABLE,
+            "error": mcp_server.IMPORT_ERROR,
+        },
+        # never handed to a remote caller: they would have to already know it
+        "token": srv.access_token if local else "",
+    }
+
+
+@router.post("/server/token/regenerate")
+def regenerate_token(request: Request) -> dict:
+    """Issue a new access token, invalidating every device already let in.
+
+    Loopback only — a caller holding the current token must not be able to
+    rotate the owner out of their own server.
+    """
+    if not _is_local(request):
+        raise HTTPException(status_code=403, detail="只能在运行本程序的机器上操作")
+    settings = config.load_settings()
+    settings.server.access_token = server.new_token()
+    config.save_settings(settings)
+    return {"token": settings.server.access_token}
 
 
 @router.post("/settings/test-llm")

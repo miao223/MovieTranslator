@@ -9,6 +9,11 @@ dependencies = [
     "uvicorn[standard]>=0.29",
     "av>=12.0",
     "faster-whisper>=1.0",
+    # MCP server (services/mcp_server.py). Held below 2.0 on purpose: that
+    # line switched to httpx2 and pydantic>=2.12, which risks pulling the
+    # openai/fastapi dependency tree apart for a feature that is off by
+    # default. 1.x has the FastMCP + streamable_http_app surface we use.
+    "mcp>=1.16,<2",
     "openai>=1.30",
     "pillow>=10.0",
     "platformdirs>=4.0",
