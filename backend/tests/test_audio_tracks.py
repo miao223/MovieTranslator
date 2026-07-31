@@ -164,6 +164,13 @@ def _peak(wav: Path) -> float:
     return float(np.abs(data).max()) / 32768 if len(data) else 0.0
 
 
+def _duration(wav: Path) -> float:
+    import wave
+
+    with wave.open(str(wav), "rb") as w:
+        return w.getnframes() / w.getframerate()
+
+
 def test_extract_audio_decodes_the_requested_track(multitrack, tmp_path):
     """Track 1 is silent, track 2 carries a tone — the WAV proves which ran."""
     quiet = extract_audio(multitrack, tmp_path / "t1.wav", track_index=1)
@@ -244,3 +251,114 @@ def test_undecodable_track_reports_which_track_to_avoid(tmp_path):
         extract_audio(path, tmp_path / "none.wav", track_index=1)
     assert "音轨 #1" in str(err.value)
     assert "改选其他音轨" in str(err.value)
+
+
+# ------------------------------------------------- source timestamp hazards
+
+
+def _patched_resampler(monkeypatch, wrap):
+    """Swap in a stand-in resampler. `av.AudioResampler` is an extension type
+    and cannot be subclassed, so the stand-in delegates to a real one."""
+    import av
+
+    real = av.AudioResampler
+
+    class Stub:
+        def __init__(self, **kwargs):
+            self.inner = real(**kwargs)
+            self.calls = 0
+
+        def resample(self, frame):
+            self.calls += 1
+            return wrap(self, frame)
+
+    monkeypatch.setattr(av, "AudioResampler", Stub)
+
+
+def test_source_timestamps_never_reach_the_wav_muxer(multitrack, tmp_path, monkeypatch):
+    """Timestamps that step backwards must not abort the extraction.
+
+    From a real report: an AAC track produced two frames and then
+    `Invalid argument: '…\\audio.wav' returned 22` — EINVAL from the WAV
+    muxer refusing a non-monotonic dts, which was then reported as
+    "视频文件在 0s 处损坏" while quoting the *output* file. A WAV keeps no
+    timestamps of its own, so the source's are simply not passed on.
+    """
+    def backwards(stub, frame):
+        out = stub.inner.resample(frame)
+        for f in out:
+            # each frame claims to precede the one before it. Equal
+            # timestamps would not do: the muxer tolerates those, and only a
+            # step *backwards* is refused.
+            f.pts = -1000 * stub.calls
+        return out
+
+    reference = extract_audio(multitrack, tmp_path / "reference.wav", track_index=2)
+    _patched_resampler(monkeypatch, backwards)
+    logs = []
+    out = extract_audio(
+        multitrack, tmp_path / "backwards.wav", track_index=2, log=logs.append
+    )
+    # the whole track, not the two frames that fitted before the muxer
+    # rejected the third: length is what gives that away, since the peak is
+    # already reached inside the first frame
+    assert _duration(out) == pytest.approx(_duration(reference), abs=0.01)
+    assert _peak(out) > 0.3
+    assert not any("损坏" in line for line in logs)
+
+
+def test_a_write_failure_does_not_blame_the_video(multitrack, tmp_path, monkeypatch):
+    """Whatever goes wrong on the output side, the message must not send the
+    user off inspecting a video file that is perfectly fine."""
+    import av
+
+    def explode(stub, frame):
+        raise av.error.ArgumentError(22, "Invalid argument", "audio.wav")
+
+    _patched_resampler(monkeypatch, explode)
+    logs = []
+    with pytest.raises(RuntimeError) as err:
+        extract_audio(multitrack, tmp_path / "nope.wav", track_index=2, log=logs.append)
+    assert "写入音频文件" in str(err.value)
+    assert not any("损坏" in line for line in logs)
+
+
+def test_a_track_that_yields_almost_nothing_fails_the_job(tmp_path):
+    """A fraction of a second of audio against a full-length video is not a
+    truncated file, it is a failed extraction. Letting it through means the
+    user learns an hour later, from an empty subtitle, that there was no
+    sound — which is exactly how this was reported."""
+    import av
+
+    path = tmp_path / "stub-audio.mkv"
+    with av.open(str(path), "w") as container:
+        video = container.add_stream("libx264", rate=1)
+        video.width, video.height = 64, 48
+        video.pix_fmt = "yuv420p"
+        track = container.add_stream("aac", rate=SR)
+        track.layout = "mono"
+
+        for i in range(60):  # a minute of video…
+            frame = av.VideoFrame.from_ndarray(
+                np.zeros((48, 64, 3), dtype=np.uint8), format="rgb24"
+            )
+            frame.pts = i
+            for packet in video.encode(frame):
+                container.mux(packet)
+        for _ in range(2):  # …against two audio frames
+            af = av.AudioFrame.from_ndarray(
+                np.zeros((1, 1024), dtype=np.float32), format="fltp", layout="mono"
+            )
+            af.sample_rate = SR
+            af.time_base = fractions.Fraction(1, SR)
+            af.pts = 0
+            for packet in track.encode(af):
+                container.mux(packet)
+        for packet in track.encode(None):
+            container.mux(packet)
+        for packet in video.encode(None):
+            container.mux(packet)
+
+    with pytest.raises(ValueError) as err:
+        extract_audio(path, tmp_path / "stub.wav", track_index=1)
+    assert "只解码出" in str(err.value) and "改选其他音轨" in str(err.value)

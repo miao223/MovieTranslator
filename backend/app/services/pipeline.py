@@ -389,7 +389,7 @@ class JobManager:
         )
         job.publish(
             "extracting", 10,
-            log=f"音频提取完成: audio.wav（{wav.stat().st_size // 1048576} MB）",
+            log=f"音频提取完成: audio.wav（{wav.stat().st_size / 1048576:.1f} MB）",
         )
 
         # 2a. download the ASR model first if it's missing, with progress --

@@ -7,12 +7,20 @@ the first stream.
 
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional
 
 import av
 
 SAMPLE_RATE = 16_000
+OUT_TIME_BASE = Fraction(1, SAMPLE_RATE)
+
+# Below this share of the container's duration the extraction is treated as
+# failed rather than as a truncated file: transcribing a fraction of a second
+# of a feature film only produces an empty subtitle an hour later.
+MIN_YIELD_RATIO = 0.01
+MIN_SECONDS = 0.5  # floor used when the container reports no duration
 
 ProgressFn = Callable[[float], None]  # 0..1
 LogFn = Callable[[str], None]
@@ -179,7 +187,8 @@ def extract_audio(
     *track_index* is a container stream index (see `list_tracks`); None takes
     the first audio stream. Damaged packets are skipped rather than aborting
     the job. Raises ValueError if the file has no audio stream, the requested
-    index is not an audio stream, or nothing at all could be decoded.
+    index is not an audio stream, or so little was decoded that transcribing
+    it would be pointless (see MIN_YIELD_RATIO).
     """
     video_path = Path(video_path)
     out_wav = Path(out_wav)
@@ -207,53 +216,104 @@ def extract_audio(
             out_stream.layout = "mono"
             resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
 
-            decoded = bad_packets = 0
+            decoded = bad_packets = written = rewinds = 0
             reached = 0.0
-            try:
-                for packet in in_container.demux(in_stream):
-                    try:
-                        frames = packet.decode()
-                    except av.error.FFmpegError:
-                        # a damaged packet must not cost the whole film —
-                        # ffmpeg's own CLI logs and moves on
-                        bad_packets += 1
-                        continue
-                    for frame in frames:
-                        decoded += 1
-                        if duration and frame.pts is not None:
-                            reached = float(frame.pts * in_stream.time_base)
-                            if progress:
-                                progress(min(reached / duration, 1.0))
-                        for out_frame in resampler.resample(frame):
-                            for out_packet in out_stream.encode(out_frame):
-                                out_container.mux(out_packet)
-            except av.error.FFmpegError as exc:
-                # the container itself broke down mid-file
-                if not decoded:
-                    raise
-                if log:
-                    log(
-                        f"⚠ 视频文件在 {reached:.0f}s 处损坏（{exc}），"
-                        "已用此前解码出的音频继续；该时间点之后不会有字幕"
-                    )
-            # flush resampler and encoder
-            for out_frame in resampler.resample(None):
-                for out_packet in out_stream.encode(out_frame):
-                    out_container.mux(out_packet)
+            last_pts: Optional[int] = None
+
+            def emit(frame) -> None:
+                """Resample one decoded frame (or None to drain) into the WAV."""
+                nonlocal written
+                try:
+                    for out_frame in resampler.resample(frame):
+                        # A WAV carries no timestamps at all — its timeline
+                        # *is* the sample count — so the source's are useless
+                        # here and can only do harm: one step backwards (TS
+                        # captures and concatenated files have them) and the
+                        # muxer refuses the packet with EINVAL. That used to
+                        # surface as "视频文件在 0s 处损坏" quoting the output
+                        # path, and left behind a WAV of two frames that the
+                        # rest of the pipeline dutifully transcribed as silence.
+                        out_frame.pts = written
+                        out_frame.time_base = OUT_TIME_BASE
+                        written += out_frame.samples
+                        for out_packet in out_stream.encode(out_frame):
+                            out_container.mux(out_packet)
+                except av.error.FFmpegError as exc:
+                    raise RuntimeError(f"写入音频文件 {out_wav.name} 失败: {exc}") from exc
+
+            demuxer = in_container.demux(in_stream)
+            while True:
+                try:
+                    packet = next(demuxer)
+                except StopIteration:
+                    break
+                except av.error.FFmpegError as exc:
+                    # The container itself broke down mid-file. Only demuxing
+                    # is covered: a failure on the output side is a fault of
+                    # this program, and blaming it on the user's video sends
+                    # the next bug report chasing the wrong file.
+                    if not decoded:
+                        raise
+                    if log:
+                        log(
+                            f"⚠ 视频文件在 {reached:.0f}s 处损坏（{exc}），"
+                            "已用此前解码出的音频继续；该时间点之后不会有字幕"
+                        )
+                    break
+
+                try:
+                    frames = packet.decode()
+                except av.error.FFmpegError:
+                    # a damaged packet must not cost the whole film —
+                    # ffmpeg's own CLI logs and moves on
+                    bad_packets += 1
+                    continue
+                for frame in frames:
+                    decoded += 1
+                    if frame.pts is not None:
+                        if last_pts is not None and frame.pts < last_pts:
+                            rewinds += 1
+                        last_pts = frame.pts
+                        # max(): source timestamps are not guaranteed to move
+                        # forward, and this one only ever names a position
+                        reached = max(reached, float(frame.pts * in_stream.time_base))
+                        if duration and progress:
+                            progress(min(reached / duration, 1.0))
+                    emit(frame)
+
+            emit(None)  # drain the resampler, then the encoder
             for out_packet in out_stream.encode(None):
                 out_container.mux(out_packet)
 
+    produced = written / SAMPLE_RATE
     if not decoded:
         raise ValueError(
             f"音轨 #{stream_index}（{codec_name}）"
             "无法解码，可能是编码格式不受支持或该音轨已损坏；"
             "请在任务页改选其他音轨后重试"
         )
+    enough = produced >= duration * MIN_YIELD_RATIO if duration else produced >= MIN_SECONDS
+    if not enough:
+        raise ValueError(
+            f"音轨 #{stream_index}（{codec_name}）只解码出 {produced:.1f}s 音频"
+            + (f"，而视频长 {duration:.0f}s" if duration else "")
+            + "，不足以用于识别；该音轨可能已损坏，"
+            "请在任务页改选其他音轨后重试"
+        )
     if log:
         log(
             f"音轨 #{stream_index} 解码完成：{decoded} 个音频帧，"
-            f"覆盖到 {reached:.0f}s / 共 {duration:.0f}s"
+            f"提取出 {produced:.0f}s 音频 / 视频共 {duration:.0f}s"
             + (f"，跳过 {bad_packets} 个损坏的包" if bad_packets else "")
+        )
+    if rewinds and log:
+        # Worth saying out loud: the audio itself is complete, but a source
+        # whose clock runs backwards is usually a TS capture or two parts
+        # joined together, and its picture may not line up with a timeline
+        # counted in samples.
+        log(
+            f"⚠ 片源时间戳有 {rewinds} 处回退（多见于电视录制或拼接的文件），"
+            "音频已按解码顺序完整提取，但字幕时间轴可能与画面有偏差"
         )
     if bad_packets and log:
         log("⚠ 文件存在轻微损坏，跳过的部分不会有字幕；其余部分已正常提取")
