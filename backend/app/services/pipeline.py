@@ -27,7 +27,9 @@ from app.models.schemas import (
     ProgressEvent,
     SubtitleLine,
 )
-from app.services import asr, audio, lyrics, refine, segmenter, series, subtitle, vet
+from app.services import (
+    asr, audio, lyrics, mux, refine, segmenter, series, subtitle, vet,
+)
 from app.services.translator import Translator
 
 # overall progress ranges per stage: (start%, end%)
@@ -275,6 +277,14 @@ class JobManager:
             )
         if not req.frame_tasks:
             raise RuntimeError("补充模式至少需要一条画面翻译时间点")
+        if req.embed_subtitle:
+            # this mode edits an existing subtitle file in place; there is no
+            # new subtitle to embed, and silently doing nothing would read as
+            # a bug when no .mkv appears
+            job.publish(
+                "translating", 0,
+                log="补充模式只修改已有字幕文件，本次忽略「合成带字幕的新视频」",
+            )
 
         job.publish("translating", 10, message=f"补充画面翻译 → {target.name}")
         frame_lines = self._translate_frames(
@@ -600,24 +610,75 @@ class JobManager:
             srt_text = subtitle.build_ass(lines, settings.subtitle, mode=req.output_mode)
         else:
             srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
-        target = video.parent / f"{video.stem}{ext}"
-        try:
-            target.write_text(srt_text, encoding="utf-8")
-            job.srt_path = target
-            job.status.srt_in_place = True
-        except OSError as exc:
-            # video dir not writable (read-only share etc.): keep it in the
-            # work dir and let the UI offer a download instead
-            job.srt_path = workdir / f"{video.stem}{ext}"
-            job.srt_path.write_text(srt_text, encoding="utf-8")
-            job.status.srt_in_place = False
-            job.publish(
-                "composing", 99,
-                log=f"⚠ 无法写入视频所在目录（{exc}），字幕已保存到工作目录，可用下载按钮获取",
-            )
+        # embed mode keeps the subtitle in the work dir — the download button
+        # and the debug artifacts still want it, the video folder does not
+        muxed = self._embed_subtitle(job, req, workdir, video, ext, srt_text) \
+            if req.embed_subtitle else None
+        if muxed is None:
+            target = video.parent / f"{video.stem}{ext}"
+            try:
+                target.write_text(srt_text, encoding="utf-8")
+                job.srt_path = target
+                job.status.srt_in_place = True
+            except OSError as exc:
+                # video dir not writable (read-only share etc.): keep it in the
+                # work dir and let the UI offer a download instead
+                job.srt_path = workdir / f"{video.stem}{ext}"
+                job.srt_path.write_text(srt_text, encoding="utf-8")
+                job.status.srt_in_place = False
+                job.publish(
+                    "composing", 99,
+                    log=f"⚠ 无法写入视频所在目录（{exc}），字幕已保存到工作目录，可用下载按钮获取",
+                )
         job.status.srt_filename = str(job.srt_path)
         self._debug_final(debug, lines, settings)
-        job.publish("done", 100, message=f"完成，字幕已保存: {job.srt_path}")
+        job.publish(
+            "done", 100,
+            message=(f"完成，带字幕的视频已生成: {muxed}" if muxed
+                     else f"完成，字幕已保存: {job.srt_path}"),
+        )
+
+    def _embed_subtitle(
+        self, job: Job, req: JobRequest, workdir: Path,
+        video: Path, ext: str, srt_text: str,
+    ) -> Optional[Path]:
+        """Mux the subtitle into a new video. Returns None to fall back.
+
+        A failure here must never cost the hour of transcription and
+        translation behind it, so anything short of a cancellation degrades
+        to writing the subtitle file — the behaviour with the switch off.
+        """
+        job.srt_path = workdir / f"{video.stem}{ext}"
+        job.srt_path.write_text(srt_text, encoding="utf-8")
+        job.status.srt_in_place = False
+        out = mux.output_path(video, req.target_language)
+        job.publish(
+            "composing", 95,
+            message="合成带字幕的视频（音视频不重编码）…",
+            log=f"开始合成 {out.name}（复制音视频流，不重编码）",
+        )
+        try:
+            mux.embed(
+                video, job.srt_path, out,
+                target_language=req.target_language,
+                track_title=f"{req.target_language}字幕",
+                log=lambda msg: job.publish("composing", job.status.progress, log=msg),
+                progress=lambda f: job.publish(
+                    "composing", 95 + 5 * min(max(f, 0.0), 1.0),
+                    message=f"合成带字幕的视频… {min(max(f, 0.0), 1.0):.0%}",
+                ),
+                should_cancel=job.cancel_event.is_set,
+            )
+        except InterruptedError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — any failure falls back
+            job.publish(
+                "composing", 95,
+                log=f"⚠ 合成视频失败（{exc}），已改为在视频所在目录生成字幕文件",
+            )
+            return None
+        job.status.video_filename = str(out)
+        return out
 
     @staticmethod
     def _debug_lyric_agreement(debug: DebugLog, lines, segments) -> None:

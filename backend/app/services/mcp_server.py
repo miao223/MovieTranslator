@@ -159,6 +159,7 @@ def build() -> Optional["FastMCP"]:
         output_mode: str = "bilingual",
         audio_track: Optional[int] = None,
         audio_language: str = "",
+        embed_subtitle: bool = False,
     ) -> dict:
         """为一个视频文件启动字幕翻译，立即返回 job_id，不等待完成。
 
@@ -171,6 +172,9 @@ def build() -> Optional["FastMCP"]:
         output_mode: bilingual 双语，translation_only 只要译文。
         audio_track: 音轨的容器序号，留空用默认音轨。
         audio_language: 按语言标签选音轨（如 jpn），仅在 audio_track 留空时生效。
+        embed_subtitle: 开启后不生成字幕文件，而是在同目录产出一个内嵌软字幕的
+            新视频（片名.zh.mkv，音视频不重编码）。会完整复制一份视频，注意磁盘空间。
+            生成路径见 get_job 的 video_filename 字段。
         """
         if output_mode not in ("bilingual", "translation_only"):
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
@@ -182,6 +186,7 @@ def build() -> Optional["FastMCP"]:
             target_language=target_language,
             synopsis=synopsis,
             output_mode=output_mode,  # type: ignore[arg-type]
+            embed_subtitle=embed_subtitle,
         )
         try:
             job = manager.create(request)
@@ -200,6 +205,7 @@ def build() -> Optional["FastMCP"]:
         skip_translated: bool = True,
         audio_language: str = "",
         series_mode: bool = False,
+        embed_subtitle: bool = False,
     ) -> dict:
         """为一个目录下的所有视频批量启动翻译，立即返回 batch_id。
 
@@ -209,6 +215,9 @@ def build() -> Optional["FastMCP"]:
         series_mode（剧集模式）：整个目录是同一部剧的多集时开启，先译出的
         人名/术语译法会强制沿用到后续每一集；目录里是互不相干的影片则不要
         开启。累积的对照表可在 get_batch 的 glossary 字段查看。
+
+        embed_subtitle：同 translate_video——每个视频产出一个内嵌软字幕的新 mkv，
+        不生成字幕文件。整季剧集会因此多占一整份磁盘空间。
         """
         if output_mode not in ("bilingual", "translation_only"):
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
@@ -222,6 +231,7 @@ def build() -> Optional["FastMCP"]:
             synopsis=synopsis,
             output_mode=output_mode,  # type: ignore[arg-type]
             series_mode=series_mode,
+            embed_subtitle=embed_subtitle,
         )
         try:
             status = await anyio.to_thread.run_sync(batch_manager.create, request)

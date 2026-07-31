@@ -39,7 +39,14 @@ const form = reactive({
   target_language: '简体中文',
   synopsis: '',
   output_mode: 'bilingual',
+  embed_subtitle: false,
 })
+
+// mirrors mux.LANGUAGES — only used to show the filename before it exists
+const LANG_SUFFIX = {
+  简体中文: 'zh', 繁體中文: 'zh', English: 'en', 日本語: 'ja',
+  한국어: 'ko', 'Français': 'fr', Deutsch: 'de',
+}
 
 const batchForm = reactive({
   directory: '',
@@ -195,6 +202,14 @@ const STAGE_LABELS = {
 const running = () =>
   job.value && !['done', 'failed', 'cancelled'].includes(job.value.stage)
 
+const embedExample = computed(() => {
+  const suffix = LANG_SUFFIX[form.target_language] || 'sub'
+  const stem = mode.value === 'single' && form.video_path
+    ? baseName(form.video_path).replace(/\.[^.]+$/, '')
+    : '片名'
+  return `${stem}.${suffix}.mkv`
+})
+
 async function start(frameOnly = false) {
   if (!form.video_path) {
     ElMessage.warning('请先选择视频文件')
@@ -323,6 +338,7 @@ async function startBatch() {
       target_language: form.target_language,
       synopsis: form.synopsis,
       output_mode: form.output_mode,
+      embed_subtitle: form.embed_subtitle,
     })
     job.value = null
     logs.value = []
@@ -473,6 +489,25 @@ onBeforeUnmount(() => {
           <el-radio value="translation_only">纯译文</el-radio>
         </el-radio-group>
       </el-form-item>
+      <el-form-item label="输出形式">
+        <el-radio-group v-model="form.embed_subtitle">
+          <el-radio :value="false">独立字幕文件</el-radio>
+          <el-radio :value="true">合成带字幕的新视频</el-radio>
+        </el-radio-group>
+        <div class="hint" style="margin: 4px 0 0; display: block">
+          <template v-if="form.embed_subtitle">
+            不再生成 .srt/.ass，而是在视频所在目录生成
+            <code>{{ embedExample }}</code>，字幕以<strong>软字幕</strong>内嵌其中——
+            播放器里可开关、可切换，画面没有被烧上字（非硬字幕）。<br>
+            <strong>音视频原样拷贝、不重编码</strong>，画质无损，耗时约等于复制一遍文件；
+            原视频保持不变。「字幕样式」设置照常生效（内嵌为 ASS 轨）。<br>
+            ⚠️ 这会<strong>完整多出一份视频文件</strong>，批量整季前请先确认磁盘空间。
+          </template>
+          <template v-else>
+            在视频所在目录生成同名的 .srt（开启「字幕样式」时为 .ass），原视频不动。
+          </template>
+        </div>
+      </el-form-item>
       <el-form-item v-if="mode === 'single'" label="画面翻译">
         <div style="width: 100%">
           <div v-for="(t, i) in frameTasks" :key="i" class="frame-task-row">
@@ -585,7 +620,11 @@ onBeforeUnmount(() => {
       <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
     </div>
     <template v-if="job.stage === 'done' && job.srt_filename">
-      <el-alert v-if="job.srt_in_place" type="success" :closable="false" style="margin-bottom: 8px">
+      <el-alert v-if="job.video_filename" type="success" :closable="false" style="margin-bottom: 8px">
+        已生成带字幕的视频：<code>{{ job.video_filename }}</code><br>
+        字幕以软字幕内嵌，播放器里可开关；原视频未改动。字幕文件本身也可用下方按钮下载。
+      </el-alert>
+      <el-alert v-else-if="job.srt_in_place" type="success" :closable="false" style="margin-bottom: 8px">
         字幕已保存到视频所在目录：<code>{{ job.srt_filename }}</code>
       </el-alert>
       <el-alert v-else type="warning" :closable="false" style="margin-bottom: 8px">
@@ -622,6 +661,13 @@ onBeforeUnmount(() => {
       :closable="false"
       style="margin-top: 12px"
       title="剧集模式已开启：以上视频将共用同一份人名/术语译名表，请确认它们属于同一部剧"
+    />
+    <el-alert
+      v-if="form.embed_subtitle"
+      type="warning"
+      :closable="false"
+      style="margin-top: 12px"
+      title="将为每个视频合成一份带字幕的新 mkv（不重编码），磁盘占用约等于再存一遍这些视频"
     />
     <template #footer>
       <el-button @click="confirmVisible = false">取消</el-button>

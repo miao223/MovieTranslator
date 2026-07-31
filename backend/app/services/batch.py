@@ -60,6 +60,7 @@ class BatchManager:
                         target_language=req.target_language,
                         synopsis=req.synopsis,
                         output_mode=req.output_mode,
+                        embed_subtitle=req.embed_subtitle,
                         series_id=batch.series_id,
                     )
                 )

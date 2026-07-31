@@ -215,6 +215,10 @@ class JobRequest(BaseModel):
     target_language: str = "简体中文"
     synopsis: str = ""  # optional plot synopsis to steer the translation
     output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+    # produce one new .mkv carrying the subtitle as a switchable soft track
+    # instead of a subtitle file next to the video (services/mux.py). The
+    # picture is copied, never re-encoded.
+    embed_subtitle: bool = False
     # set by BatchManager in series mode; names the glossary this job shares
     # with the rest of its batch (services/series.py). Always empty for a
     # single-file job — nothing it decides can leak into another film.
@@ -236,6 +240,9 @@ class BatchRequest(BaseModel):
     target_language: str = "简体中文"
     synopsis: str = ""  # shared synopsis is useful for TV series batches
     output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+    # see JobRequest.embed_subtitle — one muxed .mkv per video instead of a
+    # subtitle file. Note it writes a second copy of every film in the batch.
+    embed_subtitle: bool = False
     # 剧集模式: every video in this batch shares one accumulated 原文 → 译名
     # table, so a name settled in one episode holds for the rest
     # (services/series.py). Off by default — a directory of unrelated films
@@ -277,6 +284,9 @@ class JobStatus(BaseModel):
     video_path: str = ""
     srt_filename: str = ""  # full path of the generated SRT
     srt_in_place: bool = False  # True when saved next to the video
+    # embed mode: the new video carrying the subtitle track. Empty otherwise,
+    # so the UI can tell the two outcomes apart from this field alone.
+    video_filename: str = ""
 
 
 class ProgressEvent(BaseModel):
