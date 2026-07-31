@@ -250,6 +250,10 @@ class Translator:
     ):
         self.debug = debug if debug is not None and debug.enabled else None
         self.usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
+        # the glossary this run settled on, as the model wrote it. Series
+        # mode (services/series.py) reads it to carry names to the next
+        # episode; nothing else depends on it.
+        self.glossary_text = ""
         self._no_thinking = settings.disable_thinking
         self.settings = settings
         self.target_language = target_language
@@ -369,6 +373,7 @@ class Translator:
         ]
         self.log("正在通读全文并生成术语/译名对照表…（长片首个响应可能需要 1-2 分钟）")
         glossary = self._chat(messages)
+        self.glossary_text = glossary
         messages.append({"role": "assistant", "content": glossary})
         self.log("术语表已生成：\n" + glossary.strip()[:800])
 
@@ -559,5 +564,6 @@ class Translator:
             },
         ]
         glossary = self._chat(messages)
+        self.glossary_text = glossary
         self.log("术语表已生成（分块模式）：\n" + glossary.strip()[:800])
         return glossary

@@ -27,7 +27,7 @@ from app.models.schemas import (
     ProgressEvent,
     SubtitleLine,
 )
-from app.services import asr, audio, lyrics, refine, segmenter, subtitle, vet
+from app.services import asr, audio, lyrics, refine, segmenter, series, subtitle, vet
 from app.services.translator import Translator
 
 # overall progress ranges per stage: (start%, end%)
@@ -318,6 +318,11 @@ class JobManager:
             self._execute_frame_only(job, req, workdir)
             return
 
+        # Series mode: the names the earlier episodes of this batch settled
+        # on, merged ahead of this job's own glossary. settings.prompts is
+        # the instance config caches, so it is copied, never written to.
+        shared, glossary = series.for_job(req.series_id, settings.prompts.glossary)
+
         # deep diagnostics: written next to the subtitle we are about to
         # produce, so the user finds it without hunting for a cache dir
         video = Path(req.video_path)
@@ -493,7 +498,7 @@ class JobManager:
                 ),
                 should_cancel=job.cancel_event.is_set,
                 network=settings.network,
-                glossary=settings.prompts.glossary,
+                glossary=glossary,
                 debug=debug,
                 usage=refine_usage,
             )
@@ -529,6 +534,9 @@ class JobManager:
         def tr_log(msg: str):
             job.publish("translating", job.status.progress, log=msg)
 
+        if shared and len(shared):
+            tr_log(f"剧集模式：沿用本批已确定的 {len(shared)} 条译名")
+
         translator = Translator(
             settings.llm,
             target_language=req.target_language,
@@ -539,12 +547,25 @@ class JobManager:
                 message=f"AI 翻译中… {min(max(f, 0.0), 1.0):.0%}",
             ),
             should_cancel=job.cancel_event.is_set,
-            prompts=settings.prompts,
+            prompts=settings.prompts.model_copy(update={"glossary": glossary}),
             max_line_chars=settings.subtitle.max_chars_per_line,
             network=settings.network,
             debug=debug,
         )
         translator.translate(lines)
+        if shared and translator.glossary_text:
+            added, clashes = shared.learn(
+                translator.glossary_text, settings.prompts.glossary
+            )
+            tr_log(
+                f"剧集模式：本集新增 {added} 条译名，累计 {len(shared)} 条"
+                + (
+                    f"\n⚠ {len(clashes)} 条与已确定的译法不一致，已沿用先前译法"
+                    "（如需改用新译法，请在设置的术语表里写死）：\n  "
+                    + "\n  ".join(clashes[:20])
+                    if clashes else ""
+                )
+            )
         if settings.prompts.mark_lyrics:
             # the model was asked to keep the ♪; a marker it dropped or moved
             # onto the neighbouring line would be worse than none, so the

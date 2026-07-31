@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 
@@ -46,6 +46,7 @@ const batchForm = reactive({
   recursive: true,
   skip_existing_srt: true,
   audio_language: '',
+  series_mode: false,
 })
 
 // ------------------------------------------------------------ audio tracks
@@ -261,6 +262,35 @@ let currentSseJob = ''
 const batchRunning = () =>
   batch.value && batch.value.pending + batch.value.running > 0
 
+// series mode only: empty while it is off, so the panel keys off it
+const glossaryTerms = computed(() =>
+  (batch.value?.glossary || '').split('\n').filter((line) => line.trim()),
+)
+
+async function copyGlossary() {
+  try {
+    await navigator.clipboard.writeText(batch.value.glossary)
+    ElMessage.success('已复制译名对照表')
+  } catch {
+    // the clipboard API needs a secure context; over plain http on a LAN
+    // address the browser refuses, and failing silently looks like a bug
+    ElMessage.warning('浏览器不允许自动复制，请手动选中后复制')
+  }
+}
+
+async function keepGlossary() {
+  try {
+    const r = await api.saveBatchGlossary(batch.value.id)
+    ElMessage.success(
+      r.added
+        ? `已保存 ${r.added} 条译名到设置的术语表（共 ${r.total} 条）`
+        : '设置的术语表里已有这些译名，未重复添加',
+    )
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
 async function startBatchScan() {
   if (!batchForm.directory) {
     ElMessage.warning('请先选择目录')
@@ -404,6 +434,13 @@ onBeforeUnmount(() => {
           <el-switch v-model="batchForm.skip_existing_srt" />
           <span class="hint">跳过已有同名字幕的视频</span>
         </el-form-item>
+        <el-form-item label="剧集模式">
+          <el-switch v-model="batchForm.series_mode" />
+          <span class="hint">
+            本批所有视频共用一份人名/术语译名表：先译出的集数定下的译法，
+            后面每一集都必须沿用。适合整季剧集；目录里是互不相干的影片时请勿开启
+          </span>
+        </el-form-item>
         <el-form-item label="音轨">
           <el-select v-model="batchForm.audio_language" style="width: 260px">
             <el-option v-for="l in AUDIO_LANGS" :key="l.value" :value="l.value" :label="l.label" />
@@ -507,6 +544,23 @@ onBeforeUnmount(() => {
         </el-tag>
       </div>
     </div>
+    <el-collapse v-if="glossaryTerms.length" class="glossary">
+      <el-collapse-item :title="`本批译名对照表（${glossaryTerms.length} 条）`">
+        <div class="glossary-terms">
+          <div v-for="(t, i) in glossaryTerms" :key="i" class="log-line">{{ t }}</div>
+        </div>
+        <div class="glossary-actions">
+          <el-button size="small" @click="copyGlossary">复制</el-button>
+          <el-button size="small" type="primary" plain @click="keepGlossary">
+            保存到设置的术语表
+          </el-button>
+          <span class="hint">
+            这份表只在本次批量内有效，保存后才会长期沿用；发现译错了可以在
+            「提示词设置 → 术语表」里改写，那里写死的译法优先级最高
+          </span>
+        </div>
+      </el-collapse-item>
+    </el-collapse>
     <div ref="logBox" class="logs">
       <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
     </div>
@@ -560,6 +614,15 @@ onBeforeUnmount(() => {
     <div v-if="scanResult" class="scan-list">
       <div v-for="v in scanResult.videos" :key="v" class="scan-item">🎬 {{ baseName(v) }}</div>
     </div>
+    <!-- the mistake worth catching here is series mode left on for a folder
+         of unrelated films: the names of one would be forced onto the rest -->
+    <el-alert
+      v-if="batchForm.series_mode"
+      type="info"
+      :closable="false"
+      style="margin-top: 12px"
+      title="剧集模式已开启：以上视频将共用同一份人名/术语译名表，请确认它们属于同一部剧"
+    />
     <template #footer>
       <el-button @click="confirmVisible = false">取消</el-button>
       <el-button type="primary" @click="startBatch">开始批量翻译</el-button>
@@ -664,6 +727,31 @@ onBeforeUnmount(() => {
   border: 1px solid var(--el-border-color-light);
   border-radius: var(--app-radius);
   margin-bottom: 12px;
+}
+.glossary {
+  margin-bottom: 12px;
+}
+.glossary-terms {
+  max-height: 200px;
+  overflow-y: auto;
+  background: var(--app-log-bg);
+  color: var(--app-log-fg);
+  font-family: var(--app-mono);
+  font-size: 12px;
+  padding: 8px 12px;
+  border-radius: var(--app-radius);
+}
+.glossary-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.glossary-actions .hint {
+  margin-left: 0;
+  flex: 1;
+  min-width: 220px;
 }
 .batch-file {
   display: flex;

@@ -215,6 +215,10 @@ class JobRequest(BaseModel):
     target_language: str = "简体中文"
     synopsis: str = ""  # optional plot synopsis to steer the translation
     output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+    # set by BatchManager in series mode; names the glossary this job shares
+    # with the rest of its batch (services/series.py). Always empty for a
+    # single-file job — nothing it decides can leak into another film.
+    series_id: str = ""
     frame_tasks: list[FrameTask] = []
     # supplement mode: skip ASR/translation entirely, only translate the
     # frame_tasks and merge them into the existing same-stem .srt/.ass
@@ -232,6 +236,11 @@ class BatchRequest(BaseModel):
     target_language: str = "简体中文"
     synopsis: str = ""  # shared synopsis is useful for TV series batches
     output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+    # 剧集模式: every video in this batch shares one accumulated 原文 → 译名
+    # table, so a name settled in one episode holds for the rest
+    # (services/series.py). Off by default — a directory of unrelated films
+    # would only contaminate each other's names.
+    series_mode: bool = False
 
 
 JobStage = Literal[
@@ -289,3 +298,6 @@ class BatchStatus(BaseModel):
     current_job_id: str = ""  # the job currently executing, for SSE attach
     jobs: list[JobStatus] = []
     skipped: list[str] = []
+    # series mode: the 原文 → 译名 table accumulated so far, one per line.
+    # Empty when the mode is off, so the UI can key off it directly.
+    glossary: str = ""

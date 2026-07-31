@@ -25,6 +25,8 @@ export const api = {
     request('/api/batch', { method: 'POST', body: JSON.stringify(payload) }),
   getBatch: (id) => request(`/api/batch/${id}`),
   cancelBatch: (id) => request(`/api/batch/${id}/cancel`, { method: 'POST' }),
+  saveBatchGlossary: (id) =>
+    request(`/api/batch/${id}/glossary/save`, { method: 'POST' }),
   cancelJob: (id) => request(`/api/jobs/${id}/cancel`, { method: 'POST' }),
   getSettings: () => request('/api/settings'),
   saveSettings: (settings) =>

@@ -23,7 +23,7 @@ from app.models.schemas import (
     JobStatus,
     LLMSettings,
 )
-from app.services import audio, mcp_server
+from app.services import audio, mcp_server, series
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -140,6 +140,39 @@ def cancel_batch(batch_id: str):
     except KeyError:
         raise HTTPException(status_code=404, detail="batch not found")
     return {"ok": True}
+
+
+@router.post("/batch/{batch_id}/glossary/save")
+def save_batch_glossary(batch_id: str) -> dict:
+    """Keep a series-mode glossary for good, in the settings' own table.
+
+    The table itself only lives as long as the batch. Merging here rather
+    than in the browser keeps the dedup rule in one place and avoids
+    round-tripping the whole settings object — which, read from another
+    machine, has its API key masked.
+    """
+    try:
+        batch = batch_manager.status(batch_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="batch not found")
+    if not batch.glossary.strip():
+        raise HTTPException(status_code=400, detail="该批量没有可保存的译名对照表")
+
+    settings = config.load_settings().model_copy(deep=True)
+    existing = settings.prompts.glossary
+    kept = {source for source, _ in series.parse_terms(existing)}
+    fresh = [
+        (source, target)
+        for source, target in series.parse_terms(batch.glossary)
+        if source not in kept
+    ]
+    if fresh:
+        block = series.render_terms(fresh)
+        settings.prompts.glossary = (
+            f"{existing.rstrip()}\n{block}" if existing.strip() else block
+        )
+        config.save_settings(settings)
+    return {"added": len(fresh), "total": len(kept) + len(fresh)}
 
 
 # --------------------------------------------------------------- settings

@@ -13,6 +13,7 @@ from typing import Dict, List
 
 from app.core.media import scan_videos
 from app.models.schemas import BatchRequest, BatchStatus, JobRequest
+from app.services import series
 from app.services.pipeline import manager as job_manager
 
 TERMINAL = {"done", "failed", "cancelled"}
@@ -25,6 +26,8 @@ class Batch:
     job_ids: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
     failed_to_create: List[str] = field(default_factory=list)
+    # series mode: the id of the glossary these jobs share, "" when off
+    series_id: str = ""
 
 
 class BatchManager:
@@ -42,6 +45,11 @@ class BatchManager:
             directory=req.directory,
             skipped=[str(p) for p in skipped],
         )
+        if req.series_mode:
+            # jobs run one at a time in creation order, so the glossary is
+            # written by whichever episode is running and read by the next
+            batch.series_id = batch.id
+            series.create(batch.series_id)
         for video in videos:
             try:
                 job = job_manager.create(
@@ -52,6 +60,7 @@ class BatchManager:
                         target_language=req.target_language,
                         synopsis=req.synopsis,
                         output_mode=req.output_mode,
+                        series_id=batch.series_id,
                     )
                 )
                 batch.job_ids.append(job.id)
@@ -79,6 +88,7 @@ class BatchManager:
             else:
                 counts["running"] += 1
                 current = status.id
+        shared = series.get(batch.series_id)
         return BatchStatus(
             id=batch.id,
             directory=batch.directory,
@@ -86,6 +96,7 @@ class BatchManager:
             current_job_id=current,
             jobs=jobs,
             skipped=batch.skipped + batch.failed_to_create,
+            glossary=shared.render() if shared else "",
             **counts,
         )
 

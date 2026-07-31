@@ -199,11 +199,16 @@ def build() -> Optional["FastMCP"]:
         recursive: bool = True,
         skip_translated: bool = True,
         audio_language: str = "",
+        series_mode: bool = False,
     ) -> dict:
         """为一个目录下的所有视频批量启动翻译，立即返回 batch_id。
 
         影片逐个串行处理（语音识别占满 CPU/GPU，同时只跑一个）。
         用 get_batch 查看整体进度。
+
+        series_mode（剧集模式）：整个目录是同一部剧的多集时开启，先译出的
+        人名/术语译法会强制沿用到后续每一集；目录里是互不相干的影片则不要
+        开启。累积的对照表可在 get_batch 的 glossary 字段查看。
         """
         if output_mode not in ("bilingual", "translation_only"):
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
@@ -216,6 +221,7 @@ def build() -> Optional["FastMCP"]:
             target_language=target_language,
             synopsis=synopsis,
             output_mode=output_mode,  # type: ignore[arg-type]
+            series_mode=series_mode,
         )
         try:
             status = await anyio.to_thread.run_sync(batch_manager.create, request)

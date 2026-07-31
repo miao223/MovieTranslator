@@ -21,7 +21,7 @@ from typing import Optional
 
 from app.core.cache import _base_dir
 
-APP_VERSION = "0.11.1"
+APP_VERSION = "0.12.0"
 LOG_DIR_NAME = "logs"
 KEEP_LOGS = 20  # newest job logs to retain
 
@@ -183,4 +183,6 @@ class JobLogWriter:
             f"画面翻译      : {len(request.frame_tasks)} 条"
             + ("（仅补充模式）" if request.frame_only else ""),
             f"剧情简介      : {'已填写 ' + str(len(request.synopsis)) + ' 字' if request.synopsis.strip() else '（无）'}",
+            # explains a glossary in the prompt that is nowhere in settings
+            f"剧集模式      : {'开（本批共用译名表 ' + request.series_id + '）' if request.series_id else '关'}",
         ])
