@@ -70,14 +70,26 @@ GIVE_UP_AFTER = 2
 
 
 def build_vet_prompt(
-    language_hint: str = "", synopsis: str = "", mark_lyrics: bool = False
+    language_hint: str = "",
+    synopsis: str = "",
+    mark_lyrics: bool = False,
+    no_context: bool = False,
 ) -> str:
     lang = f"（原文语言：{language_hint}）" if language_hint else ""
+    anchor = (
+        # Nothing survived the first pass, so there is no confirmed line to
+        # anchor against. Saying so beats letting the model look for context
+        # that is not there — and beats claiming lines exist when they don't.
+        "本片没有已确认的识别结果可供对照，全部行都是补充识别，"
+        "请依据这些行彼此之间是否构成同一部影片的连贯内容来判断。"
+        if no_context else
+        "没有标记的 `[编号]` 行是已确认属于本片的识别结果，请把它们当作判断依据。"
+    )
     parts = [
         f"你是字幕校对员{lang}。下面是一部影片的语音识别转写，按时间顺序排列。",
         "以 `*[R编号]` 开头的行是【补充识别】结果：它们来自语音活动检测判定为"
         "「无语音」的片段，是关闭检测后重新识别得到的，可靠性明显低于其他行。"
-        "没有标记的 `[编号]` 行是已确认属于本片的识别结果，请把它们当作判断依据。",
+        + anchor,
         "补充识别有两类已知问题：",
         "1. 语音识别模型是用字幕文件训练的，在没有人声的段落上会吐出与本片毫无关系、"
         "但语句完全通顺的内容——视频片尾语（感谢观看、记得订阅、下期再见）、"
@@ -240,13 +252,19 @@ def vet_recovered(
 
     ids = {id(s): n for n, s in enumerate(review, start=1)}
     client = client if client is not None else make_openai_client(llm, network)
-    system = build_vet_prompt(language_hint, synopsis, mark_lyrics)
+    no_context = len(review) == len(segments)
+    if no_context:
+        log("⚠ 第一遍识别没有留下任何可对照的台词，本次复核只能靠补充识别各行"
+            "彼此是否连贯来判断，准确度低于平时")
+    system = build_vet_prompt(language_hint, synopsis, mark_lyrics, no_context)
     chunks = _chunks(segments, llm.context_limit)
     dbg = debug if debug is not None and debug.enabled else None
 
     if dbg:
         dbg.section("二次识别复核（LLM 判断是否属于本片）")
         dbg.kv("送审", f"{len(review)} 段 / {_duration(review):.0f}s")
+        if no_context:
+            dbg.kv("对照上下文", "无（第一遍识别为空）")
         dbg.kv("分块数", len(chunks))
         dbg.block("system prompt", system)
 

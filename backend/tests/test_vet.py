@@ -171,6 +171,38 @@ def test_the_request_carries_no_timestamps():
         assert f"{seg.start}" not in sent
 
 
+def test_a_transcript_that_is_all_recovered_says_so_instead_of_pointing_at_nothing():
+    """When the first pass yields nothing, the prompt's premise is gone.
+
+    It normally tells the model that the unmarked lines are confirmed and
+    to judge against them; with every line recovered there are no unmarked
+    lines, and one film reached exactly that state — its first pass came
+    back as 577 dashes, all of which this pipeline now drops. Claiming a
+    context that is not in the request is worse than admitting there is
+    none, and the user is told the pass is running blind.
+    """
+    segments = [
+        S(10.0, 12.0, "今どこ?会社?", recovered=True),
+        S(12.5, 14.0, "今下なの", recovered=True),
+    ]
+    logged: list[str] = []
+    out, client = run(
+        ["[R1] 保留\n[R2] 保留"], segments=segments, log=logged.append
+    )
+    system = client.calls[0][0]["content"]
+    assert "没有已确认的识别结果" in system
+    assert "请把它们当作判断依据" not in system
+    assert any("⚠" in line and "第一遍识别" in line for line in logged)
+    assert texts(out) == ["今どこ?会社?", "今下なの"]
+
+
+def test_the_usual_prompt_still_anchors_on_the_confirmed_lines():
+    _out, client = run(["[R1] 保留\n[R2] 保留\n[R3] 保留"])
+    system = client.calls[0][0]["content"]
+    assert "请把它们当作判断依据" in system
+    assert "没有已确认的识别结果" not in system
+
+
 def test_the_synopsis_reaches_the_model_when_given():
     _out, client = run(
         ["[R1] 保留\n[R2] 保留\n[R3] 保留"], synopsis="心霊ドキュメンタリー"

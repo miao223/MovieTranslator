@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -57,6 +58,34 @@ SECOND_PASS_MIN_LOGPROB = -1.0      # whisper's own confidence floor
 # utterance — it is a misplaced timestamp. Same value the segmenter breaks
 # lines at (segmenter.GAP_BREAK), so both agree on what a real gap is.
 COVERED_GAP_BRIDGE = 1.5
+
+# A letter, a digit or a CJK/kana/hangul character — anything a viewer
+# could read. `\w` minus the underscore covers every script.
+_CONTENT_RE = re.compile(r"[^\W_]", re.UNICODE)
+
+
+def has_content(text: str) -> bool:
+    """Does *text* contain a single readable character?
+
+    Whisper can decode a whole film into one meaningless symbol. On an 85
+    minute flv it returned 577 segments that were all exactly "-": no
+    dialogue at all, yet every quality gate waved them through — a lone
+    dash compresses to 0.33 and decodes at logprob -0.15, so the
+    repetition and confidence thresholds see a perfectly good transcript.
+    The damage was not just 224 dashes on screen (58% of the finished
+    cues, 577 seconds of screen time) and the tokens spent translating
+    them: those segments also count as transcribed, so the second pass
+    considered those stretches covered and never revisited them, and the
+    LLM review in vet.py was asked to judge recovered lines against a
+    "confirmed" transcript consisting entirely of dashes.
+
+    Dropping these is a local, deterministic rule — a cue with nothing to
+    read is not a cue — and stays within the same authority as the
+    `if not text` check next to it. It is not the LLM-side deletion that
+    vet.py is deliberately barred from applying to the first pass.
+    """
+    return bool(_CONTENT_RE.search(text))
+
 
 # Whisper was trained on subtitle files, and over non-speech it emits what
 # those files contain: closing lines, station announcements, encyclopedia
@@ -386,7 +415,7 @@ def second_pass(
             )
             for seg in found:
                 text = seg.text.strip()
-                if not text:
+                if not text or not has_content(text):
                     continue
                 # A music bed pushes no_speech_prob up even where the
                 # dialogue is perfectly clear (0.85 on lines that turned out
@@ -694,7 +723,9 @@ def coverage_report(
     return speech, covered, misses
 
 
-def _debug_segment(dbg, seg, words: List[Word], offset: float = 0.0) -> None:
+def _debug_segment(
+    dbg, seg, words: List[Word], offset: float = 0.0, note: str = ""
+) -> None:
     """Record one whisper segment verbatim, words and confidences included.
 
     The word timestamps are the point: a several-second gap reported in the
@@ -706,7 +737,8 @@ def _debug_segment(dbg, seg, words: List[Word], offset: float = 0.0) -> None:
         f"logprob={getattr(seg, 'avg_logprob', float('nan')):.2f} "
         f"no_speech={getattr(seg, 'no_speech_prob', float('nan')):.2f} "
         f"compress={getattr(seg, 'compression_ratio', float('nan')):.2f}"
-        f"\n    {seg.text.strip()}"
+        + (f"  ⚠ {note}" if note else "")
+        + f"\n    {seg.text.strip()}"
     )
     if not words:
         return
@@ -746,15 +778,19 @@ def transcribe(
                 min_silence_duration_ms=settings.vad_min_silence_ms,
                 speech_pad_ms=settings.vad_speech_pad_ms,
             )
-        segments_iter, info = model.transcribe(
-            wav_path,
-            language=language,
-            beam_size=settings.beam_size,
-            word_timestamps=settings.word_timestamps,
-            vad_filter=settings.vad_filter,
-            vad_parameters=vad_parameters,
-            initial_prompt=settings.initial_prompt.strip() or None,
-        )
+        def decode(condition: bool = True):
+            return model.transcribe(
+                wav_path,
+                language=language,
+                beam_size=settings.beam_size,
+                word_timestamps=settings.word_timestamps,
+                vad_filter=settings.vad_filter,
+                vad_parameters=vad_parameters,
+                initial_prompt=settings.initial_prompt.strip() or None,
+                condition_on_previous_text=condition,
+            )
+
+        segments_iter, info = decode()
         total = info.duration or 0.0
         after_vad = getattr(info, "duration_after_vad", None)
         if log:
@@ -776,24 +812,66 @@ def transcribe(
                 "\n词级时间戳里出现的异常大间隔，正是字幕被切成半个词的直接原因。\n"
             )
 
-        results: List[Segment] = []
-        for seg in segments_iter:
-            if should_cancel and should_cancel():
-                raise InterruptedError("cancelled")
-            text = seg.text.strip()
-            if not text:
-                continue
-            words = [
-                Word(float(w.start), float(w.end), w.word)
-                for w in (seg.words or [])
-            ]
-            results.append(Segment(float(seg.start), float(seg.end), text, words))
-            if progress and total:
-                progress(min(seg.end / total, 1.0))
+        def collect(segments_iter) -> tuple[List[Segment], int]:
+            out: List[Segment] = []
+            blank = 0
+            for seg in segments_iter:
+                if should_cancel and should_cancel():
+                    raise InterruptedError("cancelled")
+                text = seg.text.strip()
+                if not text:
+                    continue
+                words = [
+                    Word(float(w.start), float(w.end), w.word)
+                    for w in (seg.words or [])
+                ]
+                if progress and total:
+                    progress(min(seg.end / total, 1.0))
+                if not has_content(text):
+                    # kept in the debug log — what whisper said is the
+                    # evidence — but never handed on. See has_content().
+                    blank += 1
+                    if dbg:
+                        _debug_segment(dbg, seg, words, note="无文字内容，已丢弃")
+                    continue
+                out.append(Segment(float(seg.start), float(seg.end), text, words))
+                if log:
+                    log(f"[{seg.start:7.2f}s] {text}")
+                if dbg:
+                    _debug_segment(dbg, seg, words)
+            return out, blank
+
+        results, blank = collect(segments_iter)
+
+        if blank and not results:
+            # Not a quiet film — a decode loop. Whisper primes each window
+            # with what it decoded in the last one, so once it emits a
+            # meaningless symbol the prompt keeps it there for the rest of
+            # the film. Every gate waves it through: a lone dash compresses
+            # to 0.33 at logprob -0.15. The second pass already runs each
+            # window unprimed for exactly this reason; one more decode is a
+            # cheap price for the difference between a subtitle and none.
             if log:
-                log(f"[{seg.start:7.2f}s] {text}")
+                log(f"⚠ 识别结果的 {blank} 段全都没有文字内容（如「-」「…」），"
+                    "判定为解码陷入循环，正在关闭上文关联重新识别…")
             if dbg:
-                _debug_segment(dbg, seg, words)
+                dbg.kv("整片无文字内容", f"{blank} 段 → 关闭上文关联重试")
+            retried, blank = collect(decode(condition=False)[0])
+            if retried:
+                if log:
+                    log(f"重试成功，得到 {len(retried)} 段文字")
+                results = retried
+            elif log:
+                log("⚠ 重试后仍然没有任何文字，请检查音轨是否正确、"
+                    "或改用其它识别模型重试")
+
+        if blank:
+            share = blank / (blank + len(results))
+            note = f"语音识别丢弃了 {blank} 段没有任何文字内容的输出（如「-」「…」「♪」）"
+            if log:
+                log(f"⚠ {note}，占全部输出的 {share:.0%}" if share >= 0.3 else note)
+            if dbg:
+                dbg.kv("无文字内容而丢弃的 segment", f"{blank} 段（占 {share:.0%}）")
 
         # one decode serves both the second pass and the coverage report
         audio = None
