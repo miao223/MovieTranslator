@@ -141,11 +141,12 @@ def describe_media(video_path: str | Path) -> list[str]:
             )
         for track in (_track_info(s) for s in container.streams.audio):
             lines.append(f"音轨          : {describe_track(track)} @{track['sample_rate']}Hz")
+        # via subsource so the log names these the way the picker does —
+        # same language table, and it says which ones hold no readable text
+        from app.services import subsource
+
         for stream in container.streams.subtitles:
-            lines.append(
-                f"内嵌字幕      : #{stream.index} {stream.codec_context.name} "
-                f"{stream.language or '未标注'}"
-            )
+            lines.append(f"内嵌字幕      : {subsource.describe_stream(stream)}")
     return lines
 
 

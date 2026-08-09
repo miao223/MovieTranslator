@@ -190,7 +190,13 @@ def test_attached_fonts_come_through(video, tmp_path):
 
 def test_a_subtitle_track_already_in_the_video_is_kept(tmp_path):
     """Ours is an addition, not a replacement — a release's own subtitles
-    and its attached fonts have to come through."""
+    and its attached fonts have to come through.
+
+    Counting streams is not enough: the first track has to still say what it
+    said, which is exactly what services/subsource.py can now check.
+    """
+    from app.services import subsource
+
     source = tmp_path / "withsubs.mkv"
     make_multitrack_video(source)
     with_extra = tmp_path / "extra.mkv"
@@ -200,6 +206,14 @@ def test_a_subtitle_track_already_in_the_video_is_kept(tmp_path):
     out = mux.embed(with_extra, existing, tmp_path / "twice.mkv", "简体中文")
     kinds = [t for t, _, _ in _streams(out)]
     assert kinds.count("subtitle") == 2
+
+    tracks = subsource.list_tracks(out)
+    assert [t["language"] for t in tracks] == ["eng", "chi"]
+    first = subsource.read_cues(out, tracks[0])
+    # the two display lines of a bilingual cue come back as one line, which
+    # is what the LLM protocol wants; the words and times are untouched
+    assert [l.text for l in first] == ["Hello there 你好", "Goodbye 再见"]
+    assert [round(l.start, 2) for l in first] == [0.5, 1.4]
 
 
 # ------------------------------------------------------- failure handling

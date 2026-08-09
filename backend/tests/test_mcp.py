@@ -51,8 +51,8 @@ async def test_the_advertised_tools_are_the_agreed_set(mcp):
     blast radius than one that can only run jobs."""
     names = {t.name for t in await mcp.list_tools()}
     assert names == {
-        "list_videos", "list_audio_tracks", "get_server_status",
-        "translate_video", "translate_directory",
+        "list_videos", "list_audio_tracks", "list_subtitle_tracks",
+        "get_server_status", "translate_video", "translate_directory",
         "get_job", "get_batch", "cancel_job", "cancel_batch",
         "get_subtitle", "get_job_log",
     }

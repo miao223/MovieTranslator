@@ -28,13 +28,16 @@ from app.models.schemas import (
     SubtitleLine,
 )
 from app.services import (
-    asr, audio, lyrics, mux, refine, segmenter, series, subtitle, vet,
+    asr, audio, lyrics, mux, refine, segmenter, series, subsource, subtitle, vet,
 )
 from app.services.translator import Translator
 
 # overall progress ranges per stage: (start%, end%)
 STAGE_RANGES = {
     "extracting": (0.0, 10.0),
+    # reading a subtitle covers the whole span the other two stages use,
+    # because it replaces both — and takes seconds rather than an hour
+    "importing": (0.0, 60.0),
     "transcribing": (10.0, 60.0),
     "refining": (60.0, 72.0),
     "translating": (72.0, 95.0),
@@ -356,6 +359,159 @@ class JobManager:
             if job.cancel_event.is_set():
                 raise InterruptedError
 
+        # 1-2. get the original text ---------------------------------------
+        # Either from a subtitle the release already carries, or from the
+        # audio. The rest of the pipeline cannot tell which it got.
+        lines: List[SubtitleLine] = []
+        detected = ""
+        segments = None  # whisper's raw output, for the lyric cross-check
+        vet_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
+        from_subtitle = False
+        if req.text_source == "subtitle":
+            got = self._import_subtitle(job, req, debug)
+            if got is not None:
+                lines, detected = got
+                from_subtitle = True
+        if not from_subtitle:
+            lines, detected, segments = self._transcribe(
+                job, req, settings, workdir, debug, check_cancel, vet_usage
+            )
+        (workdir / "transcript.json").write_text(
+            json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+
+        # 3. preprocess the transcript --------------------------------------
+        # rejoin sentences the ASR cut mid-phrase, in the source language and
+        # with mechanical verification — a line holding only a fragment has
+        # no counterpart in the target language, and the translator fills it
+        # with the next line's content, shifting everything after it
+        refine_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
+        if from_subtitle and settings.prompts.refine_enabled:
+            # Every job this pass does — rejoin broken sentences, fix
+            # homophones, restore missing full stops — is a repair of speech
+            # recognition. A subtitle written by a person already has all
+            # three right, and re-deciding its line breaks would only undo
+            # work done against the picture.
+            job.publish(
+                "refining", 60,
+                log="使用已有字幕作为原文，已跳过转写预处理"
+                    "（它是为修复语音识别缺陷设计的，对人工字幕只会打乱断句）",
+            )
+        elif settings.prompts.refine_enabled:
+            job.publish("refining", 60, message="转写预处理中（断句整理 + 识别纠错）…")
+            lines = refine.refine_lines(
+                lines,
+                settings.llm,
+                settings.subtitle,
+                language_hint=detected or "",
+                log=lambda msg: job.publish("refining", job.status.progress, log=msg),
+                progress=lambda f: job.publish(
+                    "refining", 60 + 12 * min(max(f, 0.0), 1.0),
+                    message=f"转写预处理中… {min(max(f, 0.0), 1.0):.0%}",
+                ),
+                should_cancel=job.cancel_event.is_set,
+                network=settings.network,
+                glossary=glossary,
+                debug=debug,
+                usage=refine_usage,
+            )
+            (workdir / "transcript_refined.json").write_text(
+                json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            job.publish("refining", 72, message=f"预处理完成，共 {len(lines)} 条字幕")
+
+        self._finish(job, req, settings, workdir, video, debug, lines, detected,
+                     glossary, shared, refine_usage, vet_usage, segments)
+
+    # ------------------------------------------------------------ sources
+
+    def _import_subtitle(self, job: Job, req: JobRequest, debug: DebugLog):
+        """Read the release's own subtitle. None means "transcribe instead".
+
+        Returns None only for a batch job (see
+        JobRequest.subtitle_fallback_asr): someone who picked a track by hand
+        for a single film is expecting a result in seconds, and silently
+        starting an hour of speech recognition instead would be the surprise
+        this whole feature exists to avoid.
+        """
+        job.publish("importing", 0, message="读取已有字幕…")
+        try:
+            tracks = subsource.all_tracks(req.video_path)
+            if tracks:
+                job.publish(
+                    "importing", 0,
+                    log=f"检测到 {len(tracks)} 条可用字幕：\n"
+                        + "\n".join("  " + subsource.describe_track(t) for t in tracks),
+                )
+            track = subsource.pick_track(
+                tracks, req.subtitle_track, req.subtitle_file, req.subtitle_language
+            )
+            stats: dict = {}
+            lines = subsource.read_cues(
+                req.video_path, track,
+                log=lambda msg: job.publish("importing", 30, log=msg),
+                stats=stats,
+            )
+        except Exception as exc:  # noqa: BLE001 — the message is the point
+            if not req.subtitle_fallback_asr:
+                raise
+            job.publish(
+                "importing", 0,
+                log=f"⚠ 无法使用已有字幕（{exc}），本文件改用语音识别",
+            )
+            return None
+
+        detected = subsource.iso2(track["language"]) if track["language"] else ""
+        source = "来自轨道标签"
+        if req.source_language != "auto":
+            detected, source = req.source_language, "用户指定"
+        elif not detected:
+            detected = subsource.detect_language(lines)
+            source = "按文本判定" if detected else "未能判定"
+        job.publish(
+            "importing", 50,
+            log=f"字幕语言: {detected or '未知'}（{source}）",
+        )
+        if detected and detected == subsource.iso2(
+            mux.language_of(req.target_language)[1]
+        ):
+            # the most likely explanation is a previous run of this program
+            job.publish(
+                "importing", 50,
+                log="⚠ 这份字幕的语言与目标语言相同，请确认它不是本软件上次生成的结果",
+            )
+        if debug.enabled:
+            debug.section("原文来源（已有字幕）")
+            debug.kv("选用", subsource.describe_track(track))
+            debug.kv("条数", len(lines))
+            debug.kv("语言", f"{detected or '未知'}（{source}）")
+            debug.kv("丢弃/合并", f"无文字内容 {stats.get('blank', 0)} 条，"
+                                  f"重叠重复 {stats.get('folded', 0)} 条")
+            debug.kv("已标记歌词", stats.get("lyric", 0))
+            debug.kv("时间轴位移", f"{stats.get('offset', 0.0):.2f}s")
+            debug.line("\n全部字幕轨：")
+            debug.lines("  " + subsource.describe_track(t)
+                        for t in subsource.all_tracks(req.video_path))
+            debug.line("\n前 20 条：")
+            debug.lines(
+                f"[{l.index:4d}] {l.start:8.2f} → {l.end:8.2f} | {l.text}"
+                for l in lines[:20]
+            )
+        job.publish(
+            "importing", 60,
+            message=f"已读取 {len(lines)} 条字幕（语言: {detected or '未知'}），跳过语音识别",
+        )
+        return lines, detected
+
+    def _transcribe(self, job: Job, req: JobRequest, settings, workdir: Path,
+                    debug: DebugLog, check_cancel, vet_usage: dict):
+        """Extract the audio and recognise the speech in it.
+
+        Returns (lines, language, raw segments) — the segments only so the
+        debug log can grade our lyric marking against whisper's own ♪.
+        """
         # 1. extract audio ------------------------------------------------
         job.publish("extracting", 0, message="提取音频…")
         wav = workdir / "audio.wav"
@@ -449,7 +605,6 @@ class JobManager:
         # the real dialogue the pass also recovers, so ask one — before
         # segmentation, while each recovered segment is still a whole
         # sentence with its provenance intact.
-        vet_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
         if any(s.recovered for s in segments):
             job.publish("transcribing", job.status.progress, message="二次识别结果复核中…")
             segments = vet.vet_recovered(
@@ -479,46 +634,20 @@ class JobManager:
                     + ("" if settings.prompts.refine_enabled
                        else "；但转写预处理已关闭，字幕会偏碎，建议开启"),
             )
-        (workdir / "transcript.json").write_text(
-            json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
-            encoding="utf-8",
-        )
         job.publish(
             "transcribing", 60,
             message=f"识别完成，共 {len(lines)} 条字幕（语言: {detected}）",
         )
+        return lines, detected, segments
 
-        # 2c. preprocess the transcript ------------------------------------
-        # rejoin sentences the ASR cut mid-phrase, in the source language and
-        # with mechanical verification — a line holding only a fragment has
-        # no counterpart in the target language, and the translator fills it
-        # with the next line's content, shifting everything after it
-        refine_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
-        if settings.prompts.refine_enabled:
-            job.publish("refining", 60, message="转写预处理中（断句整理 + 识别纠错）…")
-            lines = refine.refine_lines(
-                lines,
-                settings.llm,
-                settings.subtitle,
-                language_hint=detected or "",
-                log=lambda msg: job.publish("refining", job.status.progress, log=msg),
-                progress=lambda f: job.publish(
-                    "refining", 60 + 12 * min(max(f, 0.0), 1.0),
-                    message=f"转写预处理中… {min(max(f, 0.0), 1.0):.0%}",
-                ),
-                should_cancel=job.cancel_event.is_set,
-                network=settings.network,
-                glossary=glossary,
-                debug=debug,
-                usage=refine_usage,
-            )
-            (workdir / "transcript_refined.json").write_text(
-                json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
-            job.publish("refining", 72, message=f"预处理完成，共 {len(lines)} 条字幕")
+    # ------------------------------------------------------------ the rest
 
-        # 2d. mark what is sung rather than spoken -------------------------
+    def _finish(self, job: Job, req: JobRequest, settings, workdir: Path,
+                video: Path, debug: DebugLog, lines: List[SubtitleLine],
+                detected: str, glossary: str, shared, refine_usage: dict,
+                vet_usage: dict, segments=None) -> None:
+        """Mark lyrics, translate, compose, and hand back the result."""
+        # 4. mark what is sung rather than spoken -------------------------
         # After refine, because merging and splitting lines would tear a
         # ♪ … ♪ pair apart; before translation, so the lyrics can be
         # translated as lyrics. It only annotates — a failure marks nothing.
@@ -576,10 +705,13 @@ class JobManager:
                     if clashes else ""
                 )
             )
-        if settings.prompts.mark_lyrics:
+        if settings.prompts.mark_lyrics or any(l.is_lyric for l in lines):
             # the model was asked to keep the ♪; a marker it dropped or moved
             # onto the neighbouring line would be worse than none, so the
-            # flag — not the model's output — has the last word
+            # flag — not the model's output — has the last word. The `any`
+            # covers lyrics marking being off while an imported subtitle
+            # brought its own ♪ — those were stripped on the way in and have
+            # to be written back, or the source's own marks would vanish.
             lyrics.apply_marks(lines)
         job.publish(
             "translating", 95,
@@ -690,8 +822,12 @@ class JobManager:
         But it is an *independent* opinion, and that is enough to grade this
         pass without a human subtitle: the agreements are the confident part,
         and the disagreements are the list worth listening to.
+
+        *segments* is None when the text came from a subtitle rather than
+        from whisper: there is no second opinion to compare against, and the
+        subtitle's own ♪ have already been believed outright.
         """
-        if not debug.enabled:
+        if not debug.enabled or segments is None:
             return
         from app.core.debuglog import fmt_time
 

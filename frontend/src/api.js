@@ -40,6 +40,8 @@ export const api = {
   quickAccess: () => request('/api/fs/quick-access'),
   audioTracks: (path) =>
     request(`/api/media/audio-tracks?path=${encodeURIComponent(path)}`),
+  subtitleTracks: (path) =>
+    request(`/api/media/subtitle-tracks?path=${encodeURIComponent(path)}`),
   promptPreview: (payload) =>
     request('/api/prompts/preview', { method: 'POST', body: JSON.stringify(payload) }),
   modelStatus: (modelSize) =>

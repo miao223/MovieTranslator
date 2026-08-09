@@ -30,7 +30,7 @@ from app.core import joblog
 from app.core.config import load_settings
 from app.core.media import scan_videos
 from app.models.schemas import BatchRequest, JobRequest
-from app.services import audio
+from app.services import audio, subsource
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -130,6 +130,21 @@ def build() -> Optional["FastMCP"]:
         return {"tracks": tracks}
 
     @mcp.tool()
+    async def list_subtitle_tracks(video_path: str) -> dict:
+        """列出视频已有的字幕（内嵌轨 + 同目录同名字幕文件）。
+
+        把其中一条交给 translate_video（text_source="subtitle" 加上
+        subtitle_track 或 subtitle_file），就能跳过语音识别直接翻译现成的
+        原文——又快又准。text 为 false 的是图形字幕（PGS/VobSub），只有图片
+        没有文字，不能用。
+        """
+        path = Path(video_path).expanduser()
+        if not path.is_file():
+            return {"error": f"文件不存在: {path}"}
+        tracks = await anyio.to_thread.run_sync(subsource.all_tracks, path)
+        return {"tracks": tracks}
+
+    @mcp.tool()
     async def get_server_status() -> dict:
         """查询本机翻译服务的版本、识别配置与当前任务情况。不返回任何密钥。"""
         settings = load_settings()
@@ -160,6 +175,9 @@ def build() -> Optional["FastMCP"]:
         audio_track: Optional[int] = None,
         audio_language: str = "",
         embed_subtitle: bool = False,
+        text_source: str = "asr",
+        subtitle_track: Optional[int] = None,
+        subtitle_file: str = "",
     ) -> dict:
         """为一个视频文件启动字幕翻译，立即返回 job_id，不等待完成。
 
@@ -172,16 +190,26 @@ def build() -> Optional["FastMCP"]:
         output_mode: bilingual 双语，translation_only 只要译文。
         audio_track: 音轨的容器序号，留空用默认音轨。
         audio_language: 按语言标签选音轨（如 jpn），仅在 audio_track 留空时生效。
+        text_source: asr 走语音识别；subtitle 直接读片源已有的字幕，跳过识别——
+            片源自带外文字幕时又快又准，先用 list_subtitle_tracks 看有哪些。
+        subtitle_track: 要读取的字幕轨容器序号（text_source="subtitle" 时）。
+            指向图形字幕（PGS/VobSub）会直接失败，因为那里面没有文字。
+        subtitle_file: 改为读取这个外挂字幕文件（.srt/.ass），优先于 subtitle_track。
         embed_subtitle: 开启后不生成字幕文件，而是在同目录产出一个内嵌软字幕的
             新视频（片名.zh.mkv，音视频不重编码）。会完整复制一份视频，注意磁盘空间。
-            生成路径见 get_job 的 video_filename 字段。
+            片源原有的字幕轨会保留。生成路径见 get_job 的 video_filename 字段。
         """
         if output_mode not in ("bilingual", "translation_only"):
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
+        if text_source not in ("asr", "subtitle"):
+            return {"error": "text_source 只能是 asr 或 subtitle"}
         request = JobRequest(
             video_path=video_path,
             audio_track=audio_track,
             audio_language=audio_language,
+            text_source=text_source,  # type: ignore[arg-type]
+            subtitle_track=subtitle_track,
+            subtitle_file=subtitle_file,
             source_language=source_language,
             target_language=target_language,
             synopsis=synopsis,
@@ -206,6 +234,8 @@ def build() -> Optional["FastMCP"]:
         audio_language: str = "",
         series_mode: bool = False,
         embed_subtitle: bool = False,
+        text_source: str = "asr",
+        subtitle_language: str = "",
     ) -> dict:
         """为一个目录下的所有视频批量启动翻译，立即返回 batch_id。
 
@@ -216,16 +246,24 @@ def build() -> Optional["FastMCP"]:
         人名/术语译法会强制沿用到后续每一集；目录里是互不相干的影片则不要
         开启。累积的对照表可在 get_batch 的 glossary 字段查看。
 
+        text_source="subtitle"：直接读每个视频已有的字幕，跳过语音识别。
+        subtitle_language 按语言标签挑轨（如 eng；各文件的轨道序号不同）。
+        找不到可读字幕的那个文件会自动改用语音识别，不影响整批。
+
         embed_subtitle：同 translate_video——每个视频产出一个内嵌软字幕的新 mkv，
         不生成字幕文件。整季剧集会因此多占一整份磁盘空间。
         """
         if output_mode not in ("bilingual", "translation_only"):
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
+        if text_source not in ("asr", "subtitle"):
+            return {"error": "text_source 只能是 asr 或 subtitle"}
         request = BatchRequest(
             directory=directory,
             recursive=recursive,
             skip_existing_srt=skip_translated,
             audio_language=audio_language,
+            text_source=text_source,  # type: ignore[arg-type]
+            subtitle_language=subtitle_language,
             source_language=source_language,
             target_language=target_language,
             synopsis=synopsis,

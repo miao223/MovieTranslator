@@ -203,8 +203,43 @@ class AudioTrack(BaseModel):
     default: bool = False
 
 
+class SubtitleTrack(BaseModel):
+    """One subtitle already in (or beside) the video, offered as the source.
+
+    Reading these instead of transcribing is both more accurate and far
+    faster — see services/subsource.py.
+    """
+
+    index: int  # container stream index; -1 for a sidecar file
+    path: str = ""  # sidecar file path; empty for an embedded track
+    codec: str = ""
+    language: str = ""  # canonical ISO 639-2/B code, "" when untagged
+    language_name: str = ""
+    title: str = ""
+    default: bool = False
+    forced: bool = False  # signs only — never auto-selected
+    # False for PGS/VobSub/DVB: pictures, with no text to read
+    text: bool = True
+
+
 class JobRequest(BaseModel):
     video_path: str
+    # where the original text comes from: speech recognition, or a subtitle
+    # the release already carries (services/subsource.py)
+    text_source: Literal["asr", "subtitle"] = "asr"
+    # container stream index of the subtitle track to read; None = pick one
+    subtitle_track: Optional[int] = None
+    # a sidecar subtitle file to read instead of an embedded track
+    subtitle_file: str = ""
+    # fallback when subtitle_track is None (batch jobs, where indices differ
+    # per file): prefer a track tagged with this language, e.g. "eng"
+    subtitle_language: str = ""
+    # Set by BatchManager, never by a single-file request: transcribe when
+    # this file has no readable subtitle. A directory of episodes should not
+    # stop because one of them lacks a track, while someone who picked a
+    # track by hand for one film expects a clear failure, not a silent hour
+    # of recognition.
+    subtitle_fallback_asr: bool = False
     # container stream index of the audio track to transcribe; None = the
     # track flagged default, else the first one
     audio_track: Optional[int] = None
@@ -236,6 +271,10 @@ class BatchRequest(BaseModel):
     # per-file task params, shared by every video in the batch
     # track indices differ per file, so batches select by language tag instead
     audio_language: str = ""  # e.g. "jpn"; empty = each file's default track
+    # see JobRequest.text_source. A file with no readable subtitle falls back
+    # to speech recognition rather than failing the batch.
+    text_source: Literal["asr", "subtitle"] = "asr"
+    subtitle_language: str = ""  # e.g. "eng"; empty = each file's best track
     source_language: str = "auto"
     target_language: str = "简体中文"
     synopsis: str = ""  # shared synopsis is useful for TV series batches
@@ -253,6 +292,9 @@ class BatchRequest(BaseModel):
 JobStage = Literal[
     "pending",
     "extracting",
+    # reading a subtitle the release already carries, in place of
+    # extracting + transcribing (text_source="subtitle")
+    "importing",
     "transcribing",
     "refining",
     "translating",

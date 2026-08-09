@@ -21,7 +21,7 @@ from typing import Optional
 
 from app.core.cache import _base_dir
 
-APP_VERSION = "0.13.1"
+APP_VERSION = "0.14.0"
 LOG_DIR_NAME = "logs"
 KEEP_LOGS = 20  # newest job logs to retain
 
@@ -174,7 +174,21 @@ class JobLogWriter:
             self.section("媒体信息", [f"（探测失败: {exc}）"])
 
     def write_request(self, request) -> None:
+        if request.text_source == "subtitle":
+            # explains a job that never loads a model or touches the audio
+            source = "片源已有的字幕（跳过语音识别）"
+            if request.subtitle_file:
+                source += f"，文件={Path(request.subtitle_file).name}"
+            elif request.subtitle_track is not None:
+                source += f"，字幕轨 #{request.subtitle_track}"
+            elif request.subtitle_language:
+                source += f"，语言偏好={request.subtitle_language}"
+            if request.subtitle_fallback_asr:
+                source += "（读不到则改用语音识别）"
+        else:
+            source = "语音识别"
         self.section("任务参数", [
+            f"原文来源      : {source}",
             f"源语言        : {request.source_language}",
             f"目标语言      : {request.target_language}",
             f"字幕形式      : {request.output_mode}",

@@ -34,7 +34,10 @@ const mode = ref('single') // 'single' | 'batch'
 
 const form = reactive({
   video_path: '',
+  text_source: 'asr', // 'asr' | 'subtitle'
   audio_track: null, // null = 默认音轨
+  subtitle_track: null,
+  subtitle_file: '',
   source_language: 'auto',
   target_language: '简体中文',
   synopsis: '',
@@ -53,8 +56,22 @@ const batchForm = reactive({
   recursive: true,
   skip_existing_srt: true,
   audio_language: '',
+  subtitle_language: '',
   series_mode: false,
 })
+
+// batch mode picks subtitle tracks by language tag, same reason as audio
+const SUB_LANGS = [
+  { value: '', label: '每个文件里最合适的一条' },
+  { value: 'eng', label: '英语字幕（eng）' },
+  { value: 'jpn', label: '日语字幕（jpn）' },
+  { value: 'chi', label: '中文字幕（chi/zho）' },
+  { value: 'kor', label: '韩语字幕（kor）' },
+  { value: 'fre', label: '法语字幕（fre）' },
+  { value: 'ger', label: '德语字幕（ger）' },
+  { value: 'spa', label: '西班牙语字幕（spa）' },
+  { value: 'rus', label: '俄语字幕（rus）' },
+]
 
 // ------------------------------------------------------------ audio tracks
 const tracks = ref([])
@@ -93,10 +110,56 @@ async function probeTracks() {
   }
 }
 
+// --------------------------------------------------------- subtitle tracks
+// The same choice as the audio track, one step earlier: which stream of this
+// file do the words come from. A release that already carries the dialogue
+// gives a better original than recognition can, in seconds and with no model.
+const subs = ref([])
+const subsState = ref('idle') // 'idle' | 'loading' | 'ok' | 'error'
+const subsError = ref('')
+const subPick = ref(0) // index into subs, so one v-model is not two types
+
+function subLabel(t) {
+  const bits = t.path ? [`外挂 ${t.title}`, t.language_name]
+    : [`#${t.index}`, t.language_name + (t.title ? `「${t.title}」` : '')]
+  bits.push(t.codec)
+  if (t.forced) bits.push('(强制/仅告示牌)')
+  if (t.default) bits.push('(默认)')
+  if (!t.text) bits.push('(图形字幕，无法读取文字)')
+  return bits.filter(Boolean).join(' ')
+}
+
+const readableSubs = computed(() => subs.value.filter((t) => t.text))
+
+async function probeSubs() {
+  const path = form.video_path.trim()
+  subs.value = []
+  subPick.value = 0
+  if (!path) {
+    subsState.value = 'idle'
+    return
+  }
+  subsState.value = 'loading'
+  try {
+    const list = await api.subtitleTracks(path)
+    subs.value = list
+    subsState.value = 'ok'
+    // preselect what the backend would pick: a readable, non-forced track
+    const best = list.findIndex((t) => t.text && !t.forced)
+    subPick.value = best >= 0 ? best : list.findIndex((t) => t.text)
+  } catch (e) {
+    subsState.value = 'error'
+    subsError.value = e.message
+  }
+}
+
 // the path can be typed, pasted or picked in the browser — debounce them all
 watch(() => form.video_path, () => {
   clearTimeout(probeTimer)
-  probeTimer = setTimeout(probeTracks, 400)
+  probeTimer = setTimeout(() => {
+    probeTracks()
+    probeSubs()
+  }, 400)
 })
 
 // 画面翻译 (on-screen text) time points, single-file mode only
@@ -190,6 +253,7 @@ let eventSource = null
 const STAGE_LABELS = {
   pending: '排队中',
   extracting: '提取音频',
+  importing: '读取字幕',
   transcribing: '语音识别',
   refining: '转写预处理',
   translating: 'AI 翻译',
@@ -220,9 +284,18 @@ async function start(frameOnly = false) {
     ElMessage.warning('补充模式至少需要一条画面翻译时间点')
     return
   }
+  // the picker holds one list index; the request wants a stream number or a
+  // file path, and only one of them
+  const chosen = form.text_source === 'subtitle' ? subs.value[subPick.value] : null
+  if (form.text_source === 'subtitle' && !chosen) {
+    ElMessage.warning('这个视频没有可读取的字幕，请改用语音识别')
+    return
+  }
   try {
     const status = await api.createJob({
       ...form,
+      subtitle_track: chosen && !chosen.path ? chosen.index : null,
+      subtitle_file: chosen ? chosen.path : '',
       frame_tasks: tasks,
       frame_only: frameOnly,
     })
@@ -334,6 +407,7 @@ async function startBatch() {
   try {
     batch.value = await api.createBatch({
       ...batchForm,
+      text_source: form.text_source,
       source_language: form.source_language,
       target_language: form.target_language,
       synopsis: form.synopsis,
@@ -416,7 +490,28 @@ onBeforeUnmount(() => {
           </template>
         </el-input>
       </el-form-item>
-      <el-form-item v-if="mode === 'single' && tracksState !== 'idle'" label="音轨">
+      <el-form-item label="原文来源">
+        <el-radio-group v-model="form.text_source">
+          <el-radio value="asr">语音识别</el-radio>
+          <el-radio value="subtitle">片源已有的字幕</el-radio>
+        </el-radio-group>
+        <div class="hint" style="margin: 4px 0 0; display: block">
+          <template v-if="form.text_source === 'subtitle'">
+            直接读取视频<strong>内嵌的软字幕轨</strong>，或同目录里的同名 .srt / .ass，
+            <strong>跳过语音识别</strong>——不下模型、不占 GPU，几秒钟就能进入翻译，
+            原文准确度取决于片源字幕（通常远好于识别结果）。<br>
+            片源自带的字幕轨<strong>不会被改动</strong>；选「合成带字幕的新视频」时也会原样保留。
+            图形字幕（PGS/VobSub，蓝光原盘常见）里只有图片没有文字，读不出来。
+          </template>
+          <template v-else>
+            提取音频后用 Whisper 识别。片源自带外文字幕时，改用「片源已有的字幕」会又快又准。
+          </template>
+        </div>
+      </el-form-item>
+      <el-form-item
+        v-if="mode === 'single' && form.text_source === 'asr' && tracksState !== 'idle'"
+        label="音轨"
+      >
         <template v-if="tracksState === 'loading'">
           <span class="hint" style="margin-left: 0">正在读取音轨…</span>
         </template>
@@ -434,6 +529,39 @@ onBeforeUnmount(() => {
         </template>
         <template v-else>
           <span class="hint" style="margin-left: 0">单音轨：{{ trackLabel(tracks[0]) }}</span>
+        </template>
+      </el-form-item>
+      <el-form-item
+        v-if="mode === 'single' && form.text_source === 'subtitle' && subsState !== 'idle'"
+        label="字幕轨"
+      >
+        <template v-if="subsState === 'loading'">
+          <span class="hint" style="margin-left: 0">正在读取字幕…</span>
+        </template>
+        <template v-else-if="subsState === 'error'">
+          <span class="hint" style="margin-left: 0">无法读取字幕（{{ subsError }}）</span>
+        </template>
+        <template v-else-if="readableSubs.length">
+          <el-select v-model="subPick" style="width: 480px">
+            <el-option
+              v-for="(t, i) in subs" :key="i"
+              :value="i" :label="subLabel(t)" :disabled="!t.text"
+            />
+          </el-select>
+          <span class="hint">
+            共 {{ subs.length }} 条，可读 {{ readableSubs.length }} 条；语言会自动判定
+          </span>
+        </template>
+        <template v-else-if="subs.length">
+          <span class="hint" style="margin-left: 0">
+            这个视频只有图形字幕（{{ subs.map((t) => t.codec).join('、') }}），
+            里面是图片不是文字，读不出来——请改用「语音识别」。
+          </span>
+        </template>
+        <template v-else>
+          <span class="hint" style="margin-left: 0">
+            这个视频没有内建字幕轨，同目录也没有同名的 .srt / .ass——请改用「语音识别」。
+          </span>
         </template>
       </el-form-item>
       <template v-else>
@@ -457,11 +585,19 @@ onBeforeUnmount(() => {
             后面每一集都必须沿用。适合整季剧集；目录里是互不相干的影片时请勿开启
           </span>
         </el-form-item>
-        <el-form-item label="音轨">
+        <el-form-item v-if="form.text_source === 'asr'" label="音轨">
           <el-select v-model="batchForm.audio_language" style="width: 260px">
             <el-option v-for="l in AUDIO_LANGS" :key="l.value" :value="l.value" :label="l.label" />
           </el-select>
           <span class="hint">批量模式下各文件的音轨序号不同，因此按语言标签匹配；找不到该语言的文件回退到默认音轨</span>
+        </el-form-item>
+        <el-form-item v-else label="字幕轨">
+          <el-select v-model="batchForm.subtitle_language" style="width: 260px">
+            <el-option v-for="l in SUB_LANGS" :key="l.value" :value="l.value" :label="l.label" />
+          </el-select>
+          <span class="hint">
+            各文件的字幕轨序号不同，因此按语言标签匹配；<strong>没有可读文字字幕的文件会自动改用语音识别</strong>，不影响整批
+          </span>
         </el-form-item>
       </template>
       <el-form-item label="音频语言">
@@ -661,6 +797,13 @@ onBeforeUnmount(() => {
       :closable="false"
       style="margin-top: 12px"
       title="剧集模式已开启：以上视频将共用同一份人名/术语译名表，请确认它们属于同一部剧"
+    />
+    <el-alert
+      v-if="form.text_source === 'subtitle'"
+      type="info"
+      :closable="false"
+      style="margin-top: 12px"
+      title="将读取每个视频已有的字幕作为原文，跳过语音识别；读不到可用文字字幕的那些会自动改用语音识别"
     />
     <el-alert
       v-if="form.embed_subtitle"

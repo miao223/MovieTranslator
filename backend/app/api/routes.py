@@ -22,8 +22,9 @@ from app.models.schemas import (
     JobRequest,
     JobStatus,
     LLMSettings,
+    SubtitleTrack,
 )
-from app.services import audio, mcp_server, series
+from app.services import audio, mcp_server, series, subsource
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -507,6 +508,23 @@ def media_audio_tracks(path: str) -> list[AudioTrack]:
     except Exception as exc:  # noqa: BLE001 — unreadable/corrupt container
         raise HTTPException(status_code=400, detail=f"无法读取视频: {exc}") from exc
     return [AudioTrack(**t) for t in tracks]
+
+
+@router.get("/media/subtitle-tracks", response_model=list[SubtitleTrack])
+def media_subtitle_tracks(path: str) -> list[SubtitleTrack]:
+    """List the subtitles this video already carries, plus any beside it.
+
+    An empty list is a normal answer — most files have none — so unlike the
+    audio probe this never turns "nothing found" into an error.
+    """
+    p = Path(path.strip().strip('"').strip("'")).expanduser()
+    if not p.is_file():
+        raise HTTPException(status_code=400, detail=f"文件不存在: {p}")
+    try:
+        tracks = subsource.all_tracks(p)
+    except Exception as exc:  # noqa: BLE001 — unreadable/corrupt container
+        raise HTTPException(status_code=400, detail=f"无法读取视频: {exc}") from exc
+    return [SubtitleTrack(**t) for t in tracks]
 
 
 # ------------------------------------------------------------ file browse

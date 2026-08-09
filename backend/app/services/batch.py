@@ -56,6 +56,11 @@ class BatchManager:
                     JobRequest(
                         video_path=str(video),
                         audio_language=req.audio_language,
+                        text_source=req.text_source,
+                        subtitle_language=req.subtitle_language,
+                        # a season where one episode ships without a subtitle
+                        # should translate that episode, not stop the batch
+                        subtitle_fallback_asr=True,
                         source_language=req.source_language,
                         target_language=req.target_language,
                         synopsis=req.synopsis,

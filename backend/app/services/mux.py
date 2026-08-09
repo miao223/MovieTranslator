@@ -71,6 +71,24 @@ def _first_dts(video_path: Path) -> float:
     return 0.0
 
 
+def start_offset(container, video_path: Path) -> float:
+    """Where this container's timeline begins, in seconds.
+
+    Subtracted from every timestamp so the copy starts at zero, matching
+    subtitles that were written against a transcript starting at zero.
+
+    The smallest DTS, not start_time: start_time is a PTS, and with B-frames
+    the first DTS is smaller still (often negative). Subtracting the larger
+    of the two pushes DTS below zero, which matroska cannot store — it drops
+    those packets, and the first of them is the opening keyframe.
+
+    services/subsource.py shifts embedded subtitle cues by this same value
+    when it reads them, so a film's own subtitle track survives a read and a
+    re-embed on the same timeline.
+    """
+    return min(_start_time(container), _first_dts(video_path))
+
+
 def output_path(video: Path, target_language: str) -> Path:
     """Where the muxed film goes: film.mkv -> film.zh.mkv, same folder.
 
@@ -176,14 +194,9 @@ def embed(
             # zero, because the transcript comes from audio decoded from the
             # first frame regardless of its timestamp, so copying the source's
             # timestamps unshifted would slide every cue by that much. This is
-            # what ffmpeg does by default for each input.
-            #
-            # The shift is the smallest DTS, not start_time: start_time is a
-            # PTS, and with B-frames the first DTS is smaller still (often
-            # negative). Subtracting the larger of the two pushes DTS below
-            # zero, which matroska cannot store — it drops those packets, and
-            # the first of them is the opening keyframe.
-            offset = min(_start_time(source), _first_dts(video_path))
+            # what ffmpeg does by default for each input. See start_offset()
+            # for why it is the smallest DTS rather than start_time.
+            offset = start_offset(source, video_path)
             if log and offset >= 1.0:
                 log(f"片源时间轴从 {offset:.1f}s 开始，已整体对齐到 0 以匹配字幕")
             seen = 0
