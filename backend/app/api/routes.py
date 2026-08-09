@@ -204,13 +204,18 @@ def get_settings(request: Request) -> AppSettings:
     remote = settings.model_copy(deep=True)
     if remote.llm.api_key:
         remote.llm.api_key = MASKED
+    if remote.llm.vision_api_key:
+        remote.llm.vision_api_key = MASKED
     return remote
 
 
 @router.put("/settings", response_model=AppSettings)
 def put_settings(settings: AppSettings, request: Request) -> AppSettings:
+    stored = config.load_settings()
     if settings.llm.api_key == MASKED:
-        settings.llm.api_key = config.load_settings().llm.api_key
+        settings.llm.api_key = stored.llm.api_key
+    if settings.llm.vision_api_key == MASKED:
+        settings.llm.vision_api_key = stored.llm.vision_api_key
     # a LAN user who just switched the switch on still needs a way in
     server.ensure_token(settings)
     config.save_settings(settings)

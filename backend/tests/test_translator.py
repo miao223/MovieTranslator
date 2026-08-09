@@ -7,6 +7,7 @@ from app.services.translator import (
     TranslationError,
     Translator,
     estimate_tokens,
+    make_vision_client,
     parse_translations,
     reply_text,
 )
@@ -52,6 +53,36 @@ def settings(**kw):
     return LLMSettings(**defaults)
 
 
+# ------------------------------------------------------ the vision client
+
+
+def test_the_vision_model_uses_the_main_endpoint_by_default():
+    client = make_vision_client(settings(base_url="https://api.x.com/v1",
+                                         api_key="sk-main"))
+    assert str(client.base_url).startswith("https://api.x.com/v1")
+    assert client.api_key == "sk-main"
+
+
+def test_a_vision_endpoint_of_its_own_is_used_and_inherits_no_key():
+    """A VL model on the local GPU and a text model in the cloud both have
+    to be reachable inside one job. A base URL somewhere else is a different
+    operator, so the main key must not travel there."""
+    client = make_vision_client(settings(
+        base_url="https://api.deepseek.com/v1", api_key="sk-main",
+        vision_base_url="http://127.0.0.1:1234/v1",
+    ))
+    assert str(client.base_url).startswith("http://127.0.0.1:1234/v1")
+    assert client.api_key != "sk-main"
+
+
+def test_the_vision_endpoint_can_carry_its_own_key():
+    client = make_vision_client(settings(
+        api_key="sk-main", vision_base_url="https://vision.example/v1",
+        vision_api_key="sk-vision",
+    ))
+    assert client.api_key == "sk-vision"
+
+
 # -------------------------------------------------- reading the response
 
 
@@ -86,6 +117,17 @@ def test_no_choices_at_all_reports_what_the_server_said():
     *'NoneType' object is not subscriptable*, which names nothing useful."""
     with pytest.raises(TranslationError, match="model not loaded"):
         reply_text(Reply(choices=None, error={"message": "model not loaded"}))
+
+
+def test_a_server_with_no_such_route_names_the_likely_cause():
+    """The client appends /chat/completions to the base URL, so a base URL
+    missing its /v1 lands on a path the server has never heard of — which is
+    what almost every "unexpected endpoint" turns out to be."""
+    with pytest.raises(TranslationError, match="/v1"):
+        reply_text(Reply(
+            choices=None,
+            error="Unexpected endpoint or method. (POST /chat/completions)",
+        ))
 
 
 def test_no_choices_and_nothing_to_say_still_fails_cleanly():

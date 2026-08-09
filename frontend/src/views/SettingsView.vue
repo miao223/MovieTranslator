@@ -278,7 +278,22 @@ async function testLLM() {
         </el-form-item>
         <el-form-item label="视觉模型">
           <el-input v-model="settings.llm.vision_model" placeholder="（可选）qwen-vl-plus / gpt-4o-mini / glm-4v …" />
-          <span class="hint">仅画面翻译功能使用，留空则用上方主模型；DeepSeek 等纯文本模型不支持画面翻译</span>
+          <span class="hint">
+            画面翻译、以及「图形字幕 OCR」选用视觉引擎时使用；留空则用上方主模型。
+            DeepSeek 等纯文本模型不支持这两项。
+          </span>
+        </el-form-item>
+        <el-form-item label="视觉 API 地址">
+          <el-input v-model="settings.llm.vision_base_url" placeholder="（可选）http://127.0.0.1:1234/v1" />
+          <span class="hint">
+            视觉模型单独的 base_url，留空＝与上方主接口相同。本地跑 VL 模型、翻译走云端时填这里——
+            两者在同一个任务里先后使用，中途改不了设置。<strong>注意结尾的 /v1 不能少。</strong>
+          </span>
+        </el-form-item>
+        <el-form-item label="视觉 API Key">
+          <el-input v-model="settings.llm.vision_api_key" type="password" show-password
+                    placeholder="（可选）本地服务通常不需要" />
+          <span class="hint">仅在填了上面那个地址时使用；主模型的 Key 不会被发往另一个地址</span>
         </el-form-item>
         <el-form-item label="关闭思考模式">
           <el-switch v-model="settings.llm.disable_thinking" />

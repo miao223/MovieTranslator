@@ -532,10 +532,10 @@ def _read_vision(cues: Sequence[Cue], llm: LLMSettings, settings: OcrSettings,
     handing back a subtitle with holes in it is the one outcome worse than
     stopping.
     """
-    from app.services.translator import make_openai_client
+    from app.services.translator import make_vision_client
 
     if client is None:
-        client = make_openai_client(llm, network)
+        client = make_vision_client(llm, network)
     model = llm.vision_model.strip() or llm.model
     system = build_vision_prompt(language_hint)
     size = max(1, min(settings.vision_batch, MAX_SHEET_ROWS))

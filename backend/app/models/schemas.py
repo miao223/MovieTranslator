@@ -14,9 +14,16 @@ class LLMSettings(BaseModel):
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
-    # vision model for on-screen text translation; empty = use `model`
-    # (needed because strong text models like DeepSeek have no vision)
+    # vision model for on-screen text translation and graphic-subtitle OCR;
+    # empty = use `model` (needed because strong text models like DeepSeek
+    # have no vision)
     vision_model: str = ""
+    # ...and its own endpoint, because the vision model is usually somewhere
+    # else entirely: a VL model running on the local GPU while translation
+    # goes to a cloud provider. Empty = the endpoint above. Both stages run
+    # inside one job, so without this only one of them can be reached.
+    vision_base_url: str = ""
+    vision_api_key: str = ""
     temperature: float = Field(0.3, ge=0.0, le=2.0)
     # Lines translated per output batch, bounded by the model's max output
     # tokens. Bigger batches mean fewer round trips and a conversation that

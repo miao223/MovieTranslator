@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.models.schemas import LLMSettings, NetworkSettings
-from app.services.translator import make_openai_client, reply_text
+from app.services.translator import make_vision_client, reply_text
 
 NO_TEXT_MARKER = "[无文字]"
 
@@ -26,7 +26,7 @@ def translate_frame(
     meaningful text. Raises on API errors — the pipeline catches per task.
     """
     if client is None:
-        client = make_openai_client(llm, network)
+        client = make_vision_client(llm, network)
     model = (llm.vision_model.strip() or llm.model) if llm else "gpt-4o-mini"
 
     b64 = base64.b64encode(Path(image_path).read_bytes()).decode()

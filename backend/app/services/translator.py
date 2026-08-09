@@ -46,6 +46,30 @@ def make_openai_client(settings: LLMSettings, network: Optional[NetworkSettings]
     )
 
 
+def make_vision_client(settings: LLMSettings, network: Optional[NetworkSettings] = None):
+    """Client for the vision model, which usually lives somewhere else.
+
+    A VL model on the local GPU and a text model in the cloud both have to
+    be reachable inside one job — graphic-subtitle OCR runs at the start of
+    it and translation at the end — so the vision model gets an endpoint of
+    its own. Empty means "the same one", which is what every existing
+    configuration says.
+
+    Its key is never inherited: a base URL pointing somewhere else is a
+    different operator, and the main key has no business being sent there.
+    """
+    base = settings.vision_base_url.strip()
+    if not base:
+        return make_openai_client(settings, network)
+    return make_openai_client(
+        settings.model_copy(update={
+            "base_url": base,
+            "api_key": settings.vision_api_key.strip(),
+        }),
+        network,
+    )
+
+
 def build_system_prompt(
     prompts: PromptSettings,
     target_language: str,
@@ -215,7 +239,8 @@ def reply_text(resp) -> str:
     """
     choices = getattr(resp, "choices", None)
     if not choices:
-        raise TranslationError(f"接口没有返回结果：{_server_complaint(resp)}")
+        complaint = _server_complaint(resp)
+        raise TranslationError(f"接口没有返回结果：{complaint}{_routing_hint(complaint)}")
     message = getattr(choices[0], "message", None)
     content = getattr(message, "content", None)
     if isinstance(content, (list, tuple)):  # content parts rather than a string
@@ -228,6 +253,23 @@ def reply_text(resp) -> str:
         # answer, such as it is, over here
         content = getattr(message, "reasoning_content", None) or content
     return (content or "").strip()
+
+
+# a server saying it has no such route, in the several ways they say it
+_NO_SUCH_ROUTE = ("unexpected endpoint", "not found", "404", "no route",
+                  "unknown path", "cannot post")
+
+
+def _routing_hint(complaint: str) -> str:
+    """The one misconfiguration behind almost every "no such route".
+
+    The client appends ``/chat/completions`` to whatever base URL it was
+    given, so a base URL without the ``/v1`` on the end lands on a path the
+    server has never heard of.
+    """
+    if not any(hint in complaint.lower() for hint in _NO_SUCH_ROUTE):
+        return ""
+    return "\n看起来是接口地址不对：检查设置里的 base_url 是否少了结尾的 /v1"
 
 
 def _server_complaint(resp, limit: int = 300) -> str:

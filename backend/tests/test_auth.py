@@ -133,6 +133,23 @@ def test_saving_from_a_remote_page_does_not_wipe_the_key(settings_file):
     assert saved.llm.model == "changed-model"
 
 
+def test_the_vision_key_is_masked_and_kept_the_same_way(settings_file):
+    """It is a second API key in the same object, so it needs the same round
+    trip — a mask that is not restored on save destroys the key."""
+    from app.api.routes import MASKED
+    from app.core import config
+
+    settings_file(
+        server__lan_access=True, server__require_token=False,
+        llm__api_key="sk-real", llm__vision_api_key="sk-vision",
+    )
+    c = remote_client(app())
+    body = c.get("/api/settings").json()
+    assert body["llm"]["vision_api_key"] == MASKED
+    assert c.put("/api/settings", json=body).status_code == 200
+    assert config.load_settings().llm.vision_api_key == "sk-vision"
+
+
 def test_regenerating_the_token_is_loopback_only(settings_file):
     from app.core import config
 

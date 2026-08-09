@@ -21,7 +21,7 @@ from typing import Optional
 
 from app.core.cache import _base_dir
 
-APP_VERSION = "0.15.2"
+APP_VERSION = "0.16.0"
 LOG_DIR_NAME = "logs"
 KEEP_LOGS = 20  # newest job logs to retain
 
@@ -98,7 +98,10 @@ def _settings_lines(settings) -> list[str]:
         f"翻译模型      : {llm.model} @ {llm.base_url} "
         f"(API key: {'已配置' if llm.api_key.strip() else '未配置'}) "
         f"temp={llm.temperature} 每批={llm.batch_size} 上下文={llm.context_limit}",
-        f"视觉模型      : {llm.vision_model or '（同主模型）'}",
+        f"视觉模型      : {llm.vision_model or '（同主模型）'}"
+        + (f" @ {llm.vision_base_url} "
+           f"(API key: {'已配置' if llm.vision_api_key.strip() else '未配置'})"
+           if llm.vision_base_url.strip() else "（同主接口）"),
         f"转写预处理    : {'开' if settings.prompts.refine_enabled else '关'}",
         f"二次识别      : {'开（产物经 LLM 复核）' if asr.second_pass else '关'}",
         f"歌词识别      : {'开（歌词标为 ♪ … ♪）' if settings.prompts.mark_lyrics else '关'}",
