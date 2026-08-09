@@ -325,6 +325,55 @@ def test_llm(llm: LLMSettings):
         return {"ok": False, "error": str(exc)}
 
 
+# what the test picture says; short, unambiguous, and not a word a model
+# could produce by guessing what a test image probably contains
+VISION_PROBE = "MOVIE 42"
+
+
+@router.post("/settings/test-vision")
+def test_vision(llm: LLMSettings):
+    """Prove the vision endpoint works — by sending it an actual picture.
+
+    A text ping proves nothing here: a text-only model answers it perfectly
+    and then fails on the first subtitle. So the request is built exactly
+    the way ocr.py builds its own — one PNG data URL, one instruction — and
+    the answer is checked against what the picture says.
+    """
+    from PIL import Image, ImageDraw
+
+    from app.services.ocr import _label_font, _png_data_url
+    from app.services.translator import make_vision_client, reply_text
+
+    model = llm.vision_model.strip() or llm.model
+    endpoint = llm.vision_base_url.strip() or llm.base_url
+    image = Image.new("L", (440, 90), 255)
+    ImageDraw.Draw(image).text((20, 28), VISION_PROBE, fill=0, font=_label_font())
+    try:
+        client = make_vision_client(llm, config.load_settings().network)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "只输出这张图片里的文字，不要任何解释。"},
+                {"type": "image_url", "image_url": {"url": _png_data_url(image)}},
+            ]}],
+            temperature=0,
+        )
+        reply = reply_text(resp)
+    except Exception as exc:  # noqa: BLE001 — report connectivity errors verbatim
+        return {"ok": False, "error": str(exc), "model": model, "endpoint": endpoint}
+    return {
+        "ok": True,
+        "reply": reply,
+        "model": model,
+        "endpoint": endpoint,
+        "read_it": _squash(VISION_PROBE) in _squash(reply),
+    }
+
+
+def _squash(text: str) -> str:
+    return "".join(text.split()).lower()
+
+
 def _describe_thinking(llm, resp, message, accepted: bool) -> dict:
     """Did the model actually think, and did the switch take effect?
 

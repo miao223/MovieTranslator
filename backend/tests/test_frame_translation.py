@@ -122,3 +122,67 @@ def test_frame_cue_in_srt_and_ass():
 
     ass = build_ass(lines, settings, mode="bilingual")
     assert "{\\an7}短信：马上到家" in ass
+
+
+# --------------------------------------------------- the vision self-test
+
+
+def vision_test(monkeypatch, reply, settings_file):
+    """Run POST /api/settings/test-vision against a scripted endpoint."""
+    from app.main import app as fastapi_app
+    from tests.conftest import local_client
+
+    class Client:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+            self.sent = None
+
+        def create(self, model, messages, temperature, **kw):
+            self.sent = messages
+            if isinstance(reply, Exception):
+                raise reply
+
+            class Obj:
+                pass
+
+            msg, choice, resp = Obj(), Obj(), Obj()
+            msg.content = reply
+            choice.message = msg
+            resp.choices = [choice]
+            return resp
+
+    client = Client()
+    monkeypatch.setattr("app.services.translator.make_vision_client",
+                        lambda *a, **k: client)
+    settings_file()
+    body = local_client(fastapi_app).post(
+        "/api/settings/test-vision",
+        json={"base_url": "http://x/v1", "model": "m", "vision_model": "vl"},
+    ).json()
+    return body, client
+
+
+def test_the_vision_self_test_sends_a_picture_and_checks_it_was_read(
+    monkeypatch, settings_file
+):
+    """A text ping proves nothing here — a text-only model answers it and
+    then fails on the first subtitle. So the probe is a picture."""
+    body, client = vision_test(monkeypatch, "MOVIE 42", settings_file)
+    assert body["ok"] and body["read_it"]
+    assert body["model"] == "vl"
+    content = client.sent[0]["content"]
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_a_model_that_answers_but_cannot_read_is_not_called_working(
+    monkeypatch, settings_file
+):
+    body, _ = vision_test(monkeypatch, "这是一张图片。", settings_file)
+    assert body["ok"] and not body["read_it"]
+
+
+def test_the_vision_self_test_reports_a_failure_verbatim(monkeypatch, settings_file):
+    body, _ = vision_test(monkeypatch, RuntimeError("connection refused"),
+                          settings_file)
+    assert not body["ok"] and "connection refused" in body["error"]

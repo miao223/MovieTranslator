@@ -13,6 +13,7 @@ function pickTheme(value) {
 const settings = ref(null)
 const saving = ref(false)
 const testing = ref(false)
+const testingVision = ref(false)
 const modelDownloaded = ref(null) // null = unknown / loading
 const cuda = ref(null) // { available, device_count }
 const storageInfo = ref(null) // { effective_dir, is_default }
@@ -235,6 +236,31 @@ async function testLLM() {
     testing.value = false
   }
 }
+
+async function testVision() {
+  testingVision.value = true
+  try {
+    const r = await api.testVision(settings.value.llm)
+    const at = `${r.model} @ ${r.endpoint}`
+    if (!r.ok) {
+      ElMessage({ type: 'error', duration: 8000, message: `视觉模型连接失败（${at}）：${r.error}` })
+    } else if (r.read_it) {
+      ElMessage.success(`视觉模型可用（${at}），已正确读出测试图片里的文字`)
+    } else {
+      // it answered, so the endpoint is fine — but it did not read the
+      // picture, which is the only thing this model is here to do
+      ElMessage({
+        type: 'warning', duration: 8000,
+        message: `接口通了（${at}），但模型没能读出测试图片里的文字，回复是「${r.reply}」——`
+          + '多半是这个模型不支持图像输入，或服务端没按视觉模型加载它',
+      })
+    }
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    testingVision.value = false
+  }
+}
 </script>
 
 <template>
@@ -320,6 +346,11 @@ async function testLLM() {
         </el-form-item>
         <el-form-item>
           <el-button :loading="testing" @click="testLLM">测试连接</el-button>
+          <el-button :loading="testingVision" @click="testVision">测试视觉模型</el-button>
+          <span class="hint">
+            视觉测试会发一张写着字的图片过去，要求模型读出来——纯文本模型能答完文字测试，
+            却会在第一条字幕上失败。
+          </span>
         </el-form-item>
       </el-form>
     </el-card>

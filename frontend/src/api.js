@@ -33,6 +33,8 @@ export const api = {
     request('/api/settings', { method: 'PUT', body: JSON.stringify(settings) }),
   testLLM: (llm) =>
     request('/api/settings/test-llm', { method: 'POST', body: JSON.stringify(llm) }),
+  testVision: (llm) =>
+    request('/api/settings/test-vision', { method: 'POST', body: JSON.stringify(llm) }),
   browse: (path) =>
     request(`/api/fs/browse?path=${encodeURIComponent(path || '')}`),
   resolvePath: (path) =>
