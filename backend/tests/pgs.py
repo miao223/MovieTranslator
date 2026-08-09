@@ -213,3 +213,31 @@ def write_two_region_sup(path: Path, start: float, end: float,
     out += _segment(t1, 0x80, b"")
     Path(path).write_bytes(bytes(out))
     return Path(path)
+
+
+def write_repeating_sup(path: Path, start: float, end: float, text: str,
+                        every: float = 1.0) -> Path:
+    """One subtitle, re-sent every *every* seconds without ever clearing.
+
+    Real discs do this — measured on a Blu-ray, 1165 of 2304 consecutive
+    compositions were exactly a second apart with a byte-identical bitmap.
+    """
+    img = render(text)
+    w, h = img.size
+    x, y = (CANVAS[0] - w) // 2, CANVAS[1] - h - 60
+    out = bytearray()
+    at = start
+    while at < end - 1e-6:
+        t = int(at * 90000)
+        out += _segment(t, 0x16, _pcs(0x80, [(0, 0, x, y)]))
+        out += _segment(t, 0x17, _wds([(0, x, y, w, h)]))
+        out += _segment(t, 0x14, _pds(img, "outline"))
+        out += _segment(t, 0x15, _ods(img))
+        out += _segment(t, 0x80, b"")
+        at += every
+    t1 = int(end * 90000)
+    out += _segment(t1, 0x16, _pcs(0x00, []))
+    out += _segment(t1, 0x17, _wds([(0, x, y, w, h)]))
+    out += _segment(t1, 0x80, b"")
+    Path(path).write_bytes(bytes(out))
+    return Path(path)

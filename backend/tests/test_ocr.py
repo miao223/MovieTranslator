@@ -23,7 +23,12 @@ from PIL import Image
 
 from app.models.schemas import JobRequest, LLMSettings, OcrSettings
 from app.services import ocr
-from tests.pgs import render, write_sup, write_two_region_sup
+from tests.pgs import (
+    render,
+    write_repeating_sup,
+    write_sup,
+    write_two_region_sup,
+)
 
 CUES = [(1.0, 3.0, "Hello there"), (4.0, 6.0, "What do you suppose\nthis is?")]
 
@@ -648,3 +653,75 @@ def test_the_ocr_prompt_corrects_but_never_merges():
     assert "同音" not in prompt  # that is the other machine's mistake
     assert "口吃" not in prompt  # ...and so is that
     assert "OCR" in prompt
+
+
+# ------------------------------------------------------- repeated pictures
+
+
+def test_a_subtitle_the_disc_keeps_resending_is_one_cue(tmp_path):
+    """Measured on a Blu-ray: 2305 compositions for 1088 subtitles, each
+    re-sent every second with a byte-identical bitmap. Left alone, every
+    repeat is recognised again, proofread again and translated again, and
+    the finished file breaks each line into a row of one-second copies."""
+    path = write_repeating_sup(tmp_path / "rep.sup", 10.0, 15.0, "Hello there")
+    cues = ocr.bitmap_cues(path, track_for(path), upscale=1)
+    assert len(cues) == 1
+    assert (round(cues[0].start, 2), round(cues[0].end, 2)) == (10.0, 15.0)
+
+
+def test_the_same_line_said_again_later_stays_two_cues(tmp_path):
+    """A character repeating themselves is two subtitles, not an artifact —
+    the same distinction subsource draws for karaoke-timed ASS."""
+    path = write_sup(tmp_path / "twice.sup",
+                     [(1.0, 3.0, "Hello there"), (8.0, 10.0, "Hello there")])
+    cues = ocr.bitmap_cues(path, track_for(path), upscale=1)
+    assert len(cues) == 2
+    assert round(cues[1].start, 2) == 8.0
+
+
+def test_a_different_picture_is_never_folded(tmp_path):
+    path = write_sup(tmp_path / "pair.sup",
+                     [(1.0, 3.0, "Hello there"), (3.0, 5.0, "What is this")])
+    assert len(ocr.bitmap_cues(path, track_for(path), upscale=1)) == 2
+
+
+# ---------------------------------------------------------- reading order
+
+
+def box(x0, y0, x1, y1):
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+
+def test_boxes_on_one_line_are_read_across_however_tall_they_are():
+    """Within a line of Japanese the top of a small kana and the top of a
+    kanji are tens of pixels apart at this scale. Banding on the top edge
+    split one line into several and then sorted them by height: measured on
+    a Blu-ray, 82 cues came back as an exact anagram of themselves."""
+    boxes = [
+        box(40, 150, 300, 260),    # second word, tall glyphs
+        box(700, 120, 900, 260),   # third word, taller still
+        box(10, 30, 400, 120),     # the line above
+        box(20, 175, 35, 255),     # first word, short kana — top 55px lower
+    ]
+    assert ocr.reading_order(boxes) == [2, 3, 0, 1]
+
+
+def test_two_lines_stay_in_order():
+    boxes = [box(10, 200, 500, 300), box(10, 40, 500, 140)]
+    assert ocr.reading_order(boxes) == [1, 0]
+
+
+def test_a_single_box_needs_no_ordering():
+    assert ocr.reading_order([box(0, 0, 10, 10)]) == [0]
+
+
+def test_the_fold_is_reported_so_it_can_be_checked(tmp_path):
+    """A silent 2:1 change in how many subtitles come out is exactly the
+    kind of thing that has to be visible in the log."""
+    path = write_repeating_sup(tmp_path / "rep.sup", 10.0, 15.0, "Hello there")
+    stats: dict = {}
+    said: list = []
+    ocr.read_cues(path, track_for(path), OcrSettings(), stats=stats,
+                  log=said.append, engine=fake_engine(["Hello there"]))
+    assert stats["repeats"] == 4 and stats["cues"] == 1
+    assert any("同图已合并" in line for line in said)

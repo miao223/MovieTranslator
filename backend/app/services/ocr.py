@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import io
 import re
+import statistics
 import threading
 import time
 from collections import deque
@@ -75,6 +76,9 @@ INK_CEILING = 0.5
 # clear, so this only covers a truncated stream.
 DEFAULT_CUE_SECONDS = 4.0
 MAX_CUE_SECONDS = 30.0
+# A repeat of the same picture within this of the last one is the disc
+# re-sending a subtitle that never left the screen (see `_fold_repeats`).
+REPEAT_GAP = 0.1
 # cues are reported this often; recognition of a film runs to thousands
 PROGRESS_EVERY = 25
 # vision engine: a sheet holding more rows than this is asking the model to
@@ -213,6 +217,7 @@ def bitmap_cues(
     track: dict,
     upscale: int = 2,
     should_cancel: Optional[Callable[[], bool]] = None,
+    stats: Optional[dict] = None,
 ) -> List[Cue]:
     """Decode *track*'s bitmaps into black-on-white images with timings."""
     source = Path(track["path"] or video_path)
@@ -264,7 +269,36 @@ def bitmap_cues(
         if open_cue is not None:
             cues.append(open_cue)
     cues.sort(key=lambda c: (c.start, c.end))
-    return cues
+    folded = _fold_repeats(cues)
+    if stats is not None:
+        stats.update({"events": len(cues), "cues": len(folded)})
+    return folded
+
+
+def _fold_repeats(cues: List[Cue]) -> List[Cue]:
+    """Fold a picture the disc re-sends while it is still on screen.
+
+    Measured on a Blu-ray: 1165 of 2304 consecutive cues were exactly one
+    second apart and carried a byte-identical bitmap — 2305 events for
+    1088 subtitles. Every repeat was recognised again, proofread again and
+    translated again, and the finished file showed each line broken into a
+    row of one-second duplicates.
+
+    The rule is subsource's, which was written for karaoke-timed ASS: same
+    content still on screen folds, the same content after a real gap does
+    not. A character saying a line twice is two subtitles.
+    """
+    folded: List[Cue] = []
+    previous = None
+    for cue in cues:
+        picture = (cue.image.size, cue.image.tobytes())
+        if (folded and picture == previous
+                and cue.start <= folded[-1].end + REPEAT_GAP):
+            folded[-1].end = max(folded[-1].end, cue.end)
+            continue
+        folded.append(cue)
+        previous = picture
+    return folded
 
 
 # --------------------------------------------------------------- engines
@@ -429,6 +463,41 @@ def _read_rapidocr(cues: Sequence[Cue], lang: str,
     return out
 
 
+def reading_order(boxes: Sequence) -> List[int]:
+    """Group the detector's boxes into lines, each read left to right.
+
+    Sorting on the top edge in fixed-size bands does not work: within one
+    line of Japanese the top of ``こ`` and the top of ``閒`` are tens of
+    pixels apart at this scale, so a band narrow enough to separate two
+    lines also cuts one line into several, and the fragments then come back
+    sorted by height instead of by position. Measured on a Blu-ray, 82 cues
+    came out as an exact anagram of themselves — ``ねえ これ知ってる？``
+    recognised as ``れ知って てる ねえ ?``.
+
+    So the lines are found first, by clustering the box centres with a
+    tolerance taken from the boxes' own height, and only then is each line
+    read across.
+    """
+    edges = [np.asarray(b, dtype=float) for b in boxes]
+    mid = [float(b[:, 1].min() + b[:, 1].max()) / 2 for b in edges]
+    left = [float(b[:, 0].min()) for b in edges]
+    tall = [float(b[:, 1].max() - b[:, 1].min()) for b in edges]
+    tol = max(1.0, statistics.median(tall) * 0.5)
+
+    order: List[int] = []
+    line: List[int] = []
+    anchor = 0.0
+    for i in sorted(range(len(edges)), key=lambda i: mid[i]):
+        if line and mid[i] - anchor > tol:
+            order.extend(sorted(line, key=lambda j: left[j]))
+            line = []
+        if not line:
+            anchor = mid[i]
+        line.append(i)
+    order.extend(sorted(line, key=lambda j: left[j]))
+    return order
+
+
 def _one(engine, image: Image.Image) -> tuple[str, float]:
     """Recognise one cue: every box the detector found, in reading order."""
     result = engine(np.array(image.convert("RGB")))
@@ -438,12 +507,7 @@ def _one(engine, image: Image.Image) -> tuple[str, float]:
     if not texts:
         return "", 0.0
     if boxes is not None and len(boxes) == len(texts):
-        # top to bottom, then left to right — the order a person reads
-        order = sorted(
-            range(len(texts)),
-            key=lambda i: (round(float(np.min(np.asarray(boxes[i])[:, 1])) / 12),
-                           float(np.min(np.asarray(boxes[i])[:, 0]))),
-        )
+        order = reading_order(boxes)
         texts = [texts[i] for i in order]
         scores = [scores[i] for i in order] if len(scores) == len(order) else scores
     text = " ".join(t.strip() for t in texts if t and t.strip())
@@ -625,11 +689,15 @@ def read_cues(
 ) -> List[SubtitleLine]:
     """Recognise *track* into subtitle lines, ready for proofreading."""
     began = time.monotonic()
-    cues = bitmap_cues(video_path, track, settings.upscale, should_cancel)
+    shape: dict = {}
+    cues = bitmap_cues(video_path, track, settings.upscale, should_cancel, shape)
     if not cues:
         raise ValueError("这条图形字幕轨里没有任何画面")
+    repeats = shape.get("events", len(cues)) - len(cues)
     if log:
-        log(f"图形字幕：{len(cues)} 条，开始 OCR（引擎：{settings.engine}）…")
+        log(f"图形字幕：{len(cues)} 条"
+            + (f"（片源重复发送的 {repeats} 条同图已合并）" if repeats else "")
+            + f"，开始 OCR（引擎：{settings.engine}）…")
 
     lang = language
     if engine is not None:
@@ -666,12 +734,12 @@ def read_cues(
     took = time.monotonic() - began
     if stats is not None:
         stats.update({"cues": len(cues), "blank": blank, "seconds": took,
-                      "language": lang})
+                      "language": lang, "repeats": repeats})
     if log:
         log(f"OCR 完成：{len(lines)} 条"
             + (f"，{blank} 条无文字已丢弃" if blank else "")
             + f"，耗时 {took:.0f}s")
-    _write_debug(debug, track, settings, lang, cues, raw, took)
+    _write_debug(debug, track, settings, lang, cues, raw, took, repeats)
     return lines
 
 
@@ -693,7 +761,7 @@ def _probe_language(cues: Sequence[Cue], network, log, should_cancel) -> tuple[s
 
 def _write_debug(debug, track, settings: OcrSettings, lang: str,
                  cues: Sequence[Cue], raw: Sequence[tuple[float, str, float]],
-                 took: float) -> None:
+                 took: float, repeats: int = 0) -> None:
     """Record what the engine saw and what it said.
 
     The images matter as much as the text: without them there is no telling
@@ -710,6 +778,8 @@ def _write_debug(debug, track, settings: OcrSettings, lang: str,
     debug.kv("识别语言", f"{lang or '未知'} → {rec_language(lang)}")
     debug.kv("放大倍数", f"{settings.upscale}x")
     debug.kv("条数 / 耗时", f"{len(cues)} 条 / {took:.0f}s")
+    if repeats:
+        debug.kv("片源重复发送", f"{repeats} 条同图已合并（原 {len(cues) + repeats} 个事件）")
 
     folder = None
     if debug.path is not None:
