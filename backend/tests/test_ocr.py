@@ -202,6 +202,120 @@ def test_each_language_maps_to_its_recognition_model(code, model):
     assert ocr.rec_language(code) == model
 
 
+def fake_rapidocr(monkeypatch, versions=("PP-OCRv4", "PP-OCRv5", "PP-OCRv6"),
+                  refuse=(), unknown_globals=()):
+    """A stand-in for the library that refuses what the real one refuses.
+
+    RapidOCR validates the parameter dictionary before it looks at a single
+    model: the version and the model size have to arrive as enum instances,
+    and an unknown ``Global.*`` key is an error. Neither was true of what we
+    sent, and every test here passed anyway, because nothing was checking
+    the shape of the dictionary — only the real machine found out.
+    """
+    import enum
+    import sys
+    import types
+
+    def enum_of(name, values):
+        return enum.Enum(name, {v.replace("-", "_").replace(".", "_"): v
+                                for v in values})
+
+    # the subset of Global that the shipped config.yaml actually declares
+    global_keys = {"text_score", "use_det", "use_cls", "use_rec", "font_path",
+                   "log_level", "model_root_dir", "min_side_len", "max_side_len"}
+    global_keys -= set(unknown_globals)
+    enum_params = {"engine_type", "model_type", "ocr_version", "task_type"}
+    attempts: list = []
+
+    class FakeRapidOCR:
+        def __init__(self, params=None):
+            params = params or {}
+            label = tuple(getattr(params.get(k), "value", "")
+                          for k in ("Rec.ocr_version", "Rec.model_type"))
+            attempts.append((label, params))
+            for key, value in params.items():
+                section, _, name = key.rpartition(".")
+                if section == "Global" and name not in global_keys:
+                    raise ValueError(f"{key} is not a valid key.")
+                if name in enum_params and not isinstance(value, enum.Enum):
+                    raise TypeError(f"The value of {key} must be Enum Type.")
+            if " ".join(label) in refuse:
+                raise ValueError(f"Unsupported configuration: {label}")
+
+    mod = types.ModuleType("rapidocr")
+    mod.RapidOCR = FakeRapidOCR
+    mod.OCRVersion = enum_of("OCRVersion", versions)
+    mod.ModelType = enum_of("ModelType", ("mobile", "small", "server"))
+    mod.LangRec = enum_of("LangRec", ("ch", "en", "japan", "korean", "latin",
+                                      "cyrillic"))
+    monkeypatch.setitem(sys.modules, "rapidocr", mod)
+    monkeypatch.setattr(ocr, "_engine", None)
+    monkeypatch.setattr(ocr, "_engine_key", None)
+    monkeypatch.setattr(ocr, "_engine_label", "")
+    return attempts
+
+
+def test_the_parameters_are_the_shape_the_library_demands(monkeypatch):
+    """The strings this used to send were rejected on sight — *The value of
+    Rec.ocr_version must be Enum Type* — before a single cue was read."""
+    attempts = fake_rapidocr(monkeypatch)
+    assert ocr._get_engine("japan", None, None) is not None
+    (_, params), = attempts
+    assert params["Rec.ocr_version"].value == "PP-OCRv6"
+    assert params["Rec.lang_type"].value == "japan"
+    assert params["Global.use_cls"] is False  # a subtitle is never upside down
+
+
+def test_a_model_this_release_does_not_ship_falls_back_to_the_next(monkeypatch):
+    """Which languages each line covers keeps moving — v5 never had Japanese
+    at all — and the library only says so when it goes looking for the file."""
+    attempts = fake_rapidocr(monkeypatch, refuse=("PP-OCRv6 small",))
+    assert ocr._get_engine("japan", None, None) is not None
+    assert [label for label, _ in attempts] == [
+        ("PP-OCRv6", "small"), ("PP-OCRv4", "mobile"),
+    ]
+    # which one answered decides how the recognition reads, so it is on record
+    assert ocr._engine_label == "PP-OCRv4 mobile"
+
+
+def test_a_release_that_predates_a_line_never_asks_for_it(monkeypatch):
+    attempts = fake_rapidocr(monkeypatch, versions=("PP-OCRv4",))
+    ocr._get_engine("japan", None, None)
+    assert [label for label, _ in attempts] == [("PP-OCRv4", "mobile")]
+
+
+def test_a_language_only_the_old_line_reads_goes_straight_there(monkeypatch):
+    attempts = fake_rapidocr(monkeypatch)
+    ocr._get_engine("korean", None, None)
+    assert [label for label, _ in attempts] == [("PP-OCRv4", "mobile")]
+
+
+def test_a_setting_this_release_has_never_heard_of_is_not_fatal(monkeypatch):
+    """An unknown ``Global.*`` key is an error, not something ignored, so one
+    renamed setting would otherwise take every candidate down with it."""
+    attempts = fake_rapidocr(monkeypatch, unknown_globals=("use_cls",))
+    assert ocr._get_engine("korean", None, None) is not None
+    assert len(attempts) == 2  # rejected once, then asked for nothing extra
+    assert not [k for k in attempts[-1][1] if k.startswith("Global.")]
+
+
+def test_when_nothing_loads_the_error_names_the_proxy_switch(monkeypatch):
+    """The likeliest cause is a blocked download, and that has a setting."""
+    fake_rapidocr(monkeypatch, refuse=("PP-OCRv6 small", "PP-OCRv4 mobile"))
+    with pytest.raises(RuntimeError, match="模型下载走代理"):
+        ocr._get_engine("japan", None, None)
+
+
+def test_the_models_are_kept_where_startup_does_not_wipe_them(monkeypatch, tmp_path):
+    attempts = fake_rapidocr(monkeypatch)
+    monkeypatch.setattr("app.services.asr.get_model_cache_dir",
+                        lambda: str(tmp_path))
+    ocr._get_engine("japan", None, None)
+    (_, params), = attempts
+    assert params["Global.model_root_dir"] == str(tmp_path / "rapidocr")
+    assert "Global.model_dir" not in params  # Global has no such key at all
+
+
 def test_boxes_are_read_top_to_bottom_then_left_to_right():
     """A two-line cue comes back as several boxes, and the order they were
     detected in is not the order a person reads them."""

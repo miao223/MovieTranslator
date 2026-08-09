@@ -15,10 +15,10 @@ one obstacle: **the palette is unreachable**. FFmpeg puts it in
 ``AVSubtitleRect.data[1]`` but leaves ``linesize[1]`` at zero, and PyAV
 enumerates planes by linesize, so only the index bitmap is exposed. It turns
 out not to matter. The fill and the outline are *different indices*, and the
-outline wraps around the fill, so eroding the non-transparent mask and
-asking which indices survive separates them by geometry rather than by
-colour: measured on generated discs, the fill scores 1.00 and the outline
-0.29–0.33. Anything above 0.5 is the glyph.
+outline wraps around the fill, so ranking indices by how far their pixels
+sit from the transparent background separates them by geometry rather than
+by colour: measured on generated discs the fill sits around 6.1 and the
+outline around 3.3, anti-aliased edges included.
 """
 
 from __future__ import annotations
@@ -267,6 +267,7 @@ def bitmap_cues(
 
 _engine = None
 _engine_key: Optional[tuple] = None
+_engine_label = ""  # which model answered, for the debug log
 _engine_lock = threading.Lock()
 
 # Which recognition model reads which language. The Japanese dictionary
@@ -278,14 +279,30 @@ _REC_LANG = {
 }
 PROBE_CUES = 10
 
+# Which model reads which language, best first — see `_engine_params`.
+_REC_MODELS = {
+    "japan": (("PP-OCRv6", "small"), ("PP-OCRv4", "mobile")),
+    "en": (("PP-OCRv6", "small"), ("PP-OCRv4", "mobile")),
+    "ch": (("PP-OCRv6", "small"), ("PP-OCRv4", "mobile")),
+    "korean": (("PP-OCRv4", "mobile"),),
+    "cyrillic": (("PP-OCRv4", "mobile"),),
+    "latin": (("PP-OCRv4", "mobile"),),
+}
+_REC_FALLBACK = (("PP-OCRv4", "mobile"),)
+
 
 def rec_language(code: str) -> str:
     return _REC_LANG.get((code or "").lower()[:2], "en")
 
 
 def _get_engine(lang: str, network: Optional[NetworkSettings], log: Optional[LogFn]):
-    """Load RapidOCR once and keep it, the way asr.py keeps whisper."""
-    global _engine, _engine_key
+    """Load RapidOCR once and keep it, the way asr.py keeps whisper.
+
+    Every candidate model is tried in turn: which recognition models a
+    release ships moves around, and the library only finds out it cannot
+    serve a combination when it goes looking for the file.
+    """
+    global _engine, _engine_key, _engine_label
     with _engine_lock:
         if _engine is not None and _engine_key == lang:
             return _engine
@@ -296,37 +313,98 @@ def _get_engine(lang: str, network: Optional[NetworkSettings], log: Optional[Log
 
         from app.services.asr import proxy_env
 
-        if log:
-            log(f"加载 OCR 模型（{lang}）…（仅首次需要下载，约 10–20MB）")
-        params = _engine_params(lang)
-        try:
-            # the download goes out over requests, so the model-download
-            # proxy switch applies here exactly as it does to whisper
-            with proxy_env(network):
-                _engine = RapidOCR(params=params)
-        except Exception as exc:  # noqa: BLE001 — the wording is the point
+        candidates = _engine_params(lang)
+        if not candidates:
             raise RuntimeError(
-                f"OCR 模型加载失败（语言 {lang}）：{exc}\n"
-                "若是下载失败，可在设置里开启「模型下载走代理」后重试"
-            ) from exc
-        _engine_key = lang
-        return _engine
+                f"OCR 模型加载失败：安装的 rapidocr 没有可用于「{lang}」的识别模型，"
+                "请升级 OCR 组件，或把引擎改成「视觉大模型」"
+            )
+        failure: Optional[Exception] = None
+        for label, params in candidates:
+            if log:
+                log(f"加载 OCR 模型（{lang} / {label}）…（仅首次需要下载，约 20–40MB）")
+            try:
+                # the download goes out over requests, so the model-download
+                # proxy switch applies here exactly as it does to whisper
+                with proxy_env(network):
+                    _engine = RapidOCR(params=params)
+            except Exception as exc:  # noqa: BLE001 — on to the next model
+                failure = exc
+                if log:
+                    log(f"  {label} 不可用：{exc}")
+                continue
+            _engine_key, _engine_label = lang, label
+            return _engine
+        raise RuntimeError(
+            f"OCR 模型加载失败（语言 {lang}）：{failure}\n"
+            "若是下载失败，可在设置里开启「模型下载走代理」后重试"
+        ) from failure
 
 
-def _engine_params(lang: str) -> dict:
-    """RapidOCR configuration for one language.
+def _enum_value(name: str, value: str):
+    """Look up one of RapidOCR's enum members by the value it stands for.
 
-    Pinned to PP-OCRv4: the v5 line is reported to be missing the Japanese
-    recognition model, and Japanese is half of what this feature is for.
+    These parameters are refused unless they arrive as enum instances —
+    passing the string ``"PP-OCRv4"`` fails with *The value of
+    Rec.ocr_version must be Enum Type*. Which members exist changes between
+    releases, so a missing one drops that candidate rather than failing.
+    """
+    import rapidocr
+
+    enum = getattr(rapidocr, name, None)
+    if enum is None:
+        return None
+    try:
+        return enum(value)
+    except ValueError:
+        return None
+
+
+def _engine_params(lang: str) -> List[tuple[str, dict]]:
+    """Every RapidOCR configuration worth trying for one language, best first.
+
+    The version and the model size are not free choices: RapidOCR checks the
+    whole (version, language, size) triple against its own model list. The
+    v6 line is a single multilingual model that covers Latin, Japanese and
+    Chinese; v5 has no Japanese model at all; v4 ships one model per
+    language and only in the ``mobile`` size.
     """
     from app.services.asr import get_model_cache_dir
 
-    params = {"Rec.lang_type": lang, "Rec.ocr_version": "PP-OCRv4"}
+    extras = {
+        # a subtitle is never upside down, so the orientation classifier has
+        # nothing to gain and one way to lose
+        "Global.use_cls": False,
+    }
     cache = get_model_cache_dir()
     if cache:
-        # never the core/cache.py tree — that one is wiped on every startup
-        params["Global.model_dir"] = str(Path(cache) / "rapidocr")
-    return params
+        # never the core/cache.py tree — that one is wiped on every startup.
+        # `model_root_dir` is the only directory Global has; anything else
+        # there is rejected as an unknown key.
+        extras["Global.model_root_dir"] = str(Path(cache) / "rapidocr")
+
+    out: List[tuple[str, dict]] = []
+    for version, size in _REC_MODELS.get(lang, _REC_FALLBACK):
+        ocr_version = _enum_value("OCRVersion", version)
+        model_type = _enum_value("ModelType", size)
+        if ocr_version is None or model_type is None:
+            continue  # this rapidocr has never heard of that combination
+        out.append((f"{version} {size}", {
+            # the only one still allowed to be a plain string, but the enum
+            # is what the library's own examples pass
+            "Rec.lang_type": _enum_value("LangRec", lang) or lang,
+            "Rec.ocr_version": ocr_version,
+            "Rec.model_type": model_type,
+            **extras,
+        }))
+    if out:
+        # last resort: everything above is rejected if a single key has been
+        # renamed, and a recogniser that keeps its models in the wrong folder
+        # still beats a job that fails
+        label, params = out[-1]
+        out.append((f"{label}（默认设置）",
+                    {k: v for k, v in params.items() if not k.startswith("Global.")}))
+    return out
 
 
 def _read_rapidocr(cues: Sequence[Cue], lang: str,
@@ -589,7 +667,7 @@ def _write_debug(debug, track, settings: OcrSettings, lang: str,
 
     debug.section("图形字幕 OCR")
     debug.kv("选用", describe_track(track))
-    debug.kv("引擎", settings.engine)
+    debug.kv("引擎", settings.engine + (f"（{_engine_label}）" if _engine_label else ""))
     debug.kv("识别语言", f"{lang or '未知'} → {rec_language(lang)}")
     debug.kv("放大倍数", f"{settings.upscale}x")
     debug.kv("条数 / 耗时", f"{len(cues)} 条 / {took:.0f}s")
