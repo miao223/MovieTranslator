@@ -202,6 +202,50 @@ def chat_completion(client, *, model, messages, temperature, no_thinking=True):
     ), False
 
 
+def reply_text(resp) -> str:
+    """The assistant's text, out of whatever shape the server answered in.
+
+    "OpenAI-compatible" is only mostly true of the servers people run
+    locally. One answers 200 with ``choices: null`` and puts the real
+    complaint in an ``error`` field; another splits the content into typed
+    parts; a reasoning model leaves ``content`` empty and writes into
+    ``reasoning_content``. Reading ``choices[0].message.content`` straight
+    off turns all of that into *'NoneType' object is not subscriptable*,
+    which names neither the server nor the problem.
+    """
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        raise TranslationError(f"接口没有返回结果：{_server_complaint(resp)}")
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    if isinstance(content, (list, tuple)):  # content parts rather than a string
+        content = "".join(
+            (part.get("text") if isinstance(part, dict) else getattr(part, "text", ""))
+            or "" for part in content
+        )
+    if not (content or "").strip():
+        # a reasoning model that ran out of budget mid-thought leaves the
+        # answer, such as it is, over here
+        content = getattr(message, "reasoning_content", None) or content
+    return (content or "").strip()
+
+
+def _server_complaint(resp, limit: int = 300) -> str:
+    """Whatever the server sent instead of an answer, short enough to log."""
+    for attr in ("error", "message", "detail"):
+        value = getattr(resp, attr, None)
+        if value:
+            return str(value)[:limit]
+    for dump in (lambda: resp.model_extra, lambda: resp.model_dump(), lambda: resp):
+        try:
+            value = dump()
+        except Exception:  # noqa: BLE001 — this is the diagnosis, not the job
+            continue
+        if value:
+            return str(value)[:limit]
+    return "（响应为空）"
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate: CJK ≈ 1 token/char, other text ≈ 1 token/4 chars."""
     cjk = sum(1 for c in text if "⺀" <= c <= "鿿" or "　" <= c <= "ヿ")
@@ -283,7 +327,7 @@ class Translator:
             temperature=self.settings.temperature,
             no_thinking=self._no_thinking,
         )
-        content = resp.choices[0].message.content or ""
+        content = reply_text(resp)
         self._account(resp)
         if self.debug:
             self.debug.block(f"翻译响应 #{self._chat_seq}", content)

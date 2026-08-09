@@ -36,7 +36,12 @@ from app.services.segmenter import (
     is_fragment_text,
     open_ended_ratio,
 )
-from app.services.translator import chat_completion, estimate_tokens, make_openai_client
+from app.services.translator import (
+    chat_completion,
+    estimate_tokens,
+    make_openai_client,
+    reply_text,
+)
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[float], None]  # 0..1
@@ -527,7 +532,7 @@ def refine_lines(
                 temperature=0,  # mechanical task: no creativity wanted
                 no_thinking=no_thinking,
             )
-            reply = resp.choices[0].message.content or ""
+            reply = reply_text(resp)
             _tally(usage, resp, dbg)
             if dbg:
                 dbg.block(f"第 {n} 块 请求", user)

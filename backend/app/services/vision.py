@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.models.schemas import LLMSettings, NetworkSettings
-from app.services.translator import make_openai_client
+from app.services.translator import make_openai_client, reply_text
 
 NO_TEXT_MARKER = "[无文字]"
 
@@ -56,7 +56,7 @@ def translate_frame(
         ],
         temperature=0.2,
     )
-    content = (resp.choices[0].message.content or "").strip()
+    content = reply_text(resp)
     if not content or NO_TEXT_MARKER in content:
         return None
     return content

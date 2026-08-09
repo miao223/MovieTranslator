@@ -8,6 +8,7 @@ from app.services.translator import (
     Translator,
     estimate_tokens,
     parse_translations,
+    reply_text,
 )
 
 
@@ -49,6 +50,47 @@ def settings(**kw):
     defaults = dict(base_url="http://x", api_key="k", model="m", batch_size=3)
     defaults.update(kw)
     return LLMSettings(**defaults)
+
+
+# -------------------------------------------------- reading the response
+
+
+class Reply:
+    """Whatever an OpenAI-compatible server felt like returning."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    @staticmethod
+    def of(content, **extra):
+        message = Reply(content=content, **extra)
+        return Reply(choices=[Reply(message=message)])
+
+
+def test_a_plain_answer_is_read_as_before():
+    assert reply_text(Reply.of("  hello  ")) == "hello"
+
+
+def test_an_answer_split_into_parts_is_joined():
+    """Some servers return the content as typed parts rather than a string."""
+    assert reply_text(Reply.of([{"type": "text", "text": "he"},
+                                {"type": "text", "text": "llo"}])) == "hello"
+
+
+def test_a_reasoning_model_that_never_reached_its_answer_is_still_read():
+    assert reply_text(Reply.of("", reasoning_content="思考中…")) == "思考中…"
+
+
+def test_no_choices_at_all_reports_what_the_server_said():
+    """A local endpoint answering 200 with `choices: null` used to surface as
+    *'NoneType' object is not subscriptable*, which names nothing useful."""
+    with pytest.raises(TranslationError, match="model not loaded"):
+        reply_text(Reply(choices=None, error={"message": "model not loaded"}))
+
+
+def test_no_choices_and_nothing_to_say_still_fails_cleanly():
+    with pytest.raises(TranslationError, match="接口没有返回结果"):
+        reply_text(Reply(choices=[]))
 
 
 # ------------------------------------------------------------- parsing

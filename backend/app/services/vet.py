@@ -42,7 +42,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.models.schemas import LLMSettings, NetworkSettings
 from app.services.asr import Segment
-from app.services.translator import chat_completion, estimate_tokens, make_openai_client
+from app.services.translator import (
+    chat_completion,
+    estimate_tokens,
+    make_openai_client,
+    reply_text,
+)
 
 LogFn = Callable[[str], None]
 
@@ -322,7 +327,7 @@ def vet_recovered(
                     temperature=0,  # mechanical judgement: no creativity wanted
                     no_thinking=no_thinking,
                 )
-                reply = resp.choices[0].message.content or ""
+                reply = reply_text(resp)
                 _tally(usage, resp, dbg)
                 if dbg:
                     dbg.block(f"第 {n} 块 响应（第 {attempt} 次）", reply)

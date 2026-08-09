@@ -43,7 +43,12 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from app.models.schemas import LLMSettings, NetworkSettings, SubtitleLine
 from app.services.refine import _overlap, _words
-from app.services.translator import chat_completion, estimate_tokens, make_openai_client
+from app.services.translator import (
+    chat_completion,
+    estimate_tokens,
+    make_openai_client,
+    reply_text,
+)
 
 LogFn = Callable[[str], None]
 
@@ -266,7 +271,7 @@ def mark_lyrics(
                 temperature=0,  # mechanical judgement: no creativity wanted
                 no_thinking=no_thinking,
             )
-            reply = resp.choices[0].message.content or ""
+            reply = reply_text(resp)
             _tally(usage, resp, dbg)
             if dbg:
                 dbg.block(f"第 {n} 块 响应", reply)

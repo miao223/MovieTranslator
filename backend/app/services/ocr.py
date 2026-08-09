@@ -28,13 +28,14 @@ import io
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 import av
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from app.models.schemas import (
     LLMSettings,
@@ -79,7 +80,11 @@ PROGRESS_EVERY = 25
 # vision engine: a sheet holding more rows than this is asking the model to
 # lose count, and losing count voids the whole sheet
 MAX_SHEET_ROWS = 40
-LABEL_WIDTH = 90  # room for "[123]" beside each row of a sheet
+LABEL_WIDTH = 130  # room for "[1234]" beside each row of a sheet
+# The number is downscaled by the server exactly as much as the subtitle
+# is, and a model that cannot read the labels fails the coverage check on
+# every sheet. PIL's unscaled default font is 11px.
+LABEL_SIZE = 28
 # how many binarised cues the debug log keeps as PNGs
 DEBUG_IMAGES = 30
 
@@ -448,16 +453,25 @@ def _one(engine, image: Image.Image) -> tuple[str, float]:
 # ------------------------------------------------------- the vision engine
 
 
+def _label_font():
+    try:
+        return ImageFont.load_default(size=LABEL_SIZE)  # Pillow >= 10.1
+    except TypeError:
+        return ImageFont.load_default()
+
+
 def _sheet(cues: Sequence[Cue], first: int) -> Image.Image:
     """Stack cues into one labelled image, so one call reads many lines."""
     width = LABEL_WIDTH + max(c.image.width for c in cues)
     height = sum(c.image.height + 16 for c in cues)
     sheet = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(sheet)
+    font = _label_font()
     y = 0
     for n, cue in enumerate(cues, start=first):
         sheet.paste(cue.image, (LABEL_WIDTH, y))
-        draw.text((8, y + cue.image.height // 2 - 6), f"[{n}]", fill=0)
+        draw.text((8, y + cue.image.height // 2 - LABEL_SIZE // 2),
+                  f"[{n}]", fill=0, font=font)
         y += cue.image.height + 16
         draw.line((0, y - 8, width, y - 8), fill=160)
     return sheet
@@ -509,9 +523,14 @@ def _read_vision(cues: Sequence[Cue], llm: LLMSettings, settings: OcrSettings,
     """Transcribe the cues with a vision model, a sheet at a time.
 
     Verified the way every other model answer in this project is: the reply
-    must cover exactly the numbers that were on the sheet. A sheet that
-    cannot be verified after one retry aborts the whole pass rather than
-    handing back a subtitle with holes in it.
+    must cover exactly the numbers that were on the sheet.
+
+    A sheet that will not verify is halved and tried again. The likeliest
+    reason a self-hosted endpoint turns one down is that the picture, or the
+    reply it would need to write, is over some limit of its own, and half a
+    sheet is under it. Only a single cue failing twice aborts the pass —
+    handing back a subtitle with holes in it is the one outcome worse than
+    stopping.
     """
     from app.services.translator import make_openai_client
 
@@ -520,51 +539,71 @@ def _read_vision(cues: Sequence[Cue], llm: LLMSettings, settings: OcrSettings,
     model = llm.vision_model.strip() or llm.model
     system = build_vision_prompt(language_hint)
     size = max(1, min(settings.vision_batch, MAX_SHEET_ROWS))
-    out: List[tuple[str, float]] = []
 
-    for start in range(0, len(cues), size):
+    texts: dict[int, str] = {}
+    queue = deque((start, list(cues[start: start + size]))
+                  for start in range(0, len(cues), size))
+    while queue:
         if should_cancel and should_cancel():
             raise InterruptedError
-        batch = cues[start: start + size]
-        expected = list(range(start + 1, start + 1 + len(batch)))
-        url = _png_data_url(_sheet(batch, expected[0]))
-        parsed: dict[int, str] = {}
-        for attempt in (1, 2):
-            try:
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": system},
-                            {"type": "image_url", "image_url": {"url": url}},
-                        ],
-                    }],
-                    temperature=0,
-                )
-                parsed = parse_sheet(resp.choices[0].message.content or "")
-            except Exception as exc:  # noqa: BLE001
+        offset, batch = queue.popleft()
+        parsed = _read_sheet(client, model, system, batch, offset + 1, log)
+        if parsed is None:
+            if len(batch) > 1:
+                half = len(batch) // 2
+                queue.appendleft((offset + half, batch[half:]))
+                queue.appendleft((offset, batch[:half]))
                 if log:
-                    log(f"⚠ 视觉识别第 {expected[0]}–{expected[-1]} 条失败"
-                        f"（第 {attempt} 次）：{exc}")
-                parsed = {}
-            if set(parsed) == set(expected):
-                break
-            if log and parsed:
-                log(f"⚠ 第 {expected[0]}–{expected[-1]} 条的编号覆盖校验未通过"
-                    f"（应有 {len(expected)} 条，收到 {len(parsed)} 条）")
-            parsed = {}
-        if not parsed:
+                    log(f"  拆成 {half} + {len(batch) - half} 条再试")
+                continue
             raise RuntimeError(
-                f"视觉识别在第 {expected[0]}–{expected[-1]} 条上连续失败，已中止；"
+                f"视觉识别在第 {offset + 1} 条上连续失败，已中止；"
                 "可改用本地 OCR 引擎，或换一个视觉模型"
             )
-        for n in expected:
-            text = parsed[n]
-            out.append(("" if text == _NOTHING else text, 1.0))
+        texts.update(parsed)
         if progress:
-            progress(min((start + len(batch)) / len(cues), 1.0))
-    return out
+            progress(min(len(texts) / len(cues), 1.0))
+    return [("" if texts[n] == _NOTHING else texts[n], 1.0)
+            for n in range(1, len(cues) + 1)]
+
+
+def _read_sheet(client, model: str, system: str, batch: Sequence[Cue],
+                first: int, log: Optional[LogFn]) -> Optional[dict[int, str]]:
+    """One sheet, one retry. None means it could not be verified."""
+    from app.services.translator import reply_text
+
+    expected = set(range(first, first + len(batch)))
+    image = _sheet(batch, first)
+    url = _png_data_url(image)
+    where = (f"第 {first}–{first + len(batch) - 1} 条" if len(batch) > 1
+             else f"第 {first} 条")
+    for attempt in (1, 2):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": system},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                }],
+                temperature=0,
+            )
+            parsed = parse_sheet(reply_text(resp))
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                # the picture's size is half the diagnosis when an endpoint
+                # refuses a request outright
+                log(f"⚠ 视觉识别{where}失败（第 {attempt} 次）：{exc}"
+                    f"（图 {image.width}×{image.height}，请求 {len(url) // 1024}KB）")
+            continue
+        if set(parsed) == expected:
+            return parsed
+        if log:
+            log(f"⚠ {where}的编号覆盖校验未通过"
+                f"（应有 {len(expected)} 条，收到 {len(parsed)} 条）")
+    return None
 
 
 # ------------------------------------------------------------- entry point

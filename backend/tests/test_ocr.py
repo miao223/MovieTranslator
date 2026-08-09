@@ -337,7 +337,11 @@ def test_boxes_are_read_top_to_bottom_then_left_to_right():
 
 
 class FakeVision:
-    """Records the requests and replays scripted replies."""
+    """Records the requests and replays scripted replies.
+
+    The last reply sticks once the script runs out, so "this endpoint is
+    simply broken" is one entry rather than a guess at the call count.
+    """
 
     def __init__(self, replies):
         self.replies = list(replies)
@@ -347,7 +351,7 @@ class FakeVision:
 
     def create(self, model, messages, temperature, **kw):
         self.calls.append(messages)
-        reply = self.replies.pop(0)
+        reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
         if isinstance(reply, Exception):
             raise reply
 
@@ -377,14 +381,63 @@ def test_the_sheet_carries_the_pictures_and_their_numbers():
     assert "原样抄写" in content[0]["text"]
 
 
-def test_a_sheet_the_model_lost_count_of_is_retried_then_abandoned():
+def test_the_sheet_numbers_are_drawn_big_enough_to_survive_downscaling():
+    """The server shrinks the sheet as one picture, so the label shrinks with
+    the subtitle. PIL's unscaled default font is 11px tall — on a sheet two
+    thousand pixels wide that comes back as a smudge, and a label the model
+    cannot read fails the coverage check on every single sheet."""
+    sheet = ocr._sheet(vision_cues(2), 1)
+    column = np.array(sheet)[:, :ocr.LABEL_WIDTH]
+    rows = np.where((column < 128).any(axis=1))[0]
+    assert rows.size, "the numbers are not on the sheet at all"
+    assert (column < 128).sum() > 300  # 47 per label at the default size
+
+
+def test_a_sheet_the_model_lost_count_of_is_halved_before_being_abandoned():
     """Half a subtitle is worse than a clear failure — the caller can fall
-    back to speech recognition, but it cannot fill in holes it never sees."""
-    client = FakeVision(["[1] one\n[3] three", "[1] one\n[2] two"])
-    with pytest.raises(RuntimeError, match="连续失败"):
+    back to speech recognition, but it cannot fill in holes it never sees.
+    Only a single cue that will not read ends the pass, though: the usual
+    reason a self-hosted endpoint refuses a sheet is a limit of its own."""
+    client = FakeVision(["[1] one\n[3] three"])  # never covers its numbers
+    with pytest.raises(RuntimeError, match="第 1 条上连续失败"):
         ocr._read_vision(vision_cues(), LLMSettings(model="m"),
                          OcrSettings(vision_batch=10), client=client)
-    assert len(client.calls) == 2  # one retry, then it stops
+    assert len(client.calls) == 4  # three at once, twice; then one, twice
+
+
+def test_a_sheet_the_endpoint_will_not_take_is_split_and_read():
+    """What a local deployment usually objects to is the size of the
+    request, and it stops objecting once the sheet is halved."""
+    client = FakeVision([
+        RuntimeError("payload too large"), RuntimeError("payload too large"),
+        "[1] one\n[2] two", "[3] three\n[4] four",
+    ])
+    out = ocr._read_vision(vision_cues(4), LLMSettings(model="m"),
+                           OcrSettings(vision_batch=10), client=client)
+    assert [t for t, _s in out] == ["one", "two", "three", "four"]
+
+
+def test_a_server_that_answers_without_any_choices_says_what_it_said():
+    """A local endpoint can answer 200 with `choices: null` and the real
+    complaint alongside it; reading choices[0] off that gives a TypeError
+    naming neither the server nor the problem."""
+    class NoChoices(FakeVision):
+        def create(self, model, messages, temperature, **kw):
+            self.calls.append(messages)
+
+            class Resp:
+                choices = None
+                error = {"message": "model not loaded"}
+
+            return Resp()
+
+    client, said = NoChoices([""]), []
+    with pytest.raises(RuntimeError, match="连续失败"):
+        ocr._read_vision(vision_cues(1), LLMSettings(model="m"),
+                         OcrSettings(vision_batch=10), client=client,
+                         log=said.append)
+    assert any("model not loaded" in line for line in said)
+    assert any("图 " in line for line in said)  # and how big the picture was
 
 
 def test_a_transient_api_error_gets_one_more_try():

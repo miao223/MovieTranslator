@@ -286,6 +286,7 @@ def test_llm(llm: LLMSettings):
         _THINKING_OFF,
         _rejects_thinking,
         make_openai_client,
+        reply_text,
     )
 
     try:
@@ -308,8 +309,8 @@ def test_llm(llm: LLMSettings):
             resp = client.chat.completions.create(
                 model=llm.model, messages=messages, temperature=0,
             )
+        reply = reply_text(resp)  # raises with the server's own words
         message = resp.choices[0].message
-        reply = (getattr(message, "content", "") or "").strip()
         return {
             "ok": True,
             "reply": reply,
