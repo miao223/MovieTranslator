@@ -125,11 +125,13 @@ function subLabel(t) {
   bits.push(t.codec)
   if (t.forced) bits.push('(强制/仅告示牌)')
   if (t.default) bits.push('(默认)')
-  if (!t.text) bits.push('(图形字幕，无法读取文字)')
+  if (!t.text) bits.push('(图形字幕，将用 OCR 识别)')
   return bits.filter(Boolean).join(' ')
 }
 
-const readableSubs = computed(() => subs.value.filter((t) => t.text))
+const graphicPicked = computed(
+  () => form.text_source === 'subtitle' && subs.value[subPick.value]?.text === false,
+)
 
 async function probeSubs() {
   const path = form.video_path.trim()
@@ -144,9 +146,12 @@ async function probeSubs() {
     const list = await api.subtitleTracks(path)
     subs.value = list
     subsState.value = 'ok'
-    // preselect what the backend would pick: a readable, non-forced track
-    const best = list.findIndex((t) => t.text && !t.forced)
-    subPick.value = best >= 0 ? best : list.findIndex((t) => t.text)
+    // preselect what the backend would pick: text before graphic, and a
+    // forced track (signs only) behind both
+    const rank = (t) => (t.text ? 0 : 2) + (t.forced ? 1 : 0)
+    subPick.value = list.length
+      ? list.indexOf(list.reduce((a, b) => (rank(b) < rank(a) ? b : a)))
+      : 0
   } catch (e) {
     subsState.value = 'error'
     subsError.value = e.message
@@ -288,7 +293,7 @@ async function start(frameOnly = false) {
   // file path, and only one of them
   const chosen = form.text_source === 'subtitle' ? subs.value[subPick.value] : null
   if (form.text_source === 'subtitle' && !chosen) {
-    ElMessage.warning('这个视频没有可读取的字幕，请改用语音识别')
+    ElMessage.warning('这个视频没有可用的字幕，请改用语音识别')
     return
   }
   try {
@@ -541,22 +546,19 @@ onBeforeUnmount(() => {
         <template v-else-if="subsState === 'error'">
           <span class="hint" style="margin-left: 0">无法读取字幕（{{ subsError }}）</span>
         </template>
-        <template v-else-if="readableSubs.length">
+        <template v-else-if="subs.length">
           <el-select v-model="subPick" style="width: 480px">
             <el-option
-              v-for="(t, i) in subs" :key="i"
-              :value="i" :label="subLabel(t)" :disabled="!t.text"
+              v-for="(t, i) in subs" :key="i" :value="i" :label="subLabel(t)"
             />
           </el-select>
-          <span class="hint">
-            共 {{ subs.length }} 条，可读 {{ readableSubs.length }} 条；语言会自动判定
-          </span>
-        </template>
-        <template v-else-if="subs.length">
-          <span class="hint" style="margin-left: 0">
-            这个视频只有图形字幕（{{ subs.map((t) => t.codec).join('、') }}），
-            里面是图片不是文字，读不出来——请改用「语音识别」。
-          </span>
+          <span class="hint">共 {{ subs.length }} 条；语言会自动判定</span>
+          <div v-if="graphicPicked" class="hint" style="margin: 4px 0 0; display: block">
+            这条是<strong>图形字幕</strong>（蓝光/DVD 原盘存的是图片不是文字），
+            会先做 <strong>OCR</strong> 识别再翻译——比读文字字幕慢，也可能认错个别字，
+            之后会自动过一道校对来纠正形近字。引擎和识别语言在「设置 →
+            图形字幕 OCR」里调整。
+          </div>
         </template>
         <template v-else>
           <span class="hint" style="margin-left: 0">

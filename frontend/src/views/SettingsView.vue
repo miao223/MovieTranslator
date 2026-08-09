@@ -111,6 +111,17 @@ function fmtModelSize(mb) {
 }
 const COMPUTE_TYPES = ['int8', 'int8_float16', 'float16', 'float32']
 
+// which recognition model reads the graphic subtitles (services/ocr.py)
+const OCR_LANGS = [
+  { value: '', label: '自动判定' },
+  { value: 'en', label: '英语' },
+  { value: 'ja', label: '日语' },
+  { value: 'zh', label: '中文' },
+  { value: 'ko', label: '韩语' },
+  { value: 'ru', label: '俄语' },
+  { value: 'fr', label: '法语 / 其它拉丁字母' },
+]
+
 // preview box is ~1/3 of a 1080p frame's height, scale fonts accordingly
 const PREVIEW_SCALE = 0.33
 const transStyle = computed(() => ({
@@ -577,6 +588,50 @@ async function testLLM() {
           </el-form-item>
         </template>
       </el-form>
+    </el-card>
+
+    <el-card shadow="never" class="section">
+      <template #header>🔤 图形字幕 OCR</template>
+      <el-form label-width="150px">
+        <el-form-item label="识别引擎">
+          <el-radio-group v-model="settings.ocr.engine">
+            <el-radio value="rapidocr">本地 OCR（RapidOCR）</el-radio>
+            <el-radio value="vision">视觉大模型</el-radio>
+          </el-radio-group>
+          <div class="hint" style="margin: 4px 0 0; display: block">
+            <template v-if="settings.ocr.engine === 'rapidocr'">
+              本地运行、不联网、不花钱，一部片几十秒。首次使用会自动下载约 10–20MB 的模型。<br>
+              需要先安装 OCR 组件：<code>pip install -e ".[ocr]"</code>
+              （Windows 为 <code>.venv\Scripts\pip</code>，Linux 为 <code>.venv/bin/pip</code>）。
+            </template>
+            <template v-else>
+              走上面「视觉模型」那一栏配置的模型（留空则用主模型），要联网、按 token 计费。
+              日文的识别质量通常更好，但一部片会发出几十到上百次请求。
+            </template>
+          </div>
+        </el-form-item>
+        <el-form-item label="识别语言">
+          <el-select v-model="settings.ocr.language" style="width: 200px">
+            <el-option v-for="l in OCR_LANGS" :key="l.value" :value="l.value" :label="l.label" />
+          </el-select>
+          <span class="hint">留空则先看字幕轨的语言标签，没有标签时试认几条再判定</span>
+        </el-form-item>
+        <el-form-item label="放大倍数">
+          <el-input-number v-model="settings.ocr.upscale" :min="1" :max="4" />
+          <span class="hint">识别前把字幕图放大几倍；DVD（720×480）这类小图调到 3 会更准，1080p 用 2 即可</span>
+        </el-form-item>
+        <el-form-item v-if="settings.ocr.engine === 'vision'" label="每批条数">
+          <el-input-number v-model="settings.ocr.vision_batch" :min="1" :max="40" />
+          <span class="hint">一次请求拼几条字幕。越大越省钱越快，但模型数错行号时整批作废重来</span>
+        </el-form-item>
+      </el-form>
+      <div class="model-notes">
+        <p><strong>📌 什么时候会用到</strong></p>
+        <p>· 蓝光原盘的字幕（PGS）、DVD 的字幕（VobSub）里存的是<strong>图片</strong>不是文字，
+          必须先 OCR 才能翻译。首页「原文来源」选「片源已有的字幕」并选中这类轨道时自动启用。</p>
+        <p>· OCR 的结果会再过一道<strong>同语言校对</strong>（复用「转写预处理」开关），
+          专门纠正口/ロ、力/カ、rn/m 这类形近字误识别——这是握有全片上下文的模型最擅长的事。</p>
+      </div>
     </el-card>
 
     <el-card shadow="never" class="section">

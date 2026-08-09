@@ -15,7 +15,12 @@ from pathlib import Path
 import av
 import pytest
 
-from app.models.schemas import JobRequest, SubtitleLine, SubtitleSettings
+from app.models.schemas import (
+    AppSettings,
+    JobRequest,
+    SubtitleLine,
+    SubtitleSettings,
+)
 from app.services import mux, subsource, subtitle
 from tests.test_audio_tracks import make_multitrack_video
 
@@ -149,27 +154,25 @@ def test_a_language_preference_beats_the_default_flag():
     assert subsource.pick_track(tracks, language="ja")["index"] == 3
 
 
-def test_naming_a_bitmap_track_is_refused_rather_than_worked_around():
-    """Silently picking a different track would translate something the user
-    did not ask for; silently transcribing would take an hour they did not
-    ask for either."""
-    tracks = [
-        {"index": 2, "path": "", "text": False, "forced": False, "default": True,
-         "language": "eng", "codec": "HDMV_PGS_SUBTITLE",
-         "language_name": "英语", "title": ""},
-        {"index": 3, "path": "", "text": True, "forced": False, "default": False,
-         "language": "jpn", "codec": "ASS", "language_name": "日语", "title": ""},
-    ]
-    with pytest.raises(ValueError, match="图片"):
-        subsource.pick_track(tracks, index=2)
+BITMAP = {"index": 2, "path": "", "text": False, "forced": False,
+          "default": True, "language": "eng", "codec": "HDMV_PGS_SUBTITLE",
+          "language_name": "英语", "title": ""}
+TEXT = {"index": 3, "path": "", "text": True, "forced": False,
+        "default": False, "language": "jpn", "codec": "ASS",
+        "language_name": "日语", "title": ""}
 
 
-def test_a_video_with_only_bitmap_subtitles_says_so():
-    tracks = [{"index": 2, "path": "", "text": False, "forced": False,
-               "default": True, "language": "", "codec": "DVD_SUBTITLE",
-               "language_name": "未标注语言", "title": ""}]
-    with pytest.raises(ValueError, match="图形字幕"):
-        subsource.pick_track(tracks)
+def test_a_text_track_always_beats_a_graphic_one():
+    """Graphic tracks are readable now (services/ocr.py), but OCR costs
+    minutes and can misread; a text track is free and exact."""
+    assert subsource.pick_track([BITMAP, TEXT])["index"] == 3
+    assert subsource.pick_track([TEXT, BITMAP])["index"] == 3
+    # ...even when the graphic one is the flagged default, as it is here
+
+
+def test_a_graphic_track_is_returned_when_it_is_asked_for_or_is_all_there_is():
+    assert subsource.pick_track([BITMAP, TEXT], index=2)["index"] == 2
+    assert subsource.pick_track([BITMAP])["index"] == 2
 
 
 def test_no_subtitle_at_all_is_its_own_message():
@@ -360,11 +363,12 @@ def test_importing_never_reaches_the_recogniser(tmp_path, monkeypatch):
     monkeypatch.setattr(audio, "extract_audio", lambda *a, **k: pytest.fail("audio ran"))
 
     job = pipeline.Job(JobRequest(video_path=str(out), text_source="subtitle"))
-    lines, detected = pipeline.manager._import_subtitle(
-        job, job.request, DebugLog(None, enabled=False)
+    lines, detected, kind = pipeline.manager._import_subtitle(
+        job, job.request, AppSettings(), DebugLog(None, enabled=False)
     )
     assert [l.text for l in lines] == [c.text for c in CUES]
     assert detected == "en"
+    assert kind == "subtitle"  # typed by a person, so no proofreading pass
     assert job.status.stage == "importing"
 
 
@@ -412,7 +416,7 @@ def test_a_single_file_job_fails_loudly_when_the_subtitle_is_unusable(tmp_path):
     job = pipeline.Job(JobRequest(video_path=str(plain), text_source="subtitle"))
     with pytest.raises(ValueError, match="没有内建字幕轨"):
         pipeline.manager._import_subtitle(
-            job, job.request, DebugLog(None, enabled=False)
+            job, job.request, AppSettings(), DebugLog(None, enabled=False)
         )
 
 
@@ -426,7 +430,7 @@ def test_a_batch_job_transcribes_that_file_instead(tmp_path):
         video_path=str(plain), text_source="subtitle", subtitle_fallback_asr=True
     ))
     got = pipeline.manager._import_subtitle(
-        job, job.request, DebugLog(None, enabled=False)
+        job, job.request, AppSettings(), DebugLog(None, enabled=False)
     )
     assert got is None  # the caller falls through to _transcribe
     assert any("改用语音识别" in e.log for e in job.events)

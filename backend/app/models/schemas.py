@@ -158,6 +158,27 @@ class PromptSettings(BaseModel):
     custom_system_prompt: str = ""
 
 
+class OcrSettings(BaseModel):
+    """Reading graphic subtitle tracks (PGS/VobSub/DVB) — services/ocr.py."""
+
+    # rapidocr runs locally and free; vision goes through llm.vision_model.
+    # The local one is the default because it costs nothing and needs no
+    # network, and because a switch that starts spending money on its own
+    # is the wrong default whatever its quality.
+    engine: Literal["rapidocr", "vision"] = "rapidocr"
+    # recognition language, e.g. "ja" / "en"; empty = the track's own tag,
+    # and failing that a probe over the first few cues
+    language: str = ""
+    # recognisers want tall text; DVD subtitles at 720x480 need the help
+    upscale: int = Field(2, ge=1, le=4)
+    # vision engine: cues per request. Bigger is cheaper and faster, but a
+    # sheet the model loses count on is discarded whole.
+    vision_batch: int = Field(10, ge=1, le=40)
+    # There is no separate proofreading switch: OCR output goes through the
+    # same 转写预处理 pass as speech recognition (prompts.refine_enabled),
+    # with wording aimed at look-alike glyphs instead of homophones.
+
+
 class AppSettings(BaseModel):
     # temp working dir for intermediate files; empty = platform cache dir.
     # only its "jobs" subdirectory is managed (and wiped on startup)
@@ -172,6 +193,7 @@ class AppSettings(BaseModel):
     llm: LLMSettings = LLMSettings()
     asr: ASRSettings = ASRSettings()
     subtitle: SubtitleSettings = SubtitleSettings()
+    ocr: OcrSettings = OcrSettings()
     prompts: PromptSettings = PromptSettings()
     network: NetworkSettings = NetworkSettings()
     server: ServerSettings = ServerSettings()

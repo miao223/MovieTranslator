@@ -61,8 +61,11 @@ BITMAP_CODECS = {
     "dvb_subtitle", "dvbsub", "xsub",
 }
 
-# Subtitle files that may sit next to the video, best format first
-SIDECAR_SUFFIXES = (".ass", ".ssa", ".srt", ".vtt")
+# Subtitle files that may sit next to the video, best format first. .sup is
+# a graphic one — listed because services/ocr.py can read it, ranked last
+# because OCR costs minutes where the others cost nothing.
+SIDECAR_SUFFIXES = (".ass", ".ssa", ".srt", ".vtt", ".sup")
+GRAPHIC_SUFFIXES = (".sup", ".idx")
 
 # ffmpeg hands every text codec over as an ASS event, whose fields are
 # ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text — eight
@@ -136,7 +139,7 @@ def sidecar_tracks(video_path: str | Path) -> list[dict]:
             "title": path.name,
             "default": False,
             "forced": False,
-            "text": True,
+            "text": path.suffix.lower() not in GRAPHIC_SUFFIXES,
         })
     return found
 
@@ -165,7 +168,7 @@ def describe_track(track: dict) -> str:
     if track["default"]:
         parts.append("(默认)")
     if not track["text"]:
-        parts.append("(图形字幕，无法读取文字)")
+        parts.append("(图形字幕，需 OCR 识别)")
     return " ".join(p for p in parts if p)
 
 
@@ -175,10 +178,9 @@ def describe_stream(stream) -> str:
 
 
 def bitmap_error(track: dict) -> str:
-    return (
-        f"{describe_track(track)} 只有图片没有文字，"
-        "读不出可翻译的内容（需要 OCR）；请改选其它字幕轨或改用语音识别"
-    )
+    """Only for callers of read_cues, which reads text and nothing else —
+    a graphic track belongs to services/ocr.py."""
+    return f"{describe_track(track)} 存的是图片，请用 OCR 读取（services/ocr.py）"
 
 
 def pick_track(
@@ -189,8 +191,9 @@ def pick_track(
 ) -> dict:
     """Choose one: explicit file > explicit index > language > default > first.
 
-    Raises ValueError when nothing readable is on offer, or when the caller
-    named a bitmap track — the two cases the pipeline has to tell apart.
+    A graphic track is a legitimate answer now that services/ocr.py can read
+    one, but it always loses to a text track: OCR costs minutes and can
+    misread, while a text track is free and exact.
 
     An index that no longer exists falls back rather than raising, matching
     audio.pick_track: the video may have been re-picked after the选择.
@@ -202,27 +205,23 @@ def pick_track(
     if index is not None:
         for t in tracks:
             if t["index"] == index and not t["path"]:
-                if not t["text"]:
-                    raise ValueError(bitmap_error(t))
                 return t
-    readable = [t for t in tracks if t["text"]]
-    if not readable:
-        if tracks:
-            raise ValueError(
-                "这个视频只有图形字幕（PGS/VobSub 之类），读不出文字；请改用语音识别"
-            )
+    if not tracks:
         raise ValueError("这个视频没有内建字幕轨，也没有同名的外挂字幕文件")
-    # a forced track is a legal answer only when it is the only one
-    full = [t for t in readable if not t["forced"]] or readable
+    # text before graphic, and a forced track — signs only — behind both
+    ranked = sorted(tracks, key=lambda t: (not t["text"], t["forced"]))
+    best = ranked[0]
+    peers = [t for t in ranked
+             if t["text"] == best["text"] and t["forced"] == best["forced"]]
     wanted = canon_language(language)
     if wanted:
-        for t in full:
+        for t in peers:
             if t["language"] == wanted:
                 return t
-    for t in full:
+    for t in peers:
         if t["default"]:
             return t
-    return full[0]
+    return peers[0]
 
 
 # ----------------------------------------------------------------- cues

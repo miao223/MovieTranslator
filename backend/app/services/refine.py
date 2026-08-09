@@ -49,6 +49,9 @@ _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*$")
 MIN_KEPT = 0.6  # share of source words that must survive
 MAX_ADDED_RATIO = 0.25  # share of the unit's words that may be new
 MAX_ADDED_FLOOR = 2  # ...but always allow a couple, so short lines can be fixed
+# OCR proofreading is measured in characters instead (see _is_faithful).
+# A few glyphs put right leaves a line almost identical; a rewrite does not.
+MIN_OCR_SIMILARITY = 0.75
 # one chunk is restated in full by the reply, so it must fit the model's
 # OUTPUT limit (commonly 4k-16k tokens), not just its context window
 REFINE_CHUNK_TOKENS = 1_500
@@ -85,7 +88,21 @@ _SENTENCE_END_RE = re.compile(rf"[{re.escape(_SENTENCE_CHARS)}]$")
 _SENTENCE_CHARS_RE = re.compile(rf"[{re.escape(_SENTENCE_CHARS)}]")
 
 
-def build_refine_prompt(language_hint: str = "", glossary: str = "") -> str:
+def build_refine_prompt(
+    language_hint: str = "", glossary: str = "", source: str = "asr"
+) -> str:
+    """The cleanup instructions, aimed at whichever machine produced the text.
+
+    Two sources make two different kinds of mistake, and the pass is worth
+    running on both — but only the errors are shared. Speech recognition
+    cuts sentences in half and mishears homophones; OCR reads a subtitle
+    whose line breaks a *person* chose, and only misreads look-alike glyphs.
+    So the OCR variant keeps the correction half and forbids the merging
+    half, which is the same reason services/subsource.py skips this pass
+    entirely for a subtitle that was typed rather than recognised.
+    """
+    if source == "ocr":
+        return _ocr_prompt(language_hint, glossary)
     lang = f"（原文语言：{language_hint}）" if language_hint else ""
     parts = [
         f"你是字幕转写整理员{lang}。输入是语音识别产生的字幕行，格式 `[行号] 原文`。",
@@ -117,6 +134,42 @@ def build_refine_prompt(language_hint: str = "", glossary: str = "") -> str:
         "示例：",
         "输入: [7] Yeah, like that thought never entered my / [8] mind / [9] Okay, come on",
         "输出: [7-8] Yeah, like that thought never entered my mind. / [9] Okay, come on.",
+    ]
+    return "\n".join(parts)
+
+
+def _ocr_prompt(language_hint: str, glossary: str) -> str:
+    lang = f"（原文语言：{language_hint}）" if language_hint else ""
+    parts = [
+        f"你是字幕校对员{lang}。输入是从影片的图形字幕（蓝光/DVD 的图片字幕）"
+        "OCR 出来的字幕行，格式 `[行号] 原文`。",
+        "这些行的断句、换行和标点都是当初制作字幕的人排好的，是对的；"
+        "**错的只可能是个别字符被认错**。所以你的任务只有两件事：",
+        "1. 修正字形相近的误识别字符，例如 口/ロ、力/カ、一/ー/－、二/ニ、"
+        "タ/夕、へ/ヘ、rn/m、l/I/1、O/0、cl/d 之类；",
+        "2. 删除 OCR 噪点产生的乱码字符（画面边框、图标被当成文字认出来的）。",
+        "严格禁止：",
+        "- **禁止合并行**：输出必须与输入一一对应，一行进、一行出；",
+        "- 禁止把一行拆成多行；",
+        "- 禁止翻译，输出必须与输入是同一种语言；",
+        "- 禁止改写措辞、润色文风、增删标点、增加或删减实质内容；",
+        "- 拿不准的字一律保持原样——改错比不改更糟。",
+    ]
+    if glossary.strip():
+        parts += [
+            "- 专有名词按下面的对照表纠正（识别结果与表中某个词字形相近时，"
+            "改成表中的原文写法）；表中没有的人名、地名保持原样。",
+            "专有名词对照表：\n" + glossary.strip(),
+        ]
+    else:
+        parts.append("- 人名、地名、专有名词保持原样，不要改动。")
+    parts += [
+        "输出格式：每行 `[行号] 校对后的原文`。",
+        "必须覆盖输入的全部行号，顺序递增，不得跳过、重复、合并或新增行号。",
+        "不要输出解释、注释、代码块标记或任何多余内容。",
+        "示例：",
+        "输入: [7] 口ボットが動いた / [8] 何が起きてるの",
+        "输出: [7] ロボットが動いた / [8] 何が起きてるの",
     ]
     return "\n".join(parts)
 
@@ -194,14 +247,27 @@ def _overlap(candidate: str, source: str) -> tuple[int, int, int]:
     return kept, len(src), added
 
 
-def _is_faithful(candidate: str, source: str) -> bool:
+def _is_faithful(candidate: str, source: str, ocr: bool = False) -> bool:
     """Is the model's version still the source text, not a rewrite?
 
     Two independent guards, because the two ways of losing content look
     nothing alike: dropping most of the line (deletion) and stuffing in
     text that was never spoken (hallucination — which keeps every source
     word and would sail through a "words retained" check alone).
+
+    OCR needs a different measure, not a looser one. Its whole job is to
+    change characters *inside* words, and a word-set overlap counts a
+    corrected word as both a deletion and an invention: "He11o there" →
+    "Hello there" keeps one word of two, i.e. 0.50, and a two-word subtitle
+    line is the common case. Characters are the unit the correction works
+    in, so characters are what gets measured.
     """
+    if ocr:
+        import difflib
+
+        if not source.strip():
+            return True
+        return difflib.SequenceMatcher(None, source, candidate).ratio() >= MIN_OCR_SIMILARITY
     kept, total, added = _overlap(candidate, source)
     if total == 0:
         return True
@@ -276,6 +342,7 @@ def _apply_units(
     settings: SubtitleSettings,
     gap_limit: float = MAX_INTERNAL_GAP,
     rejections: Optional[List[str]] = None,
+    ocr: bool = False,
 ) -> tuple[List[SubtitleLine], int, int]:
     """Turn validated units into cues. Returns (lines, merged, corrected).
 
@@ -295,7 +362,7 @@ def _apply_units(
         for src in sources:
             joined = _join_text(joined, src.text)
 
-        reason = "" if _is_faithful(text, joined) else "改写幅度过大（保真校验未通过）"
+        reason = "" if _is_faithful(text, joined, ocr) else "改写幅度过大（保真校验未通过）"
         start, end = sources[0].start, sources[-1].end
         if not reason and len(sources) > 1:
             # constraints the model could not check: it never sees timestamps.
@@ -395,6 +462,7 @@ def refine_lines(
     glossary: str = "",
     debug=None,
     usage: Optional[dict] = None,
+    source: str = "asr",  # "ocr" swaps the wording; see build_refine_prompt
 ) -> List[SubtitleLine]:
     """Rejoin and clean up *lines*; returns renumbered cues.
 
@@ -408,7 +476,7 @@ def refine_lines(
         return lines
 
     client = client if client is not None else make_openai_client(llm, network)
-    system = build_refine_prompt(language_hint, glossary)
+    system = build_refine_prompt(language_hint, glossary, source)
     chunks = _chunks(lines, llm.context_limit)
     before = open_ended_ratio(lines)
     gap_limit = _gap_limit(lines)
@@ -416,6 +484,7 @@ def refine_lines(
 
     if dbg:
         dbg.section("转写预处理（refine）")
+        dbg.kv("原文来源", source)
         dbg.kv("分块数", len(chunks))
         dbg.kv("间隔阈值 gap_limit", f"{gap_limit:.2f}s（本片自适应，下限 {MAX_INTERNAL_GAP}s）")
         dbg.kv("输入是否有句末标点", "是" if has_sentence_punctuation(lines) else "否 ⚠")
@@ -467,7 +536,9 @@ def refine_lines(
             if not units or not _covers_exactly(units, chunk):
                 raise ValueError("行号覆盖校验未通过")
             rejections: List[str] = []
-            applied, m, c = _apply_units(units, chunk, subtitle, gap_limit, rejections)
+            applied, m, c = _apply_units(
+                units, chunk, subtitle, gap_limit, rejections, source == "ocr"
+            )
             if dbg and rejections:
                 dbg.line(f"\n第 {n} 块 被本地约束否决的合并（{len(rejections)} 条）：")
                 dbg.lines("  " + r for r in rejections)

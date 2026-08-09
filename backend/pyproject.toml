@@ -22,6 +22,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.27"]
+# Local OCR for graphic subtitle tracks (services/ocr.py). Kept out of the
+# base install because rapidocr brings opencv/shapely/pyclipper with it —
+# 100MB+ for a feature only Blu-ray rips need. The vision-model engine
+# needs none of this.
+ocr = ["rapidocr>=3.0", "onnxruntime>=1.17"]
 # CUDA runtime libraries for GPU inference (NVIDIA GPU required)
 gpu = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9"]
 

@@ -28,7 +28,8 @@ from app.models.schemas import (
     SubtitleLine,
 )
 from app.services import (
-    asr, audio, lyrics, mux, refine, segmenter, series, subsource, subtitle, vet,
+    asr, audio, lyrics, mux, ocr, refine, segmenter, series, subsource,
+    subtitle, vet,
 )
 from app.services.translator import Translator
 
@@ -366,13 +367,12 @@ class JobManager:
         detected = ""
         segments = None  # whisper's raw output, for the lyric cross-check
         vet_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
-        from_subtitle = False
+        source_kind = "asr"
         if req.text_source == "subtitle":
-            got = self._import_subtitle(job, req, debug)
+            got = self._import_subtitle(job, req, settings, debug)
             if got is not None:
-                lines, detected = got
-                from_subtitle = True
-        if not from_subtitle:
+                lines, detected, source_kind = got
+        if source_kind == "asr":
             lines, detected, segments = self._transcribe(
                 job, req, settings, workdir, debug, check_cancel, vet_usage
             )
@@ -387,24 +387,30 @@ class JobManager:
         # no counterpart in the target language, and the translator fills it
         # with the next line's content, shifting everything after it
         refine_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
-        if from_subtitle and settings.prompts.refine_enabled:
+        if source_kind == "subtitle" and settings.prompts.refine_enabled:
             # Every job this pass does — rejoin broken sentences, fix
             # homophones, restore missing full stops — is a repair of speech
             # recognition. A subtitle written by a person already has all
             # three right, and re-deciding its line breaks would only undo
-            # work done against the picture.
+            # work done against the picture. OCR output is a different
+            # matter: a machine produced those characters, so it runs.
             job.publish(
                 "refining", 60,
                 log="使用已有字幕作为原文，已跳过转写预处理"
                     "（它是为修复语音识别缺陷设计的，对人工字幕只会打乱断句）",
             )
         elif settings.prompts.refine_enabled:
-            job.publish("refining", 60, message="转写预处理中（断句整理 + 识别纠错）…")
+            job.publish(
+                "refining", 60,
+                message=("OCR 结果校对中（纠正形近字误识别）…" if source_kind == "ocr"
+                         else "转写预处理中（断句整理 + 识别纠错）…"),
+            )
             lines = refine.refine_lines(
                 lines,
                 settings.llm,
                 settings.subtitle,
                 language_hint=detected or "",
+                source=source_kind,
                 log=lambda msg: job.publish("refining", job.status.progress, log=msg),
                 progress=lambda f: job.publish(
                     "refining", 60 + 12 * min(max(f, 0.0), 1.0),
@@ -427,8 +433,12 @@ class JobManager:
 
     # ------------------------------------------------------------ sources
 
-    def _import_subtitle(self, job: Job, req: JobRequest, debug: DebugLog):
+    def _import_subtitle(self, job: Job, req: JobRequest, settings, debug: DebugLog):
         """Read the release's own subtitle. None means "transcribe instead".
+
+        Returns (lines, language, "subtitle" | "ocr") — the third value says
+        whether a person typed those characters or a recogniser did, which
+        is what decides whether the proofreading pass runs.
 
         Returns None only for a batch job (see
         JobRequest.subtitle_fallback_asr): someone who picked a track by hand
@@ -449,11 +459,18 @@ class JobManager:
                 tracks, req.subtitle_track, req.subtitle_file, req.subtitle_language
             )
             stats: dict = {}
-            lines = subsource.read_cues(
-                req.video_path, track,
-                log=lambda msg: job.publish("importing", 30, log=msg),
-                stats=stats,
-            )
+            if track["text"]:
+                kind = "subtitle"
+                lines = subsource.read_cues(
+                    req.video_path, track,
+                    log=lambda msg: job.publish("importing", 30, log=msg),
+                    stats=stats,
+                )
+            else:
+                kind = "ocr"
+                lines = self._ocr_subtitle(job, req, settings, track, debug, stats)
+        except InterruptedError:
+            raise
         except Exception as exc:  # noqa: BLE001 — the message is the point
             if not req.subtitle_fallback_asr:
                 raise
@@ -463,8 +480,10 @@ class JobManager:
             )
             return None
 
-        detected = subsource.iso2(track["language"]) if track["language"] else ""
-        source = "来自轨道标签"
+        detected = stats.get("language") or (
+            subsource.iso2(track["language"]) if track["language"] else ""
+        )
+        source = "来自轨道标签" if track["language"] else "OCR 时判定"
         if req.source_language != "auto":
             detected, source = req.source_language, "用户指定"
         elif not detected:
@@ -485,12 +504,14 @@ class JobManager:
         if debug.enabled:
             debug.section("原文来源（已有字幕）")
             debug.kv("选用", subsource.describe_track(track))
+            debug.kv("读取方式", "OCR 识别" if kind == "ocr" else "直接读取文字")
             debug.kv("条数", len(lines))
             debug.kv("语言", f"{detected or '未知'}（{source}）")
-            debug.kv("丢弃/合并", f"无文字内容 {stats.get('blank', 0)} 条，"
-                                  f"重叠重复 {stats.get('folded', 0)} 条")
-            debug.kv("已标记歌词", stats.get("lyric", 0))
-            debug.kv("时间轴位移", f"{stats.get('offset', 0.0):.2f}s")
+            if kind == "subtitle":
+                debug.kv("丢弃/合并", f"无文字内容 {stats.get('blank', 0)} 条，"
+                                      f"重叠重复 {stats.get('folded', 0)} 条")
+                debug.kv("已标记歌词", stats.get("lyric", 0))
+                debug.kv("时间轴位移", f"{stats.get('offset', 0.0):.2f}s")
             debug.line("\n全部字幕轨：")
             debug.lines("  " + subsource.describe_track(t)
                         for t in subsource.all_tracks(req.video_path))
@@ -503,7 +524,36 @@ class JobManager:
             "importing", 60,
             message=f"已读取 {len(lines)} 条字幕（语言: {detected or '未知'}），跳过语音识别",
         )
-        return lines, detected
+        return lines, detected, kind
+
+    def _ocr_subtitle(self, job: Job, req: JobRequest, settings, track: dict,
+                      debug: DebugLog, stats: dict) -> List[SubtitleLine]:
+        """Recognise a graphic subtitle track — Blu-ray PGS and the like."""
+        job.publish(
+            "importing", 5,
+            message="识别图形字幕（OCR）…",
+            log=f"{subsource.describe_track(track)} 是图形字幕，"
+                f"将用 OCR 识别（引擎：{settings.ocr.engine}）",
+        )
+        language = settings.ocr.language.strip()
+        if not language and req.source_language != "auto":
+            language = req.source_language
+        if not language and track["language"]:
+            language = subsource.iso2(track["language"])
+        return ocr.read_cues(
+            req.video_path, track, settings.ocr,
+            llm=settings.llm, network=settings.network, language=language,
+            log=lambda msg: job.publish("importing", job.status.progress, log=msg),
+            # OCR of a whole film runs for minutes, so it gets the bulk of
+            # the stage rather than a single jump at the end
+            progress=lambda f: job.publish(
+                "importing", 5 + 50 * min(max(f, 0.0), 1.0),
+                message=f"识别图形字幕… {min(max(f, 0.0), 1.0):.0%}",
+            ),
+            should_cancel=job.cancel_event.is_set,
+            debug=debug,
+            stats=stats,
+        )
 
     def _transcribe(self, job: Job, req: JobRequest, settings, workdir: Path,
                     debug: DebugLog, check_cancel, vet_usage: dict):
