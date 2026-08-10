@@ -79,6 +79,16 @@ MAX_CUE_SECONDS = 30.0
 # A repeat of the same picture within this of the last one is the disc
 # re-sending a subtitle that never left the screen (see `_fold_repeats`).
 REPEAT_GAP = 0.1
+# PP-OCR's detector normalises the *short* side to 736px, so a bare
+# subtitle strip is blown up out of all proportion: a measured 1646x276 cue
+# reaches 4390x736 and the glyphs outgrow what the detector can take in. On
+# real Blu-ray cues it then returned one box swallowing both lines, or no
+# boxes at all — 6.3% of a film came back blank, every one of them a short
+# line. A white margin fixes both and is *faster*, because the short side
+# needs less enlarging: measured over 30 cues, 90.2% -> 96.3% per character,
+# no blanks left, and 1677ms -> 1047ms each.
+DETECTOR_MARGIN = 0.5  # of the picture's own height, on every side
+MIN_MARGIN = 24
 # cues are reported this often; recognition of a film runs to thousands
 PROGRESS_EVERY = 25
 # vision engine: a sheet holding more rows than this is asking the model to
@@ -498,9 +508,17 @@ def reading_order(boxes: Sequence) -> List[int]:
     return order
 
 
+def bordered(image: Image.Image) -> Image.Image:
+    """The cue with room around it, which is what the detector needs."""
+    margin = max(MIN_MARGIN, int(image.height * DETECTOR_MARGIN))
+    out = Image.new("L", (image.width + margin * 2, image.height + margin * 2), 255)
+    out.paste(image.convert("L"), (margin, margin))
+    return out
+
+
 def _one(engine, image: Image.Image) -> tuple[str, float]:
     """Recognise one cue: every box the detector found, in reading order."""
-    result = engine(np.array(image.convert("RGB")))
+    result = engine(np.array(bordered(image).convert("RGB")))
     boxes = getattr(result, "boxes", None)
     texts = list(getattr(result, "txts", None) or [])
     scores = list(getattr(result, "scores", None) or [])

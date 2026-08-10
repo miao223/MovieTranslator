@@ -20,6 +20,12 @@ import contextlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# before the first third-party import, so a half-updated install is told
+# what to run instead of dying on someone else's traceback
+from app.core.deps import require_dependencies
+
+require_dependencies()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
