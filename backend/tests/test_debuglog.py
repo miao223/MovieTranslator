@@ -3,7 +3,13 @@ import pytest
 
 from pathlib import Path
 
-from app.core.debuglog import DebugLog, debug_path_for, fmt_cue, percentiles
+from app.core.debuglog import (
+    DebugLog,
+    debug_path_for,
+    fmt_cue,
+    open_debug_log,
+    percentiles,
+)
 
 
 def test_disabled_log_writes_nothing(tmp_path):
@@ -43,6 +49,34 @@ def test_unwritable_target_falls_back_to_the_work_dir(tmp_path):
 
 def test_path_sits_next_to_the_subtitle(tmp_path):
     assert debug_path_for(tmp_path / "movie.srt", tmp_path) == tmp_path / "movie.debug.log"
+    # picking the path *creates* it — that is the writability probe, and
+    # the reason the mode has to be checked before this is ever called
+    assert (tmp_path / "movie.debug.log").exists()
+
+
+def test_debug_off_puts_nothing_in_the_film_folder(tmp_path):
+    """Off has to mean the film folder looks untouched.
+
+    Deciding the path first and the mode second left an empty
+    `<video>.debug.log` beside every film processed with the mode off:
+    the probe above had already created it by the time `enabled=False`
+    was consulted.
+    """
+    films = tmp_path / "films"
+    films.mkdir()
+    (films / "movie.mkv").write_bytes(b"x")
+
+    log = open_debug_log(films / "movie.srt", tmp_path, enabled=False)
+
+    assert not log.enabled and log.path is None
+    assert [p.name for p in films.iterdir()] == ["movie.mkv"]
+
+
+def test_debug_on_writes_next_to_the_film(tmp_path):
+    log = open_debug_log(tmp_path / "movie.srt", tmp_path, enabled=True)
+    log.line("recorded")
+    assert log.path == tmp_path / "movie.debug.log"
+    assert "recorded" in log.path.read_text(encoding="utf-8")
 
 
 def test_formatting_helpers():

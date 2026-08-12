@@ -34,7 +34,13 @@ MAX_TEXT_BLOCK = 200_000  # a single LLM message longer than this gets clipped
 
 
 def debug_path_for(subtitle_target: Path, fallback_dir: Path) -> Path:
-    """`<video stem>.debug.log` next to the subtitle, or in the work dir."""
+    """`<video stem>.debug.log` next to the subtitle, or in the work dir.
+
+    The probe **creates the file**, which is the only honest way to ask
+    "can I write here?" across read-only mounts, ACLs and Windows. So it
+    must never run for a job that has debug mode off — call
+    ``open_debug_log`` instead of this, which is what enforces that.
+    """
     candidate = subtitle_target.with_suffix(".debug.log")
     try:
         candidate.parent.mkdir(parents=True, exist_ok=True)
@@ -43,6 +49,21 @@ def debug_path_for(subtitle_target: Path, fallback_dir: Path) -> Path:
         return candidate
     except OSError:
         return fallback_dir / candidate.name
+
+
+def open_debug_log(
+    subtitle_target: Path, fallback_dir: Path, enabled: bool
+) -> "DebugLog":
+    """Start a job's debug log — the mode's on/off switch lives here.
+
+    Off must mean *nothing appears in the user's film folder*. Deciding
+    the path first and the mode second used to leave an empty
+    `<video>.debug.log` beside every film processed with the mode off,
+    because picking the path probes it by creating it.
+    """
+    if not enabled:
+        return DebugLog(None, enabled=False)
+    return DebugLog(debug_path_for(subtitle_target, fallback_dir), enabled=True)
 
 
 class DebugLog:

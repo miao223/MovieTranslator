@@ -71,6 +71,21 @@ def test_every_stage_writes_into_the_debug_log(tmp_path):
     assert "间隔阈值 gap_limit" in text        # the adaptive threshold used
 
 
+def test_the_job_starts_its_log_through_the_guarded_helper():
+    """Pinning the wiring, not the style.
+
+    `DebugLog(debug_path_for(...), enabled=settings.debug_mode)` evaluates
+    the path — and so creates the file — before the mode is ever looked at,
+    which is how jobs run with debug off still dropped an empty
+    `<video>.debug.log` into the user's film folder.
+    """
+    import inspect
+
+    src = inspect.getsource(JobManager._execute)
+    assert "open_debug_log(" in src
+    assert "debug_path_for(" not in src
+
+
 def test_debug_off_leaves_no_file_and_no_cost(tmp_path):
     path = tmp_path / "movie.debug.log"
     debug = DebugLog(path, enabled=False)

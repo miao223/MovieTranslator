@@ -19,7 +19,7 @@ from typing import Dict, Iterator, List, Optional
 
 from app.core import config
 from app.core.cache import job_dir
-from app.core.debuglog import DebugLog, debug_path_for
+from app.core.debuglog import DebugLog, open_debug_log
 from app.core.joblog import JobLogWriter, _settings_lines as joblog_settings_lines
 from app.models.schemas import (
     JobRequest,
@@ -340,9 +340,8 @@ class JobManager:
         # deep diagnostics: written next to the subtitle we are about to
         # produce, so the user finds it without hunting for a cache dir
         video = Path(req.video_path)
-        debug = DebugLog(
-            debug_path_for(video.parent / f"{video.stem}.srt", workdir),
-            enabled=settings.debug_mode,
+        debug = open_debug_log(
+            video.parent / f"{video.stem}.srt", workdir, settings.debug_mode
         )
         if debug.enabled:
             job.publish(
