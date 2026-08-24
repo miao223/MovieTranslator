@@ -24,7 +24,7 @@ from app.models.schemas import (
     LLMSettings,
     SubtitleTrack,
 )
-from app.services import audio, mcp_server, series, subsource
+from app.services import audio, mcp_server, mux, series, subsource
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -48,7 +48,7 @@ def get_version() -> dict:
 def create_job(req: JobRequest) -> JobStatus:
     try:
         job = manager.create(req)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return job.status
 
@@ -548,6 +548,34 @@ def download_log(name: str):
 
 
 # ------------------------------------------------------------------ media
+
+
+@router.get("/media/encoders")
+def media_encoders() -> dict:
+    """Containers, and the video encoders this machine can actually use.
+
+    The dropdown is built from this rather than a fixed list: h264_nvenc is
+    registered on a machine with no NVIDIA card at all and only fails when
+    the encoder is opened, so offering it everywhere would mean offering an
+    option that is certain to fail on most machines.
+    """
+    return {
+        "containers": [
+            {"value": "mkv", "label": "MKV（推荐）", "styled_subtitle": True},
+            {"value": "mp4", "label": "MP4（兼容性最好）", "styled_subtitle": False},
+        ],
+        "video": [{"id": mux.COPY, "label": "保持原编码（不重编码）",
+                   "family": "", "hardware": False}] + mux.available_encoders(),
+        "audio": [
+            {"id": "copy", "label": "保持原编码（不重编码）"},
+            {"id": "aac", "label": "AAC（兼容性最好）"},
+            {"id": "ac3", "label": "AC-3"},
+            {"id": "eac3", "label": "E-AC-3"},
+            {"id": "flac", "label": "FLAC（无损）"},
+            {"id": "libopus", "label": "Opus"},
+        ],
+        "presets": ["ultrafast", "fast", "medium", "slow", "veryslow"],
+    }
 
 
 @router.get("/media/audio-tracks", response_model=list[AudioTrack])

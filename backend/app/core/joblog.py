@@ -116,6 +116,17 @@ def _settings_lines(settings) -> list[str]:
     ]
 
 
+def _embed_summary(request) -> str:
+    """The 输出形式 line when the job produces a new video file."""
+    embed = request.embed
+    if embed.video_codec == "copy" and embed.audio_codec == "copy":
+        return f"合成带软字幕的新视频（{embed.container}，不重编码）"
+    video = ("原编码" if embed.video_codec == "copy" else embed.video_codec)
+    audio = ("原编码" if embed.audio_codec == "copy" else embed.audio_codec)
+    return (f"合成带软字幕的新视频（{embed.container}，视频 {video} / 音频 {audio}，"
+            f"质量 {embed.quality}／速度 {embed.preset}）")
+
+
 class JobLogWriter:
     """Appends every published progress line to a file, with a header."""
 
@@ -195,7 +206,7 @@ class JobLogWriter:
             f"源语言        : {request.source_language}",
             f"目标语言      : {request.target_language}",
             f"字幕形式      : {request.output_mode}",
-            f"输出形式      : {'合成带软字幕的新视频（不重编码）' if request.embed_subtitle else '独立字幕文件'}",
+            f"输出形式      : {_embed_summary(request) if request.embed_subtitle else '独立字幕文件'}",
             f"指定音轨      : {request.audio_track if request.audio_track is not None else '（自动）'}"
             + (f" 语言偏好={request.audio_language}" if request.audio_language else ""),
             f"画面翻译      : {len(request.frame_tasks)} 条"

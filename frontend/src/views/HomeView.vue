@@ -43,6 +43,49 @@ const form = reactive({
   synopsis: '',
   output_mode: 'bilingual',
   embed_subtitle: false,
+  // 仅 embed_subtitle 为真时有意义，见后端 schemas.EmbedSettings
+  embed: {
+    container: 'mkv',
+    video_codec: 'copy',
+    audio_codec: 'copy',
+    quality: 23,
+    preset: 'medium',
+  },
+})
+
+// 本机真正能用的编码器由后端探测（NVENC 在没有显卡的机器上也「存在」，
+// 只有打开时才失败），拿不到就退化成只有「保持原编码」
+const encoders = ref({ containers: [], video: [], audio: [], presets: [] })
+const CONTAINER_FALLBACK = [
+  { value: 'mkv', label: 'MKV（推荐）', styled_subtitle: true },
+  { value: 'mp4', label: 'MP4（兼容性最好）', styled_subtitle: false },
+]
+const containerChoices = computed(() =>
+  encoders.value.containers.length ? encoders.value.containers : CONTAINER_FALLBACK)
+const videoChoices = computed(() =>
+  encoders.value.video.length
+    ? encoders.value.video
+    : [{ id: 'copy', label: '保持原编码（不重编码）', hardware: false }])
+const audioChoices = computed(() =>
+  encoders.value.audio.length
+    ? encoders.value.audio
+    : [{ id: 'copy', label: '保持原编码（不重编码）' }])
+const presetChoices = computed(() =>
+  encoders.value.presets.length
+    ? encoders.value.presets
+    : ['ultrafast', 'fast', 'medium', 'slow', 'veryslow'])
+const reEncoding = computed(() => form.embed.video_codec !== 'copy')
+// SVT-AV1 与 VP9 的 CRF 到 63，x26x / NVENC 的到 51
+const qualityMax = computed(() =>
+  ['libsvtav1', 'libvpx-vp9'].includes(form.embed.video_codec) ? 63 : 51)
+
+// 只在用户真的要合成视频时才去探测：探测会逐个打开编码器，没必要在每次
+// 打开首页时都跑一遍。失败就沉默降级成「只有保持原编码」，绝不挡住表单。
+let encodersAsked = false
+watch(() => form.embed_subtitle, (on) => {
+  if (!on || encodersAsked) return
+  encodersAsked = true
+  api.encoders().then((r) => { encoders.value = r }).catch(() => {})
 })
 
 // mirrors mux.LANGUAGES — only used to show the filename before it exists
@@ -276,7 +319,7 @@ const embedExample = computed(() => {
   const stem = mode.value === 'single' && form.video_path
     ? baseName(form.video_path).replace(/\.[^.]+$/, '')
     : '片名'
-  return `${stem}.${suffix}.mkv`
+  return `${stem}.${suffix}.${form.embed.container}`
 })
 
 async function start(frameOnly = false) {
@@ -418,6 +461,7 @@ async function startBatch() {
       synopsis: form.synopsis,
       output_mode: form.output_mode,
       embed_subtitle: form.embed_subtitle,
+      embed: form.embed,
     })
     job.value = null
     logs.value = []
@@ -637,8 +681,19 @@ onBeforeUnmount(() => {
             不再生成 .srt/.ass，而是在视频所在目录生成
             <code>{{ embedExample }}</code>，字幕以<strong>软字幕</strong>内嵌其中——
             播放器里可开关、可切换，画面没有被烧上字（非硬字幕）。<br>
-            <strong>音视频原样拷贝、不重编码</strong>，画质无损，耗时约等于复制一遍文件；
-            原视频保持不变。「字幕样式」设置照常生效（内嵌为 ASS 轨）。<br>
+            <template v-if="!reEncoding">
+              <strong>音视频原样拷贝、不重编码</strong>，画质无损，耗时约等于复制一遍文件；
+              原视频保持不变。
+            </template>
+            <template v-else>
+              画面将<strong>重新编码</strong>，原视频保持不变。
+            </template>
+            <template v-if="form.embed.container === 'mkv'">
+              「字幕样式」设置照常生效（内嵌为 ASS 轨）。
+            </template>
+            <template v-else>
+              内嵌轨为纯文本，「字幕样式」不生效；带样式的完整字幕仍可在完成后下载。
+            </template><br>
             ⚠️ 这会<strong>完整多出一份视频文件</strong>，批量整季前请先确认磁盘空间。
           </template>
           <template v-else>
@@ -646,6 +701,47 @@ onBeforeUnmount(() => {
           </template>
         </div>
       </el-form-item>
+      <template v-if="form.embed_subtitle">
+        <el-form-item label="储存容器">
+          <el-select v-model="form.embed.container" style="width: 220px">
+            <el-option v-for="c in containerChoices" :key="c.value" :value="c.value" :label="c.label" />
+          </el-select>
+          <span class="hint">产物为 <code>{{ embedExample }}</code></span>
+          <div v-if="form.embed.container === 'mp4'" class="hint" style="margin: 4px 0 0; display: block">
+            ⚠️ MP4 只能容纳<strong>纯文本</strong>字幕轨（mov_text）：双语两行与 ♪ 都保留，
+            但「字幕样式」里的字号/颜色/定位不会生效，片源自带的字幕轨与字体附件也装不进去。
+            需要带样式的内嵌字幕请选 MKV。
+          </div>
+        </el-form-item>
+        <el-form-item label="编码方式">
+          <el-select v-model="form.embed.video_codec" style="width: 280px">
+            <el-option v-for="e in videoChoices" :key="e.id" :value="e.id" :label="e.label" />
+          </el-select>
+          <span class="hint">列出的是本机真正可用的编码器</span>
+          <div v-if="reEncoding" class="hint" style="margin: 4px 0 0; display: block">
+            ⚠️ <strong>会把整部影片重新压一遍</strong>：软件编码常需数小时（H.265 / AV1 更久），
+            而且画质只减不增。有 NVIDIA 显卡时选带「硬件加速」的条目会快一个数量级。
+            只是想让字幕能内嵌的话，「保持原编码」就够了。
+          </div>
+        </el-form-item>
+        <el-form-item v-if="reEncoding" label="画面质量">
+          <el-slider v-model="form.embed.quality" :min="0" :max="qualityMax" :step="1"
+            show-input style="width: 400px" />
+          <span class="hint">CRF，越小越清晰、文件越大</span>
+        </el-form-item>
+        <el-form-item v-if="reEncoding" label="编码速度">
+          <el-select v-model="form.embed.preset" style="width: 220px">
+            <el-option v-for="p in presetChoices" :key="p" :value="p" :label="p" />
+          </el-select>
+          <span class="hint">越慢，同样体积下画质越好</span>
+        </el-form-item>
+        <el-form-item label="音频编码">
+          <el-select v-model="form.embed.audio_codec" style="width: 220px">
+            <el-option v-for="a in audioChoices" :key="a.id" :value="a.id" :label="a.label" />
+          </el-select>
+          <span class="hint">保持原编码即可；MP4 装不下 DTS/TrueHD 时会自动转成 AAC</span>
+        </el-form-item>
+      </template>
       <el-form-item v-if="mode === 'single'" label="画面翻译">
         <div style="width: 100%">
           <div v-for="(t, i) in frameTasks" :key="i" class="frame-task-row">
@@ -812,7 +908,9 @@ onBeforeUnmount(() => {
       type="warning"
       :closable="false"
       style="margin-top: 12px"
-      title="将为每个视频合成一份带字幕的新 mkv（不重编码），磁盘占用约等于再存一遍这些视频"
+      :title="reEncoding
+        ? `将为每个视频合成一份带字幕的新 ${form.embed.container} 并重新编码画面——每个文件都要压一遍，整批可能跑上几天，磁盘占用约等于再存一遍这些视频`
+        : `将为每个视频合成一份带字幕的新 ${form.embed.container}（不重编码），磁盘占用约等于再存一遍这些视频`"
     />
     <template #footer>
       <el-button @click="confirmVisible = false">取消</el-button>

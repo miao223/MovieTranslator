@@ -45,6 +45,32 @@ STAGE_RANGES = {
     "composing": (95.0, 100.0),
 }
 
+
+def _hms(seconds: float) -> str:
+    whole = int(max(seconds, 0))
+    hours, minutes = divmod(whole // 60, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分"
+    return f"{minutes} 分" if minutes else f"{whole} 秒"
+
+
+def _eta(started: float, fraction: float, recoding: bool) -> str:
+    """How long the re-encode has taken and has left, as text.
+
+    The progress bar cannot express this: composing owns 95->100% because
+    it used to be a file copy, and widening it now would mean re-numbering
+    every literal percentage in _execute. A re-encode running for hours
+    behind a bar that barely moves needs the real figure somewhere, so it
+    goes in the message.
+    """
+    if not recoding or fraction <= 0.01:
+        return ""
+    elapsed = time.monotonic() - started
+    if elapsed < 5:  # too early for the estimate to mean anything
+        return ""
+    return f"（已用 {_hms(elapsed)}，约剩 {_hms(elapsed / fraction - elapsed)}）"
+
+
 _run_slot = threading.Semaphore(1)  # one CPU-heavy job at a time
 
 
@@ -105,6 +131,16 @@ class JobManager:
         video = Path(request.video_path)
         if not video.is_file():
             raise FileNotFoundError(f"视频文件不存在: {video}")
+        if request.embed_subtitle and request.embed.video_codec != mux.COPY:
+            # Checked here rather than at mux time: the mux runs after an
+            # hour of transcription and translation, and "this machine has
+            # no such encoder" is knowable right now.
+            usable = {enc["id"] for enc in mux.available_encoders()}
+            if request.embed.video_codec not in usable:
+                raise ValueError(
+                    f"本机无法使用编码器 {request.embed.video_codec}。"
+                    f"可用的有：{'、'.join(sorted(usable)) or '（无）'}"
+                )
         job = Job(request)
         self.jobs[job.id] = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
@@ -832,21 +868,36 @@ class JobManager:
         job.srt_path = workdir / f"{video.stem}{ext}"
         job.srt_path.write_text(srt_text, encoding="utf-8")
         job.status.srt_in_place = False
-        out = mux.output_path(video, req.target_language)
+        out = mux.output_path(video, req.target_language, req.embed.container)
+        recoding = req.embed.video_codec != mux.COPY
+        how = (f"重编码为 {mux.encoder_label(req.embed.video_codec)}"
+               if recoding else "复制音视频流，不重编码")
         job.publish(
             "composing", 95,
-            message="合成带字幕的视频（音视频不重编码）…",
-            log=f"开始合成 {out.name}（复制音视频流，不重编码）",
+            message=f"合成带字幕的视频（{how}）…",
+            log=f"开始合成 {out.name}（{how}）",
         )
+        if recoding:
+            job.publish(
+                "composing", 95,
+                log="⚠ 重编码要把整部影片重新压一遍：软件编码常需数小时，"
+                    "画质只减不增。中途可以取消，不会留下半成品。",
+            )
+        started = time.monotonic()
         try:
             mux.embed(
                 video, job.srt_path, out,
                 target_language=req.target_language,
+                opts=req.embed,
                 track_title=f"{req.target_language}字幕",
                 log=lambda msg: job.publish("composing", job.status.progress, log=msg),
                 progress=lambda f: job.publish(
                     "composing", 95 + 5 * min(max(f, 0.0), 1.0),
-                    message=f"合成带字幕的视频… {min(max(f, 0.0), 1.0):.0%}",
+                    # The bar only has 95->100 to give, while a re-encode is
+                    # the longest step of the whole job. The honest fix is to
+                    # put the real number and an estimate in the text.
+                    message=f"合成带字幕的视频… {min(max(f, 0.0), 1.0):.0%}"
+                            + _eta(started, f, recoding),
                 ),
                 should_cancel=job.cancel_event.is_set,
             )

@@ -218,6 +218,36 @@ class FrameTask(BaseModel):
     duration: float = Field(5.0, ge=1.0, le=60.0)  # cue display seconds
 
 
+class EmbedSettings(BaseModel):
+    """Container and codec choices for the muxed video (services/mux.py).
+
+    Only meaningful when JobRequest.embed_subtitle is on. The defaults are
+    exactly what the feature did before these existed: an mkv with every
+    stream copied, so nothing re-encodes unless it was asked for.
+    """
+
+    container: Literal["mkv", "mp4"] = "mkv"
+    # encoder id, or "copy" to remux the picture untouched. Deliberately a
+    # free string rather than a Literal: which encoders exist depends on the
+    # machine (NVENC/QSV/AMF need the hardware), so the list comes from
+    # GET /api/media/encoders and the server validates against that same
+    # probe. ASRSettings.model_size / compute_type are free strings for the
+    # same reason.
+    video_codec: str = "copy"
+    audio_codec: Literal[
+        "copy", "aac", "ac3", "eac3", "flac", "libopus"
+    ] = "copy"
+    # CRF-style quality, lower is better. The scales differ per encoder
+    # (x264/x265 0-51, SVT-AV1 0-63, NVENC calls it cq); mux.py maps and
+    # clamps this into whatever the chosen encoder actually wants.
+    quality: int = Field(23, ge=0, le=63)
+    # abstract speed tier, mapped per encoder — x26x take these names as-is,
+    # SVT-AV1 wants a number, NVENC wants p1-p7
+    preset: Literal[
+        "ultrafast", "fast", "medium", "slow", "veryslow"
+    ] = "medium"
+
+
 class AudioTrack(BaseModel):
     """One audio stream of a video, as offered for selection."""
 
@@ -283,6 +313,8 @@ class JobRequest(BaseModel):
     # instead of a subtitle file next to the video (services/mux.py). The
     # picture is copied, never re-encoded.
     embed_subtitle: bool = False
+    # container/codec for that new video. Ignored when embed_subtitle is off.
+    embed: EmbedSettings = EmbedSettings()
     # set by BatchManager in series mode; names the glossary this job shares
     # with the rest of its batch (services/series.py). Always empty for a
     # single-file job — nothing it decides can leak into another film.
@@ -311,6 +343,8 @@ class BatchRequest(BaseModel):
     # see JobRequest.embed_subtitle — one muxed .mkv per video instead of a
     # subtitle file. Note it writes a second copy of every film in the batch.
     embed_subtitle: bool = False
+    # see JobRequest.embed — same container/codec choice for every file
+    embed: EmbedSettings = EmbedSettings()
     # 剧集模式: every video in this batch shares one accumulated 原文 → 译名
     # table, so a name settled in one episode holds for the rest
     # (services/series.py). Off by default — a directory of unrelated films

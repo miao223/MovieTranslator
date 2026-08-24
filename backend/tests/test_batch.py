@@ -204,3 +204,19 @@ def test_saving_an_empty_glossary_is_refused(tmp_path, monkeypatch, settings_fil
     status, _ = _fake_batch(tmp_path, monkeypatch)
     with local_client(app) as client:
         assert client.post(f"/api/batch/{status.id}/glossary/save").status_code == 400
+
+
+def test_batch_passes_the_container_and_codec_to_each_job(tmp_path, monkeypatch):
+    """Every field a batch shares has to be forwarded by hand — both in
+    BatchManager and in the page's startBatch(). A field that is added to
+    the single-file form and forgotten here goes missing without a word."""
+    make_tree(tmp_path)
+    _, seen = _fake_batch(
+        tmp_path, monkeypatch,
+        embed_subtitle=True,
+        embed={"container": "mp4", "video_codec": "libx265", "quality": 30},
+    )
+    assert len(seen) == 2
+    assert {r.embed.container for r in seen} == {"mp4"}
+    assert {r.embed.video_codec for r in seen} == {"libx265"}
+    assert {r.embed.quality for r in seen} == {30}

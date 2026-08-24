@@ -29,8 +29,8 @@ import anyio.to_thread
 from app.core import joblog
 from app.core.config import load_settings
 from app.core.media import scan_videos
-from app.models.schemas import BatchRequest, JobRequest
-from app.services import audio, subsource
+from app.models.schemas import BatchRequest, EmbedSettings, JobRequest
+from app.services import audio, mux, subsource
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -49,6 +49,19 @@ AVAILABLE = FastMCP is not None
 # how much subtitle text one tool call may return; a two-hour bilingual SRT
 # is well under this, but a client should never be handed an unbounded blob
 MAX_SUBTITLE_CHARS = 200_000
+
+
+def _embed_error(container: str, video_codec: str) -> str:
+    """Why this container/codec pair cannot be used here, or empty."""
+    if container not in mux.CONTAINERS:
+        return f"container 只能是 {' 或 '.join(mux.CONTAINERS)}"
+    if video_codec == mux.COPY:
+        return ""
+    usable = {enc["id"] for enc in mux.available_encoders()}
+    if video_codec not in usable:
+        return (f"本机无法使用编码器 {video_codec}。"
+                f"可用的有：{'、'.join(sorted(usable)) or '（无）'}")
+    return ""
 
 
 def _job_view(job) -> dict:
@@ -175,6 +188,8 @@ def build() -> Optional["FastMCP"]:
         audio_track: Optional[int] = None,
         audio_language: str = "",
         embed_subtitle: bool = False,
+        container: str = "mkv",
+        video_codec: str = "copy",
         text_source: str = "asr",
         subtitle_track: Optional[int] = None,
         subtitle_file: str = "",
@@ -198,11 +213,19 @@ def build() -> Optional["FastMCP"]:
         embed_subtitle: 开启后不生成字幕文件，而是在同目录产出一个内嵌软字幕的
             新视频（片名.zh.mkv，音视频不重编码）。会完整复制一份视频，注意磁盘空间。
             片源原有的字幕轨会保留。生成路径见 get_job 的 video_filename 字段。
+        container: 新视频的容器，mkv 或 mp4。mp4 兼容性最好，但只能带纯文本字幕轨，
+            也装不下片源自带的字幕轨与字体附件。仅在 embed_subtitle 开启时有意义。
+        video_codec: copy 表示原样拷贝不重编码（默认，唯一不损失画质的选项）。
+            要重编码就填编码器 id，可用的用 get_server_info 查。重编码整部影片
+            动辄数小时，画质只减不增。
         """
         if output_mode not in ("bilingual", "translation_only"):
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
         if text_source not in ("asr", "subtitle"):
             return {"error": "text_source 只能是 asr 或 subtitle"}
+        bad = _embed_error(container, video_codec)
+        if bad:
+            return {"error": bad}
         request = JobRequest(
             video_path=video_path,
             audio_track=audio_track,
@@ -215,6 +238,7 @@ def build() -> Optional["FastMCP"]:
             synopsis=synopsis,
             output_mode=output_mode,  # type: ignore[arg-type]
             embed_subtitle=embed_subtitle,
+            embed=EmbedSettings(container=container, video_codec=video_codec),
         )
         try:
             job = manager.create(request)
@@ -250,6 +274,7 @@ def build() -> Optional["FastMCP"]:
         subtitle_language 按语言标签挑轨（如 eng；各文件的轨道序号不同）。
         找不到可读字幕的那个文件会自动改用语音识别，不影响整批。
 
+        container / video_codec：同 translate_video，整批共用。
         embed_subtitle：同 translate_video——每个视频产出一个内嵌软字幕的新 mkv，
         不生成字幕文件。整季剧集会因此多占一整份磁盘空间。
         """
@@ -257,6 +282,9 @@ def build() -> Optional["FastMCP"]:
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
         if text_source not in ("asr", "subtitle"):
             return {"error": "text_source 只能是 asr 或 subtitle"}
+        bad = _embed_error(container, video_codec)
+        if bad:
+            return {"error": bad}
         request = BatchRequest(
             directory=directory,
             recursive=recursive,
@@ -270,6 +298,7 @@ def build() -> Optional["FastMCP"]:
             output_mode=output_mode,  # type: ignore[arg-type]
             series_mode=series_mode,
             embed_subtitle=embed_subtitle,
+            embed=EmbedSettings(container=container, video_codec=video_codec),
         )
         try:
             status = await anyio.to_thread.run_sync(batch_manager.create, request)

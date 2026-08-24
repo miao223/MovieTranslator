@@ -7,7 +7,10 @@ requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
-    "av>=12.0",
+    # 17.0 is the floor for add_mux_stream (the mov_text track in mux.py);
+    # add_stream_from_template, used since the first embed release, needs 14.0 —
+    # the old >=12.0 floor was never actually satisfiable by this code.
+    "av>=17.0",
     "faster-whisper>=1.0",
     # MCP server (services/mcp_server.py). Held below 2.0 on purpose: that
     # line switched to httpx2 and pydantic>=2.12, which risks pulling the

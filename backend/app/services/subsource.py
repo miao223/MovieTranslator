@@ -227,11 +227,14 @@ def pick_track(
 # ----------------------------------------------------------------- cues
 
 
-def _plain_text(rect) -> str:
-    """The readable line inside one decoded subtitle rect."""
-    raw = bytes(rect.ass or b"") or bytes(rect.text or b"")
-    body = raw.decode("utf-8", "replace")
-    if rect.ass:
+def event_text(body: str, ass: bool = True) -> str:
+    """The readable text inside one subtitle event, line breaks intact.
+
+    Shared with services/mux.py, which needs the same cleaning to build a
+    plain-text MP4 track but must keep the two lines of a bilingual cue
+    apart — hence the split from _plain_text below, which joins them.
+    """
+    if ass:
         parts = body.split(",", _ASS_FIELDS)
         if len(parts) > _ASS_FIELDS:
             body = parts[_ASS_FIELDS]
@@ -239,7 +242,13 @@ def _plain_text(rect) -> str:
         return ""  # a shape, not a line — see _DRAWING
     body = body.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
     body = _OVERRIDE.sub("", body)
-    body = _HTML.sub("", body)
+    return _HTML.sub("", body)
+
+
+def _plain_text(rect) -> str:
+    """The readable line inside one decoded subtitle rect."""
+    raw = bytes(rect.ass or b"") or bytes(rect.text or b"")
+    body = event_text(raw.decode("utf-8", "replace"), ass=bool(rect.ass))
     # one cue is one line for the LLM; the renderer re-wraps for display
     return " ".join(body.split())
 

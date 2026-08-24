@@ -54,6 +54,7 @@ export const api = {
     request('/api/asr/download', { method: 'POST', body: JSON.stringify({ model_size: modelSize }) }),
   downloadStatus: (modelSize) =>
     request(`/api/asr/download-status?model_size=${encodeURIComponent(modelSize)}`),
+  encoders: () => request('/api/media/encoders'),
   serverInfo: () => request('/api/server/info'),
   regenerateToken: () =>
     request('/api/server/token/regenerate', { method: 'POST' }),

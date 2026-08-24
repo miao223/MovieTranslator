@@ -6,12 +6,13 @@ the source file changes. The tests exist to hold that line — above all
 that no re-encode ever creeps in.
 """
 
+from fractions import Fraction
 from pathlib import Path
 
 import av
 import pytest
 
-from app.models.schemas import SubtitleLine, SubtitleSettings
+from app.models.schemas import EmbedSettings, SubtitleLine, SubtitleSettings
 from app.services import mux, subtitle
 from tests.test_audio_tracks import make_multitrack_video
 
@@ -448,3 +449,380 @@ def test_only_our_subtitle_track_is_the_default_one(video, tmp_path):
             if s.type == "subtitle" and s.disposition & av.stream.Disposition.default
         ]
     assert defaults == ["chi"]
+
+
+# --------------------------------------------------------------------------
+# Re-encoding and the second container. Everything above this line describes
+# the default path, which must keep behaving exactly as it did; everything
+# below only happens when EmbedSettings asks for it.
+# --------------------------------------------------------------------------
+
+
+def _vfr_video(path: Path, pts_ms=(0, 10, 12, 40, 41, 100, 101, 102, 200, 300, 400)) -> Path:
+    """A source whose frames are not evenly spaced.
+
+    Constant-rate material cannot detect a wrong encoder time base, because
+    quantising to 1/fps maps such timestamps onto themselves. Only irregular
+    spacing shows the damage.
+    """
+    import numpy as np
+
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("libx264", rate=24)
+        stream.width, stream.height = 128, 96
+        stream.pix_fmt = "yuv420p"
+        stream.time_base = Fraction(1, 1000)
+        stream.codec_context.time_base = Fraction(1, 1000)
+        stream.options = {"bf": "2", "g": "8"}
+        for i, when in enumerate(pts_ms):
+            img = np.zeros((96, 128, 3), dtype=np.uint8)
+            img[:, (i * 7) % 128:((i * 7) % 128) + 16] = 255
+            frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            frame.pts, frame.time_base = when, Fraction(1, 1000)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+    return path
+
+
+def _frame_pts(path: Path) -> list:
+    with av.open(str(path)) as c:
+        stream = c.streams.video[0]
+        return sorted(
+            round(float(f.pts * stream.time_base) * 1000)
+            for p in c.demux(stream) for f in p.decode()
+        )
+
+
+def _cue_texts(path: Path) -> list:
+    """The cues as a player would read them, for either subtitle carrier."""
+    with av.open(str(path)) as c:
+        track = c.streams.subtitles[0]
+        tx3g = track.codec_context.name == "mov_text"
+        out = []
+        for p in c.demux(track):
+            if not p.size:
+                continue
+            raw = bytes(p)
+            # tx3g: a big-endian uint16 length, then the text. The MP4 muxer
+            # inserts empty samples of its own to fill the gaps between cues.
+            body = raw[2:].decode("utf-8") if tx3g else raw.decode("utf-8")
+            if body:
+                out.append((round(float(p.pts * p.time_base), 2), body))
+    return out
+
+
+def test_re_encoding_loses_not_a_single_frame(tmp_path):
+    """The trap this guards is that the copy path's `not packet.size` filter
+    looks exactly like the right thing to reuse. It is not: that empty packet
+    is what makes the decoder release the frames it is holding for B-frame
+    reorder, and skipping it silently shortened the film."""
+    source = make_bframe_video(tmp_path / "bframes.mkv")
+    assert _frames(source) == 48
+    out = mux.embed(
+        source, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+        opts=EmbedSettings(video_codec="libx264", preset="ultrafast"),
+    )
+    assert _frames(out) == 48
+
+
+def test_a_variable_rate_source_keeps_every_timestamp(tmp_path):
+    """Guards the encoder's time base.
+
+    Setting it on the stream rather than the codec context reads back as if
+    it worked, but the encoder never looks there and derives 1/fps instead.
+    Measured before the fix: 0,10,12,40,41,100… came back 0,0,0,42,42,83…,
+    which slides the audio and every cue with it.
+    """
+    source = _vfr_video(tmp_path / "vfr.mkv")
+    before = _frame_pts(source)
+    out = mux.embed(
+        source, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+        opts=EmbedSettings(video_codec="libx264", preset="ultrafast"),
+    )
+    assert _frame_pts(out) == before
+
+
+def test_a_ten_bit_source_is_not_quietly_flattened_to_eight(tmp_path):
+    """A new stream defaults to yuv420p, so saying nothing costs the depth."""
+    import numpy as np
+
+    source = tmp_path / "deep.mkv"
+    with av.open(str(source), "w") as c:
+        stream = c.add_stream("libx264", rate=24)
+        stream.width, stream.height = 128, 96
+        stream.pix_fmt = "yuv420p10le"
+        for i in range(12):
+            img = np.zeros((96, 128, 3), dtype=np.uint8)
+            img[:, i * 8:i * 8 + 16] = 255
+            frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            frame = frame.reformat(format="yuv420p10le")
+            frame.pts = i
+            for packet in stream.encode(frame):
+                c.mux(packet)
+        for packet in stream.encode(None):
+            c.mux(packet)
+
+    out = mux.embed(
+        source, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+        opts=EmbedSettings(video_codec="libx265", preset="ultrafast"),
+    )
+    with av.open(str(out)) as c:
+        assert c.streams.video[0].codec_context.pix_fmt == "yuv420p10le"
+
+
+def test_re_encoding_the_picture_leaves_the_sound_alone(video, tmp_path):
+    """Only the video was asked for, so the audio must still be a copy —
+    language tags and all, which is what multi-track releases are picked by."""
+    out = mux.embed(
+        video, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+        opts=EmbedSettings(video_codec="libx264", preset="ultrafast"),
+    )
+    kinds = [(t, c) for t, c, _ in _streams(out)]
+    assert kinds[0] == ("video", "h264")  # re-encoded, but still h264
+    assert [c for t, c in kinds if t == "audio"] == ["aac", "aac"]
+    langs = [m.get("language") for t, _, m in _streams(out) if t == "audio"]
+    assert langs == ["jpn", "eng"]
+
+
+def test_a_cover_image_is_copied_rather_than_re_encoded(tmp_path):
+    """Releases carry a poster as a second video stream flagged attached_pic.
+    Re-encoding that as if it were the film is both pointless and wrong."""
+    import numpy as np
+
+    source = tmp_path / "withcover.mkv"
+    with av.open(str(source), "w") as c:
+        main = c.add_stream("libx264", rate=24)
+        main.width, main.height = 128, 96
+        main.pix_fmt = "yuv420p"
+        cover = c.add_stream("mjpeg", rate=1)
+        cover.width, cover.height = 32, 32
+        cover.pix_fmt = "yuvj420p"
+        cover.disposition = av.stream.Disposition.attached_pic
+        for i in range(12):
+            img = np.zeros((96, 128, 3), dtype=np.uint8)
+            img[:, i * 8:i * 8 + 16] = 255
+            frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            frame.pts = i
+            for packet in main.encode(frame):
+                c.mux(packet)
+        art = av.VideoFrame.from_ndarray(
+            np.full((32, 32, 3), 200, dtype=np.uint8), format="rgb24")
+        art.pts = 0
+        for packet in cover.encode(art):
+            c.mux(packet)
+        for packet in main.encode(None):
+            c.mux(packet)
+        for packet in cover.encode(None):
+            c.mux(packet)
+
+    out = mux.embed(
+        source, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+        opts=EmbedSettings(video_codec="libx265", preset="ultrafast"),
+    )
+    codecs = [c for t, c, _ in _streams(out) if t == "video"]
+    assert codecs == ["hevc", "mjpeg"]  # the film re-encoded, the poster not
+
+
+def test_mp4_carries_the_subtitle_as_a_mov_text_track(video, tmp_path):
+    """MP4 accepts neither SRT nor ASS, and PyAV cannot encode subtitles at
+    all, so the track is tx3g built by hand. What matters is that a player
+    reads back the same text at the same times."""
+    out = mux.embed(
+        video, _write_subs(tmp_path), tmp_path / "out.mp4", "简体中文",
+        opts=EmbedSettings(container="mp4"),
+    )
+    with av.open(str(out)) as c:
+        assert c.streams.subtitles[0].codec_context.name == "mov_text"
+    assert _cue_texts(out) == [(0.5, "Hello there\n你好"), (1.4, "Goodbye\n再见")]
+
+
+def test_mp4_keeps_the_two_lines_of_a_styled_cue_apart(video, tmp_path):
+    """The ASS the styled path emits carries override tags and \\N breaks.
+    Stripping those must not also join the original and its translation —
+    that is exactly what subsource's own cleaner does for the LLM."""
+    out = mux.embed(
+        video, _write_subs(tmp_path, styled=True), tmp_path / "out.mp4", "简体中文",
+        opts=EmbedSettings(container="mp4"),
+    )
+    assert _cue_texts(out) == [(0.5, "Hello there\n你好"), (1.4, "Goodbye\n再见")]
+
+
+def test_mp4_keeps_the_lyric_marks(video, tmp_path):
+    """♪ is ordinary UTF-8 and must survive into the tx3g payload."""
+    lines = [SubtitleLine(index=1, start=0.5, end=1.2,
+                          text="♪ Crawl out ♪", translation="♪ 爬出来 ♪")]
+    path = tmp_path / "lyric.srt"
+    path.write_text(subtitle.build_srt(lines, SubtitleSettings()), encoding="utf-8")
+    out = mux.embed(video, path, tmp_path / "out.mp4", "简体中文",
+                    opts=EmbedSettings(container="mp4"))
+    assert _cue_texts(out) == [(0.5, "♪ Crawl out ♪\n♪ 爬出来 ♪")]
+
+
+def test_mp4_loses_no_frames_either(tmp_path):
+    """B-frames mean the first DTS is negative; MP4 stores that in an edit
+    list where matroska could not, but the packets still have to all arrive."""
+    source = make_bframe_video(tmp_path / "bframes.mkv")
+    out = mux.embed(source, _write_subs(tmp_path), tmp_path / "out.mp4", "简体中文",
+                    opts=EmbedSettings(container="mp4"))
+    assert _frames(out) == 48
+
+
+def test_mp4_says_what_it_had_to_leave_behind(video, tmp_path):
+    """A source subtitle track has nowhere to go in an MP4. Dropping it is
+    the only option; dropping it silently is not."""
+    first = mux.embed(video, _write_subs(tmp_path), tmp_path / "one.mkv", "English")
+    notes = []
+    out = mux.embed(first, _write_subs(tmp_path), tmp_path / "two.mp4", "简体中文",
+                    opts=EmbedSettings(container="mp4"), log=notes.append)
+    assert any("无法容纳" in n for n in notes)
+    # theirs is gone, ours is the only subtitle left
+    subs = [(c, m.get("language")) for t, c, m in _streams(out) if t == "subtitle"]
+    assert subs == [("mov_text", "chi")]
+
+
+@pytest.mark.parametrize("codec,expected", [
+    ("libx264", "h264"),
+    ("libx265", "hevc"),
+    # AV1 reads back under the decoder's name, not the encoder's
+    ("libsvtav1", "libdav1d"),
+])
+def test_every_software_encoder_produces_a_playable_file(tmp_path, codec, expected):
+    source = make_bframe_video(tmp_path / "bframes.mkv")
+    out = mux.embed(
+        source, _write_subs(tmp_path), tmp_path / f"out_{codec}.mkv", "简体中文",
+        opts=EmbedSettings(video_codec=codec, preset="ultrafast", quality=40),
+    )
+    assert _frames(out) == 48
+    with av.open(str(out)) as c:
+        assert c.streams.video[0].codec_context.name == expected
+
+
+@pytest.mark.skipif(
+    any(e["id"] == "h264_nvenc" for e in mux.available_encoders()),
+    reason="this machine really has NVENC",
+)
+def test_an_encoder_this_machine_lacks_fails_before_writing_anything(video, tmp_path):
+    """A hardware encoder builds a stream quite happily on a machine with no
+    such card — only avcodec_open2 fails. Opening it up front is what keeps
+    the failure from landing after the header and some audio are written."""
+    out = tmp_path / "out.mkv"
+    with pytest.raises(ValueError, match="无法使用编码器"):
+        mux.embed(video, _write_subs(tmp_path), out, "简体中文",
+                  opts=EmbedSettings(video_codec="h264_nvenc"))
+    assert not out.exists() and list(tmp_path.glob("*.part")) == []
+
+
+def test_the_probe_finds_the_encoders_the_wheel_ships(tmp_path):
+    ids = {e["id"] for e in mux.available_encoders()}
+    assert {"libx264", "libx265", "libsvtav1"} <= ids
+    # hardware entries are machine-dependent: assert only that any that do
+    # show up are labelled as such, never that they are present or absent
+    assert all(e["hardware"] == bool("nvenc" in e["id"] or "qsv" in e["id"]
+                                     or "amf" in e["id"])
+               for e in mux.available_encoders())
+
+
+def test_the_output_is_named_after_the_container(tmp_path):
+    video = tmp_path / "film.mkv"
+    video.touch()
+    assert mux.output_path(video, "简体中文").name == "film.zh.mkv"
+    assert mux.output_path(video, "简体中文", "mp4").name == "film.zh.mp4"
+    # and it still refuses to overwrite something already there
+    (tmp_path / "film.zh.mp4").touch()
+    assert mux.output_path(video, "简体中文", "mp4").name == "film.zh.2.mp4"
+
+
+def test_the_audio_can_be_re_encoded_on_its_own(video, tmp_path):
+    """Asking for an audio codec must not drag the picture into an encode."""
+    out = mux.embed(
+        video, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+        opts=EmbedSettings(audio_codec="flac"),
+    )
+    kinds = [(t, c) for t, c, _ in _streams(out)]
+    assert kinds[0] == ("video", "h264")
+    assert [c for t, c in kinds if t == "audio"] == ["flac", "flac"]
+    langs = [m.get("language") for t, _, m in _streams(out) if t == "audio"]
+    assert langs == ["jpn", "eng"]
+
+
+def test_the_pipeline_stage_honours_the_container_choice(
+    video, tmp_path, job_factory
+):
+    """The stage decides the output name, so the container has to reach it —
+    otherwise the mp4 would be written under a .mkv name."""
+    from app.services.pipeline import manager
+
+    job = job_factory(video, target_language="简体中文",
+                      embed={"container": "mp4"})
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    out = manager._embed_subtitle(
+        job, job.request, workdir, video, ".srt",
+        subtitle.build_srt(LINES, SubtitleSettings()),
+    )
+    assert out == video.parent / "film.zh.mp4" and out.is_file()
+    assert _cue_texts(out) == [(0.5, "Hello there\n你好"), (1.4, "Goodbye\n再见")]
+
+
+def test_the_encoder_list_is_served_to_the_page(tmp_path):
+    from app.main import app
+    from tests.conftest import local_client
+
+    with local_client(app) as client:
+        body = client.get("/api/media/encoders").json()
+    assert body["video"][0]["id"] == "copy"  # always first, always available
+    assert {"libx264", "libx265"} <= {e["id"] for e in body["video"]}
+    assert [c["value"] for c in body["containers"]] == ["mkv", "mp4"]
+    assert "aac" in {a["id"] for a in body["audio"]}
+
+
+@pytest.mark.skipif(
+    any(e["id"] == "h264_nvenc" for e in mux.available_encoders()),
+    reason="this machine really has NVENC",
+)
+def test_a_job_asking_for_a_missing_encoder_is_refused_at_once(video, tmp_path):
+    """Not at mux time: that runs after an hour of transcription and
+    translation, and 'this machine has no such encoder' is knowable now."""
+    from app.main import app
+    from tests.conftest import local_client
+
+    with local_client(app) as client:
+        reply = client.post("/api/jobs", json={
+            "video_path": str(video),
+            "embed_subtitle": True,
+            "embed": {"video_codec": "h264_nvenc"},
+        })
+    assert reply.status_code == 400
+    assert "无法使用编码器" in reply.json()["detail"]
+
+
+def test_an_audio_codec_the_container_cannot_hold_is_re_encoded_not_fatal(
+    video, tmp_path, monkeypatch
+):
+    """MP4 has no room for DTS or TrueHD, and the bundled ffmpeg has no
+    encoder for either, so copying such a track was never going to work.
+    An hour of transcription and translation stands behind this step, so one
+    audio track gets re-encoded rather than the whole job being lost.
+
+    Faked, because a source with a codec this build cannot even encode
+    cannot be built here — which is the same reason the fallback exists.
+    """
+    real = av.container.OutputContainer.add_stream_from_template
+
+    def picky(self, template, *args, **kwargs):
+        if template.type == "audio":
+            raise ValueError("mp4 does not support 'dts' codec")
+        return real(self, template, *args, **kwargs)
+
+    monkeypatch.setattr(
+        av.container.OutputContainer, "add_stream_from_template", picky)
+    notes = []
+    out = mux.embed(video, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+                    log=notes.append)
+
+    assert [c for t, c, _ in _streams(out) if t == "audio"] == ["aac", "aac"]
+    assert [m.get("language") for t, _, m in _streams(out) if t == "audio"] \
+        == ["jpn", "eng"]
+    assert sum("已转为 AAC" in n for n in notes) == 2
