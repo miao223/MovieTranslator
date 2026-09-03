@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core import config, joblog, server
 from app.core.auth import MCP_PREFIX
-from app.core.media import VIDEO_EXTS, scan_videos
+from app.core.media import MEDIA_EXTS, kind_of, scan_media
 from app.models.schemas import (
     AppSettings,
     AudioTrack,
@@ -106,15 +106,21 @@ def cancel_job(job_id: str):
 
 @router.get("/batch/scan")
 def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True):
-    """Preview which videos a batch would translate."""
+    """Preview which videos and audio files a batch would translate."""
     try:
-        videos, skipped = scan_videos(path, recursive, skip_existing)
+        found, skipped, shadowed = scan_media(path, recursive, skip_existing)
     except NotADirectoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audio_files = [str(f) for f in found if kind_of(f) == "audio"]
     return {
-        "videos": [str(v) for v in videos],
+        "videos": [str(v) for v in found],
         "skipped": [str(s) for s in skipped],
-        "total": len(videos),
+        "total": len(found),
+        # a subset of "videos": the confirm dialog says these will only ever
+        # produce a subtitle file, however the output switch is set
+        "audio": audio_files,
+        "audio_count": len(audio_files),
+        "shadowed": [str(s) for s in shadowed],
     }
 
 
@@ -589,7 +595,7 @@ def media_audio_tracks(path: str) -> list[AudioTrack]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 — unreadable/corrupt container
-        raise HTTPException(status_code=400, detail=f"无法读取视频: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"无法读取媒体文件: {exc}") from exc
     return [AudioTrack(**t) for t in tracks]
 
 
@@ -606,7 +612,7 @@ def media_subtitle_tracks(path: str) -> list[SubtitleTrack]:
     try:
         tracks = subsource.all_tracks(p)
     except Exception as exc:  # noqa: BLE001 — unreadable/corrupt container
-        raise HTTPException(status_code=400, detail=f"无法读取视频: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"无法读取媒体文件: {exc}") from exc
     return [SubtitleTrack(**t) for t in tracks]
 
 
@@ -626,7 +632,8 @@ def fs_resolve(path: str):
         return {
             "type": "file",
             "path": str(p),
-            "is_video": p.suffix.lower() in VIDEO_EXTS,
+            "is_media": p.suffix.lower() in MEDIA_EXTS,
+            "is_audio": kind_of(p) == "audio",
         }
     return {"type": "missing", "path": raw}
 
@@ -654,7 +661,7 @@ def fs_quick_access():
 
 @router.get("/fs/browse")
 def fs_browse(path: str = ""):
-    """List directories and video files for the server-side file picker."""
+    """List directories, videos and audio files for the file picker."""
     if not path:
         if sys.platform == "win32":
             drives = [
@@ -676,10 +683,14 @@ def fs_browse(path: str = ""):
             try:
                 if entry.is_dir():
                     dirs.append(entry.name)
-                elif entry.suffix.lower() in VIDEO_EXTS:
-                    files.append(
-                        {"name": entry.name, "size": entry.stat().st_size}
-                    )
+                elif entry.suffix.lower() in MEDIA_EXTS:
+                    files.append({
+                        "name": entry.name,
+                        "size": entry.stat().st_size,
+                        # the picker draws its icon from this rather than
+                        # keeping a second copy of the extension table
+                        "kind": kind_of(entry),
+                    })
             except OSError:
                 continue
     except PermissionError:

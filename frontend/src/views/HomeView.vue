@@ -201,13 +201,34 @@ async function probeSubs() {
   }
 }
 
+// A source with no picture cannot be muxed into a video and has no frames to
+// translate. The answer comes from the server so the page never keeps its own
+// copy of the extension table — /api/fs/resolve already knows.
+const isAudioSource = ref(false)
+
+async function probeKind() {
+  try {
+    const r = await api.resolvePath(form.video_path)
+    isAudioSource.value = r.type === 'file' && !!r.is_audio
+  } catch {
+    isAudioSource.value = false
+  }
+}
+
 // the path can be typed, pasted or picked in the browser — debounce them all
 watch(() => form.video_path, () => {
   clearTimeout(probeTimer)
   probeTimer = setTimeout(() => {
+    probeKind()
     probeTracks()
     probeSubs()
   }, 400)
+})
+
+// otherwise switching a chosen film for an mp3 leaves the embed options open
+// and embedExample naming a .mkv that is never going to exist
+watch(isAudioSource, (on) => {
+  if (on) form.embed_subtitle = false
 })
 
 // 画面翻译 (on-screen text) time points, single-file mode only
@@ -249,7 +270,7 @@ async function openBrowser(path = '', pick = null) {
   }
 }
 
-// jump to a pasted Explorer path: a folder opens it, a full video file
+// jump to a pasted Explorer path: a folder opens it, a full media file
 // path selects it directly (quotes from "复制文件地址" are stripped server-side)
 async function jumpToAddress() {
   const raw = addressInput.value.trim()
@@ -258,14 +279,14 @@ async function jumpToAddress() {
     const r = await api.resolvePath(raw)
     if (r.type === 'dir') {
       openBrowser(r.path)
-    } else if (r.type === 'file' && r.is_video && browsePick.value === 'file') {
+    } else if (r.type === 'file' && r.is_media && browsePick.value === 'file') {
       form.video_path = r.path
       browserVisible.value = false
       ElMessage.success('已选择: ' + r.path)
     } else if (r.type === 'file' && browsePick.value === 'dir') {
       ElMessage.warning('当前在选择目录，请粘贴文件夹路径或点「选择此目录」')
     } else if (r.type === 'file') {
-      ElMessage.warning('该文件不是支持的视频格式')
+      ElMessage.warning('该文件不是支持的视频 / 音频格式')
     } else {
       ElMessage.warning('路径不存在: ' + r.path)
     }
@@ -324,10 +345,12 @@ const embedExample = computed(() => {
 
 async function start(frameOnly = false) {
   if (!form.video_path) {
-    ElMessage.warning('请先选择视频文件')
+    ElMessage.warning('请先选择视频或音频文件')
     return
   }
-  const tasks = frameTasks.value.filter((t) => t.time.trim())
+  const tasks = isAudioSource.value
+    ? []
+    : frameTasks.value.filter((t) => t.time.trim())
   if (frameOnly && !tasks.length) {
     ElMessage.warning('补充模式至少需要一条画面翻译时间点')
     return
@@ -438,7 +461,7 @@ async function startBatchScan() {
     )
     if (!r.total) {
       ElMessage.warning(
-        '目录中没有需要翻译的视频'
+        '目录中没有需要翻译的视频或音频'
         + (r.skipped.length ? `（${r.skipped.length} 个已有字幕，被跳过）` : ''),
       )
       return
@@ -532,8 +555,8 @@ onBeforeUnmount(() => {
           <el-radio value="batch">批量目录</el-radio>
         </el-radio-group>
       </el-form-item>
-      <el-form-item v-if="mode === 'single'" label="视频文件" required>
-        <el-input v-model="form.video_path" placeholder="视频文件的完整路径">
+      <el-form-item v-if="mode === 'single'" label="视频 / 音频" required>
+        <el-input v-model="form.video_path" placeholder="视频或音频文件的完整路径">
           <template #append>
             <el-button @click="openBrowser('', 'file')">浏览…</el-button>
           </template>
@@ -674,10 +697,13 @@ onBeforeUnmount(() => {
       <el-form-item label="输出形式">
         <el-radio-group v-model="form.embed_subtitle">
           <el-radio :value="false">独立字幕文件</el-radio>
-          <el-radio :value="true">合成带字幕的新视频</el-radio>
+          <el-radio :value="true" :disabled="isAudioSource">合成带字幕的新视频</el-radio>
         </el-radio-group>
         <div class="hint" style="margin: 4px 0 0; display: block">
-          <template v-if="form.embed_subtitle">
+          <template v-if="isAudioSource">
+            纯音频片源没有画面，只能生成独立字幕文件。字幕会写在音频文件所在目录。
+          </template>
+          <template v-else-if="form.embed_subtitle">
             不再生成 .srt/.ass，而是在视频所在目录生成
             <code>{{ embedExample }}</code>，字幕以<strong>软字幕</strong>内嵌其中——
             播放器里可开关、可切换，画面没有被烧上字（非硬字幕）。<br>
@@ -742,7 +768,7 @@ onBeforeUnmount(() => {
           <span class="hint">保持原编码即可；MP4 装不下 DTS/TrueHD 时会自动转成 AAC</span>
         </el-form-item>
       </template>
-      <el-form-item v-if="mode === 'single'" label="画面翻译">
+      <el-form-item v-if="mode === 'single' && !isAudioSource" label="画面翻译">
         <div style="width: 100%">
           <div v-for="(t, i) in frameTasks" :key="i" class="frame-task-row">
             <el-input v-model="t.time" placeholder="如 8:19" style="width: 110px" />
@@ -882,10 +908,12 @@ onBeforeUnmount(() => {
 
   <el-dialog v-model="confirmVisible" title="确认批量翻译" width="560px">
     <p v-if="scanResult">
-      共找到 <strong>{{ scanResult.total }}</strong> 个待翻译视频<span v-if="scanResult.skipped.length">，另有 {{ scanResult.skipped.length }} 个已有字幕将被跳过</span>：
+      共找到 <strong>{{ scanResult.total }}</strong> 个待翻译文件<span v-if="scanResult.skipped.length">，另有 {{ scanResult.skipped.length }} 个已有字幕将被跳过</span>：
     </p>
     <div v-if="scanResult" class="scan-list">
-      <div v-for="v in scanResult.videos" :key="v" class="scan-item">🎬 {{ baseName(v) }}</div>
+      <div v-for="v in scanResult.videos" :key="v" class="scan-item">
+        {{ (scanResult.audio || []).includes(v) ? '🎵' : '🎬' }} {{ baseName(v) }}
+      </div>
     </div>
     <!-- the mistake worth catching here is series mode left on for a folder
          of unrelated films: the names of one would be forced onto the rest -->
@@ -902,6 +930,22 @@ onBeforeUnmount(() => {
       :closable="false"
       style="margin-top: 12px"
       title="将读取每个视频已有的字幕作为原文，跳过语音识别；读不到可用文字字幕的那些会自动改用语音识别"
+    />
+    <!-- a mixed folder is the common shape here: the audio files can only
+         ever produce a subtitle file, whatever the output switch says -->
+    <el-alert
+      v-if="scanResult && scanResult.audio_count"
+      type="info"
+      :closable="false"
+      style="margin-top: 12px"
+      :title="`其中 ${scanResult.audio_count} 个是纯音频文件，没有画面，只会生成字幕文件`"
+    />
+    <el-alert
+      v-if="scanResult && scanResult.shadowed && scanResult.shadowed.length"
+      type="info"
+      :closable="false"
+      style="margin-top: 12px"
+      :title="`${scanResult.shadowed.length} 个音频文件与同名视频重名（如 film.mp4 / film.mp3），两者会写同一份字幕，已只保留视频`"
     />
     <el-alert
       v-if="form.embed_subtitle"
@@ -920,7 +964,7 @@ onBeforeUnmount(() => {
 
   <el-dialog
     v-model="browserVisible"
-    :title="browsePick === 'dir' ? '选择目录' : '选择视频文件'"
+    :title="browsePick === 'dir' ? '选择目录' : '选择视频 / 音频文件'"
     width="680px"
   >
     <div class="browser-path">
@@ -930,7 +974,7 @@ onBeforeUnmount(() => {
       <el-input
         v-model="addressInput"
         size="small"
-        placeholder="粘贴文件夹或视频文件的完整路径，回车跳转"
+        placeholder="粘贴文件夹或视频 / 音频文件的完整路径，回车跳转"
         @keyup.enter="jumpToAddress"
       >
         <template #append>
@@ -951,9 +995,9 @@ onBeforeUnmount(() => {
         📁 {{ d }}
       </div>
       <div v-for="f in browser.files" :key="'f-' + f.name" class="entry file" @click="pickFile(f.name)">
-        🎬 {{ f.name }} <span class="size">{{ fmtSize(f.size) }}</span>
+        {{ f.kind === 'audio' ? '🎵' : '🎬' }} {{ f.name }} <span class="size">{{ fmtSize(f.size) }}</span>
       </div>
-      <el-empty v-if="!browser.dirs.length && !browser.files.length" description="此目录没有子目录或视频文件" :image-size="60" />
+      <el-empty v-if="!browser.dirs.length && !browser.files.length" description="此目录没有子目录或视频 / 音频文件" :image-size="60" />
     </div>
     <template v-if="browsePick === 'dir'" #footer>
       <el-button @click="browserVisible = false">取消</el-button>

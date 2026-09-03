@@ -1,4 +1,4 @@
-"""Audio extraction with PyAV: any video container → 16 kHz mono s16 WAV.
+"""Audio extraction with PyAV: any media container → 16 kHz mono s16 WAV.
 
 Multi-track releases (original + dub, or commentary tracks) are common, so
 tracks are enumerated and one is picked explicitly instead of blindly taking
@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import av
+
+from app.core import media
 
 SAMPLE_RATE = 16_000
 OUT_TIME_BASE = Fraction(1, SAMPLE_RATE)
@@ -96,6 +98,34 @@ def describe_track(track: dict) -> str:
     if track["default"]:
         parts.append("(默认)")
     return " ".join(parts)
+
+
+def picture_stream(container):
+    """The container's real picture stream, or None.
+
+    A cover image travels as a video stream flagged attached_pic — a great many
+    audio files carry one — so `streams.video` being non-empty is not the same
+    question as "does this have a picture". Every caller that means the latter
+    must come through here.
+    """
+    return next(
+        (s for s in container.streams.video
+         if not (s.disposition & av.stream.Disposition.attached_pic)),
+        None,
+    )
+
+
+def has_picture(media_path: str | Path) -> bool:
+    """Whether *media_path* holds moving pictures (album art does not count).
+
+    Falls back to the extension when the file cannot be opened, so a damaged
+    container keeps its own error later on instead of failing here.
+    """
+    try:
+        with av.open(str(media_path)) as container:
+            return picture_stream(container) is not None
+    except Exception:  # noqa: BLE001 — unreadable file: let the pipeline report it
+        return not media.is_audio_ext(media_path)
 
 
 def list_tracks(video_path: str | Path) -> list[dict]:

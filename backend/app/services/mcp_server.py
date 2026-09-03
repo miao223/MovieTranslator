@@ -28,7 +28,7 @@ import anyio.to_thread
 
 from app.core import joblog
 from app.core.config import load_settings
-from app.core.media import scan_videos
+from app.core.media import kind_of, scan_media
 from app.models.schemas import BatchRequest, EmbedSettings, JobRequest
 from app.services import audio, mux, subsource
 from app.services.batch import batch_manager
@@ -51,10 +51,23 @@ AVAILABLE = FastMCP is not None
 MAX_SUBTITLE_CHARS = 200_000
 
 
-def _embed_error(container: str, video_codec: str) -> str:
-    """Why this container/codec pair cannot be used here, or empty."""
+def _container_error(container: str) -> str:
+    """Why this container cannot be used, or empty.
+
+    Kept out of pydantic's hands on purpose: EmbedSettings.container is a
+    Literal, and a ValidationError traceback is a poor answer for a client
+    that simply mistyped the format.
+    """
     if container not in mux.CONTAINERS:
         return f"container 只能是 {' 或 '.join(mux.CONTAINERS)}"
+    return ""
+
+
+def _embed_error(container: str, video_codec: str) -> str:
+    """Why this container/codec pair cannot be used here, or empty."""
+    bad = _container_error(container)
+    if bad:
+        return bad
     if video_codec == mux.COPY:
         return ""
     usable = {enc["id"] for enc in mux.available_encoders()}
@@ -115,19 +128,25 @@ def build() -> Optional["FastMCP"]:
     async def list_videos(
         directory: str, recursive: bool = True, skip_translated: bool = True
     ) -> dict:
-        """列出某个目录下可翻译的视频文件。
+        """列出某个目录下可翻译的视频与音频文件。
 
         directory: 服务器本机的目录绝对路径。
         recursive: 是否递归子目录。
-        skip_translated: 跳过同名字幕已存在的视频。
+        skip_translated: 跳过同名字幕已存在的文件。
+
+        audio: 上面这批里的纯音频文件——它们只能产出字幕文件，
+            不支持内嵌合成新视频，也没有画面翻译。
+        shadowed: 与同名视频重名而被让位的音频文件（两者会写同一份字幕）。
         """
-        videos, skipped = await anyio.to_thread.run_sync(
-            scan_videos, directory, recursive, skip_translated
+        found, skipped, shadowed = await anyio.to_thread.run_sync(
+            scan_media, directory, recursive, skip_translated
         )
         return {
-            "videos": [str(v) for v in videos],
+            "videos": [str(v) for v in found],
             "skipped": [str(s) for s in skipped],
-            "total": len(videos),
+            "total": len(found),
+            "audio": [str(f) for f in found if kind_of(f) == "audio"],
+            "shadowed": [str(s) for s in shadowed],
         }
 
     @mcp.tool()
@@ -199,7 +218,7 @@ def build() -> Optional["FastMCP"]:
         整个流程需要几分钟到几小时，请随后用 get_job 轮询进度，
         完成后用 get_subtitle 取回字幕。
 
-        video_path: 服务器本机的视频绝对路径。
+        video_path: 服务器本机的视频或音频文件绝对路径。
         source_language: 影片原始语言代码（如 ja / en），auto 为自动判断。
         synopsis: 剧情简介，可显著提升人名与代词的翻译准确度。
         output_mode: bilingual 双语，translation_only 只要译文。
@@ -213,6 +232,7 @@ def build() -> Optional["FastMCP"]:
         embed_subtitle: 开启后不生成字幕文件，而是在同目录产出一个内嵌软字幕的
             新视频（片名.zh.mkv，音视频不重编码）。会完整复制一份视频，注意磁盘空间。
             片源原有的字幕轨会保留。生成路径见 get_job 的 video_filename 字段。
+            纯音频片源没有画面可合成，会自动改为生成字幕文件。
         container: 新视频的容器，mkv 或 mp4。mp4 兼容性最好，但只能带纯文本字幕轨，
             也装不下片源自带的字幕轨与字体附件。仅在 embed_subtitle 开启时有意义。
         video_codec: copy 表示原样拷贝不重编码（默认，唯一不损失画质的选项）。
@@ -223,7 +243,10 @@ def build() -> Optional["FastMCP"]:
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}
         if text_source not in ("asr", "subtitle"):
             return {"error": "text_source 只能是 asr 或 subtitle"}
-        bad = _embed_error(container, video_codec)
+        # the encoder half is left to manager.create, which knows whether this
+        # source has a picture at all — an audio file degrades rather than
+        # being turned away over an encoder it will never reach
+        bad = _container_error(container)
         if bad:
             return {"error": bad}
         request = JobRequest(
@@ -242,7 +265,7 @@ def build() -> Optional["FastMCP"]:
         )
         try:
             job = manager.create(request)
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
             return {"error": str(exc)}
         return _job_view(job)
 
@@ -258,10 +281,12 @@ def build() -> Optional["FastMCP"]:
         audio_language: str = "",
         series_mode: bool = False,
         embed_subtitle: bool = False,
+        container: str = "mkv",
+        video_codec: str = "copy",
         text_source: str = "asr",
         subtitle_language: str = "",
     ) -> dict:
-        """为一个目录下的所有视频批量启动翻译，立即返回 batch_id。
+        """为一个目录下的所有视频与音频文件批量启动翻译，立即返回 batch_id。
 
         影片逐个串行处理（语音识别占满 CPU/GPU，同时只跑一个）。
         用 get_batch 查看整体进度。
@@ -276,7 +301,8 @@ def build() -> Optional["FastMCP"]:
 
         container / video_codec：同 translate_video，整批共用。
         embed_subtitle：同 translate_video——每个视频产出一个内嵌软字幕的新 mkv，
-        不生成字幕文件。整季剧集会因此多占一整份磁盘空间。
+        不生成字幕文件。整季剧集会因此多占一整份磁盘空间。目录里的纯音频文件
+        没有画面可合成，会各自改为生成字幕文件，不影响整批。
         """
         if output_mode not in ("bilingual", "translation_only"):
             return {"error": "output_mode 只能是 bilingual 或 translation_only"}

@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from app.models.schemas import JobStatus
+from app.models.schemas import BatchStatus, JobStatus
 from app.services import mcp_server
 from tests.conftest import local_client, remote_client
 
@@ -172,6 +172,58 @@ async def test_list_videos_reports_what_a_batch_would_pick_up(mcp, tmp_path):
     out = await call(mcp, "list_videos", directory=str(tmp_path))
     assert [p.rsplit("/", 1)[-1] for p in out["videos"]] == ["a.mkv"]
     assert out["total"] == 1 and len(out["skipped"]) == 1
+
+
+@pytest.mark.anyio
+async def test_list_videos_also_reports_audio_files(mcp, tmp_path):
+    """They translate the same way; the client is told which ones they are
+    because those can only ever produce a subtitle file."""
+    (tmp_path / "a.mkv").write_bytes(b"")
+    (tmp_path / "a.mp3").write_bytes(b"")  # same stem: would fight over a.srt
+    (tmp_path / "ep1.m4a").write_bytes(b"")
+    out = await call(mcp, "list_videos", directory=str(tmp_path))
+    assert [p.rsplit("/", 1)[-1] for p in out["videos"]] == ["a.mkv", "ep1.m4a"]
+    assert [p.rsplit("/", 1)[-1] for p in out["audio"]] == ["ep1.m4a"]
+    assert [p.rsplit("/", 1)[-1] for p in out["shadowed"]] == ["a.mp3"]
+
+
+@pytest.mark.anyio
+async def test_translate_directory_accepts_the_container_it_documents(
+    mcp, monkeypatch
+):
+    """Both parameters were named in the docstring and used in the body,
+    but were missing from the signature — every call raised NameError."""
+    seen = {}
+
+    def fake_create(request):
+        seen["request"] = request
+        return BatchStatus(id="b1", directory=request.directory, total=0)
+
+    monkeypatch.setattr(mcp_server.batch_manager, "create", fake_create)
+    out = await call(
+        mcp, "translate_directory", directory="/films",
+        embed_subtitle=True, container="mp4", video_codec="copy",
+    )
+    assert out["batch_id"] == "b1"
+    assert seen["request"].embed.container == "mp4"
+
+
+@pytest.mark.anyio
+async def test_an_audio_source_is_not_turned_away_over_embedding(mcp, monkeypatch):
+    """The HTTP path degrades it to a subtitle file; MCP must not refuse
+    what the other door accepts."""
+    seen = {}
+
+    def fake_create(request):
+        seen["request"] = request
+        return FakeJob(stage="pending")
+
+    monkeypatch.setattr(mcp_server.manager, "create", fake_create)
+    out = await call(
+        mcp, "translate_video", video_path="/v/ep1.mp3", embed_subtitle=True,
+    )
+    assert "job_id" in out and out.get("error") is None
+    assert seen["request"].embed_subtitle is True
 
 
 # ------------------------------------------------------------- the mount

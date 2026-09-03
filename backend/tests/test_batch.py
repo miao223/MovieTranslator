@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core.media import scan_videos
+from app.core.media import scan_media
 
 
 def make_tree(root: Path):
@@ -18,24 +18,78 @@ def make_tree(root: Path):
     (hidden / "d.mkv").write_bytes(b"x")
 
 
+def add_audio(root: Path):
+    """Audio files on top of make_tree; kept apart so the counts the other
+    tests assert on stay put."""
+    (root / "e.mp3").write_bytes(b"x")
+    (root / "g.m4a").write_bytes(b"x")
+    (root / "g.srt").write_text("1", encoding="utf-8")  # g has subs already
+    (root / "cover.jpg").write_bytes(b"x")
+    (root / "sub" / "f.flac").write_bytes(b"x")
+
+
 def test_scan_recursive_with_skip(tmp_path):
     make_tree(tmp_path)
-    videos, skipped = scan_videos(tmp_path, recursive=True, skip_existing_srt=True)
+    videos, skipped, shadowed = scan_media(
+        tmp_path, recursive=True, skip_existing_srt=True
+    )
     names = [v.name for v in videos]
     assert names == ["a.mkv", "c.avi"]  # b skipped (srt), d hidden, txt ignored
     assert [s.name for s in skipped] == ["b.mp4"]
+    assert shadowed == []
 
 
 def test_scan_non_recursive_no_skip(tmp_path):
     make_tree(tmp_path)
-    videos, skipped = scan_videos(tmp_path, recursive=False, skip_existing_srt=False)
+    videos, skipped, _ = scan_media(
+        tmp_path, recursive=False, skip_existing_srt=False
+    )
     assert [v.name for v in videos] == ["a.mkv", "b.mp4"]
     assert skipped == []
 
 
 def test_scan_rejects_non_directory(tmp_path):
     with pytest.raises(NotADirectoryError):
-        scan_videos(tmp_path / "nope", True, True)
+        scan_media(tmp_path / "nope", True, True)
+
+
+def test_audio_files_are_scanned_like_videos(tmp_path):
+    """A release shared as its audio track alone is the whole point of the
+    feature; the .srt skip has to apply to it the same way."""
+    make_tree(tmp_path)
+    add_audio(tmp_path)
+    found, skipped, shadowed = scan_media(
+        tmp_path, recursive=True, skip_existing_srt=True
+    )
+    assert [f.name for f in found] == ["a.mkv", "e.mp3", "c.avi", "f.flac"]
+    assert [s.name for s in skipped] == ["b.mp4", "g.m4a"]
+    assert shadowed == []
+
+
+def test_an_audio_twin_of_a_video_steps_aside(tmp_path):
+    """film.mkv and film.mp3 both write film.srt: translating each would
+    burn an hour of GPU to overwrite the other's subtitle."""
+    make_tree(tmp_path)
+    (tmp_path / "a.mp3").write_bytes(b"x")
+    (tmp_path / "solo.mp3").write_bytes(b"x")
+    found, _, shadowed = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
+    names = [f.name for f in found]
+    assert "a.mkv" in names and "a.mp3" not in names
+    assert "solo.mp3" in names  # no video of that name, so it stands
+    assert [s.name for s in shadowed] == ["a.mp3"]
+
+
+def test_a_video_already_subtitled_still_shadows_its_audio(tmp_path):
+    """The grouping runs before the .srt check on purpose: the other order
+    lets b.mp3 live on and overwrite the subtitle b.mp4 already has."""
+    make_tree(tmp_path)
+    (tmp_path / "b.mp3").write_bytes(b"x")
+    found, skipped, shadowed = scan_media(
+        tmp_path, recursive=True, skip_existing_srt=True
+    )
+    assert "b.mp3" not in [f.name for f in found]
+    assert [s.name for s in shadowed] == ["b.mp3"]
+    assert [s.name for s in skipped] == ["b.mp4"]
 
 
 def test_batch_endpoints(tmp_path):
@@ -51,6 +105,8 @@ def test_batch_endpoints(tmp_path):
         params={"path": str(tmp_path), "recursive": True, "skip_existing": True},
     ).json()
     assert scan["total"] == 2 and len(scan["skipped"]) == 1
+    assert scan["audio"] == [] and scan["audio_count"] == 0
+    assert scan["shadowed"] == []
 
     r = c.post("/api/batch", json={"directory": str(tmp_path)})
     assert r.status_code == 200
@@ -220,3 +276,36 @@ def test_batch_passes_the_container_and_codec_to_each_job(tmp_path, monkeypatch)
     assert {r.embed.container for r in seen} == {"mp4"}
     assert {r.embed.video_codec for r in seen} == {"libx265"}
     assert {r.embed.quality for r in seen} == {30}
+
+
+def test_the_scan_endpoint_names_the_audio_files(tmp_path):
+    """The confirm dialog warns that these only ever produce a subtitle
+    file, so it needs to know which of them they are."""
+    from tests.conftest import local_client
+
+    from app.main import app
+
+    make_tree(tmp_path)
+    add_audio(tmp_path)
+    (tmp_path / "a.mp3").write_bytes(b"x")
+    with local_client(app) as c:
+        scan = c.get("/api/batch/scan", params={"path": str(tmp_path)}).json()
+    assert [Path(a).name for a in scan["audio"]] == ["e.mp3", "f.flac"]
+    assert scan["audio_count"] == 2
+    assert [Path(s).name for s in scan["shadowed"]] == ["a.mp3"]
+
+
+def test_a_directory_of_only_audio_can_be_batched(tmp_path):
+    """The error a moment ago said "no video files" and stopped there."""
+    from tests.conftest import local_client
+
+    from app.main import app
+
+    (tmp_path / "ep1.mp3").write_bytes(b"x")
+    (tmp_path / "ep2.m4a").write_bytes(b"x")
+    with local_client(app) as c:
+        r = c.post("/api/batch", json={"directory": str(tmp_path)})
+        assert r.status_code == 200
+        batch_id = r.json()["id"]
+        assert r.json()["total"] == 2
+        c.post(f"/api/batch/{batch_id}/cancel")

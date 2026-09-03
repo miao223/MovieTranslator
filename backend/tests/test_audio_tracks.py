@@ -68,6 +68,56 @@ def make_multitrack_video(path: Path, tracks=(("jpn", "日本語", 0.0), ("eng",
     return path
 
 
+def make_audio_file(path: Path, codec="aac", lang="jpn", amp=0.6, cover=False):
+    """Synthesize a file with no picture — a release shared as its audio.
+
+    The suffix picks the container ('.m4a', '.mka', '.flac', ...), which is
+    the point of some of the tests: '.mka' looks like a video to an extension
+    table and is not one. With *cover* it carries album art, the trap that
+    makes `streams.video` the wrong question to ask — that one needs a
+    container ffmpeg lets mjpeg into, i.e. '.mp3' (m4a and mka both refuse).
+    """
+    import av
+
+    with av.open(str(path), "w") as container:
+        st = container.add_stream(codec, rate=SR)
+        st.layout = "mono"
+        st.metadata["language"] = lang
+
+        art = None
+        if cover:
+            art = container.add_stream("mjpeg", rate=1)
+            art.width, art.height = 32, 32
+            art.pix_fmt = "yuvj420p"
+            art.disposition = av.stream.Disposition.attached_pic
+
+        pts = 0
+        for _ in range(16):
+            t = (np.arange(1024) + pts) / SR
+            samples = (amp * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+            af = av.AudioFrame.from_ndarray(
+                samples.reshape(1, -1), format="fltp", layout="mono"
+            )
+            af.sample_rate = SR
+            af.time_base = fractions.Fraction(1, SR)
+            af.pts = pts
+            pts += 1024
+            for packet in st.encode(af):
+                container.mux(packet)
+        if art is not None:
+            frame = av.VideoFrame.from_ndarray(
+                np.full((32, 32, 3), 200, dtype=np.uint8), format="rgb24"
+            )
+            frame.pts = 0
+            for packet in art.encode(frame):
+                container.mux(packet)
+            for packet in art.encode(None):
+                container.mux(packet)
+        for packet in st.encode(None):
+            container.mux(packet)
+    return path
+
+
 @pytest.fixture(scope="module")
 def multitrack(tmp_path_factory):
     return make_multitrack_video(tmp_path_factory.mktemp("mt") / "dual.mkv")
@@ -362,3 +412,19 @@ def test_a_track_that_yields_almost_nothing_fails_the_job(tmp_path):
     with pytest.raises(ValueError) as err:
         extract_audio(path, tmp_path / "stub.wav", track_index=1)
     assert "只解码出" in str(err.value) and "改选其他音轨" in str(err.value)
+
+
+# ----------------------------------------------------- audio-only sources
+
+
+def test_an_audio_file_yields_a_track_and_a_wav(tmp_path):
+    """The pipeline's first stage already worked on these; only the entry
+    gate kept them out. This is the proof it still does."""
+    src = make_audio_file(tmp_path / "ep1.m4a")
+    tracks = list_tracks(src)
+    assert len(tracks) == 1 and tracks[0]["language"] == "jpn"
+
+    wav = extract_audio(src, tmp_path / "out.wav")
+    with __import__("wave").open(str(wav)) as w:
+        assert w.getframerate() == 16_000 and w.getnchannels() == 1
+        assert w.getnframes() > 0

@@ -187,7 +187,7 @@ class JobLogWriter:
         except Exception as exc:  # noqa: BLE001
             self.section("媒体信息", [f"（探测失败: {exc}）"])
 
-    def write_request(self, request) -> None:
+    def write_request(self, request, audio_only: bool = False) -> None:
         if request.text_source == "subtitle":
             # explains a job that never loads a model or touches the audio
             source = "片源已有的字幕（跳过语音识别）"
@@ -201,16 +201,26 @@ class JobLogWriter:
                 source += "（读不到则改用语音识别）"
         else:
             source = "语音识别"
+        if request.embed_subtitle and audio_only:
+            output = "独立字幕文件（纯音频片源，已忽略「合成新视频」）"
+        elif request.embed_subtitle:
+            output = _embed_summary(request)
+        else:
+            output = "独立字幕文件"
+        frames = f"{len(request.frame_tasks)} 条"
+        if request.frame_tasks and audio_only:
+            frames += "（纯音频片源，已跳过）"
+        elif request.frame_only:
+            frames += "（仅补充模式）"
         self.section("任务参数", [
             f"原文来源      : {source}",
             f"源语言        : {request.source_language}",
             f"目标语言      : {request.target_language}",
             f"字幕形式      : {request.output_mode}",
-            f"输出形式      : {_embed_summary(request) if request.embed_subtitle else '独立字幕文件'}",
+            f"输出形式      : {output}",
             f"指定音轨      : {request.audio_track if request.audio_track is not None else '（自动）'}"
             + (f" 语言偏好={request.audio_language}" if request.audio_language else ""),
-            f"画面翻译      : {len(request.frame_tasks)} 条"
-            + ("（仅补充模式）" if request.frame_only else ""),
+            f"画面翻译      : {frames}",
             f"剧情简介      : {'已填写 ' + str(len(request.synopsis)) + ' 字' if request.synopsis.strip() else '（无）'}",
             # explains a glossary in the prompt that is nowhere in settings
             f"剧集模式      : {'开（本批共用译名表 ' + request.series_id + '）' if request.series_id else '关'}",

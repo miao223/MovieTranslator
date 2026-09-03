@@ -41,6 +41,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import av
 
 from app.models.schemas import EmbedSettings
+from app.services import audio
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[float], None]  # 0..1
@@ -448,11 +449,8 @@ def embed(
             # flagged attached_pic. Re-encoding that as if it were the film
             # is both pointless and wrong, so only the real picture is
             # transcoded and the cover travels as a copy like any other.
-            picture = next(
-                (s.index for s in source.streams.video
-                 if not (s.disposition & av.stream.Disposition.attached_pic)),
-                None,
-            )
+            real = audio.picture_stream(source)
+            picture = real.index if real is not None else None
             copies: Dict[int, object] = {}       # source index -> copied stream
             encoders: Dict[int, object] = {}     # source index -> encoding stream
             resamplers: Dict[int, object] = {}   # source index -> AudioResampler

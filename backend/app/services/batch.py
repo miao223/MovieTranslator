@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from app.core.media import scan_videos
+from app.core.media import scan_media
 from app.models.schemas import BatchRequest, BatchStatus, JobRequest
 from app.services import series
 from app.services.pipeline import manager as job_manager
@@ -35,11 +35,11 @@ class BatchManager:
         self.batches: Dict[str, Batch] = {}
 
     def create(self, req: BatchRequest) -> BatchStatus:
-        videos, skipped = scan_videos(
+        videos, skipped, _shadowed = scan_media(
             req.directory, req.recursive, req.skip_existing_srt
         )
         if not videos:
-            raise ValueError("目录中没有需要翻译的视频文件")
+            raise ValueError("目录中没有需要翻译的视频或音频文件")
         batch = Batch(
             id=uuid.uuid4().hex[:12],
             directory=req.directory,

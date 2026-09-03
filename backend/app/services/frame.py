@@ -6,6 +6,8 @@ from pathlib import Path
 
 import av
 
+from app.services import audio
+
 MAX_WIDTH = 1280  # frames are downscaled to save vision-model tokens
 
 
@@ -30,7 +32,10 @@ def extract_frame(video_path: str | Path, seconds: float, out_jpg: str | Path) -
     """Save the frame at *seconds* as a JPEG (width capped at MAX_WIDTH)."""
     out_jpg = Path(out_jpg)
     with av.open(str(video_path)) as container:
-        if not container.streams.video:
+        # a cover image is a video stream too, and translating the album art
+        # at every timestamp is worse than saying there is no picture
+        stream = audio.picture_stream(container)
+        if stream is None:
             raise ValueError("视频中没有画面流")
         duration = (
             float(container.duration / av.time_base) if container.duration else None
@@ -39,7 +44,6 @@ def extract_frame(video_path: str | Path, seconds: float, out_jpg: str | Path) -
             raise ValueError(
                 f"时间点 {seconds:.0f}s 超出视频时长 {duration:.0f}s"
             )
-        stream = container.streams.video[0]
         container.seek(int(seconds * av.time_base))
         frame_found = None
         for frame in container.decode(stream):

@@ -75,9 +75,18 @@ _run_slot = threading.Semaphore(1)  # one CPU-heavy job at a time
 
 
 class Job:
-    def __init__(self, request: JobRequest):
+    def __init__(self, request: JobRequest, audio_only: Optional[bool] = None):
         self.id = uuid.uuid4().hex[:12]
         self.request = request
+        # A source with no picture cannot be muxed into a video and has no
+        # frames to translate. Worked out here rather than only in
+        # JobManager.create so that a Job built directly (as the tests do)
+        # answers the question correctly too; create passes its own probe in
+        # so the container is opened once per job, not twice.
+        self.audio_only = (
+            audio_only if audio_only is not None
+            else not audio.has_picture(request.video_path)
+        )
         self.status = JobStatus(id=self.id, video_path=request.video_path)
         self.cancel_event = threading.Event()
         self.events: List[ProgressEvent] = []
@@ -130,8 +139,17 @@ class JobManager:
     def create(self, request: JobRequest) -> Job:
         video = Path(request.video_path)
         if not video.is_file():
-            raise FileNotFoundError(f"视频文件不存在: {video}")
-        if request.embed_subtitle and request.embed.video_codec != mux.COPY:
+            raise FileNotFoundError(f"片源文件不存在: {video}")
+        audio_only = not audio.has_picture(video)
+        if request.frame_only and audio_only:
+            # embed_subtitle degrades quietly on an audio source, but frame
+            # translation IS the whole output here — running it would mean
+            # producing nothing at all.
+            raise ValueError("纯音频片源没有画面，无法使用「仅补充画面翻译」")
+        # audio sources never reach the encoder (see _embed_subtitle), so the
+        # check below must not reject them before that degradation happens
+        if (request.embed_subtitle and not audio_only
+                and request.embed.video_codec != mux.COPY):
             # Checked here rather than at mux time: the mux runs after an
             # hour of transcription and translation, and "this machine has
             # no such encoder" is knowable right now.
@@ -141,7 +159,7 @@ class JobManager:
                     f"本机无法使用编码器 {request.embed.video_codec}。"
                     f"可用的有：{'、'.join(sorted(usable)) or '（无）'}"
                 )
-        job = Job(request)
+        job = Job(request, audio_only=audio_only)
         self.jobs[job.id] = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job
@@ -236,6 +254,23 @@ class JobManager:
             if st["status"] == "done":
                 return 20.0
             time.sleep(1)
+
+    def _frame_lines(
+        self, job: Job, req: JobRequest, settings, workdir: Path
+    ) -> List[SubtitleLine]:
+        """The frame translations, or nothing when there is no picture.
+
+        Not left to per-task failure: an audio file with album art *has* a
+        video stream, so every task would cheerfully translate the cover.
+        """
+        if job.audio_only:
+            job.publish(
+                "translating", 94,
+                log=f"⚠ 纯音频片源没有画面，已跳过 {len(req.frame_tasks)} 条画面翻译"
+                    "（不影响字幕生成）",
+            )
+            return []
+        return self._translate_frames(job, req, settings, workdir)
 
     def _translate_frames(
         self, job, req, settings, workdir: Path,
@@ -356,7 +391,7 @@ class JobManager:
     def _write_diagnostics(self, job: Job, req: JobRequest, settings) -> None:
         """Header that lets one log file explain a failure on its own."""
         job.logfile.write_environment()
-        job.logfile.write_request(req)
+        job.logfile.write_request(req, audio_only=job.audio_only)
         job.logfile.write_settings(settings)
         job.logfile.write_media(req.video_path)
         job.logfile.section("进度", [])
@@ -364,6 +399,19 @@ class JobManager:
     def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
         settings = config.load_settings()
         self._write_diagnostics(job, req, settings)
+        if job.audio_only and req.embed_subtitle:
+            # said now, not at 95%: someone waiting for a video should not
+            # learn an hour later that there was never going to be one
+            job.publish(
+                "extracting", 0,
+                log="⚠ 纯音频片源没有画面，本次将忽略「合成带字幕的新视频」，"
+                    "改为在音频所在目录生成字幕文件",
+            )
+        if job.audio_only and req.frame_tasks:
+            job.publish(
+                "extracting", 0,
+                log=f"⚠ 纯音频片源没有画面，将跳过 {len(req.frame_tasks)} 条画面翻译",
+            )
         if req.frame_only:
             self._execute_frame_only(job, req, workdir)
             return
@@ -815,7 +863,7 @@ class JobManager:
         # 3b. on-screen text translation (画面翻译) — best-effort per task,
         # failures must never affect the speech subtitles
         if req.frame_tasks:
-            frame_lines = self._translate_frames(job, req, settings, workdir)
+            frame_lines = self._frame_lines(job, req, settings, workdir)
             if frame_lines:
                 lines = sorted(lines + frame_lines, key=lambda l: l.start)
 
@@ -864,7 +912,16 @@ class JobManager:
         A failure here must never cost the hour of transcription and
         translation behind it, so anything short of a cancellation degrades
         to writing the subtitle file — the behaviour with the switch off.
+
+        A source with no picture is one such failure, decided before anything
+        is written: muxing it would produce a video file with nothing to watch.
         """
+        if job.audio_only:
+            job.publish(
+                "composing", 95,
+                log="⚠ 纯音频片源没有画面，无法合成带字幕的视频，已改为生成字幕文件",
+            )
+            return None
         job.srt_path = workdir / f"{video.stem}{ext}"
         job.srt_path.write_text(srt_text, encoding="utf-8")
         job.status.srt_in_place = False
