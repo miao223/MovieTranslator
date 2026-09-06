@@ -150,6 +150,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             text = "{\\an7}" + translation
         elif mode == "translation_only":
             text = translation
+        elif mode == "original_only":
+            # Default 样式（＝设置里的「译文」字号/颜色），不是 orig_tag：原文
+            # 在这里是唯一一行，套 original_font_size 那套小字灰色是给双语副
+            # 行准备的，单独用会读成注释。代价是纯原文下「原文字号/颜色」两
+            # 个设置项不生效——刻意不在设置页加 guard，与 translation_only 一致。
+            text = original
         elif settings.bilingual_layout == "translation_top":
             text = f"{translation}\\N{orig_tag}{original}"
         else:
@@ -168,8 +174,17 @@ def build_srt(
 ) -> str:
     """Render *lines* as SRT text.
 
-    mode: "bilingual" (original + translation) or "translation_only".
-    Lines with an empty translation fall back to the original text.
+    mode: "bilingual"（原文 + 译文）、"translation_only"（只要译文）、
+    "original_only"（只要原文——对白根本没送去翻译）。
+
+    Lines with an empty translation fall back to the original text, which is
+    exactly why original_only needs a branch of its own rather than riding on
+    that fallback: with it, "bilingual" would print the same sentence twice.
+    The fallback itself has to stay — a partly failed translation must still
+    produce a watchable file.
+
+    is_frame cues ignore *mode* entirely and stay translated: 画面文字与对白
+    是两件事，纯原文模式下对白保持原文而招牌/标题仍译成目标语言。
     """
     blocks: List[str] = []
     wrap = settings.max_chars_per_line
@@ -184,6 +199,11 @@ def build_srt(
             text = "{\\an7}" + translation
         elif mode == "translation_only":
             text = translation
+        elif mode == "original_only":
+            # 必须有自己的分支：上面那行 `line.translation.strip() or line.text`
+            # 的空译文回退，会让「不翻译」在 bilingual 下把同一句原文输出两遍。
+            # 而那条回退本身不能删——译文部分失败时成品仍要能看。
+            text = original
         else:
             if settings.bilingual_layout == "translation_top":
                 text = f"{translation}\n{original}"

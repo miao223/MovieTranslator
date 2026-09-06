@@ -119,6 +119,24 @@ def language_of(target_language: str) -> tuple[str, str]:
     return LANGUAGES.get(target_language.strip(), FALLBACK)
 
 
+def source_language_of(detected: str) -> tuple[str, str, str]:
+    """(文件名后缀, 轨道 ISO-639-2/B 标签, 轨道标题) —— language_of 的镜像。
+
+    纯原文模式（output_mode="original_only"）的产物是片子自己的语言，那不是
+    LANGUAGES 里那七个可选目标之一，而是 pipeline 一路传下来的 `detected`。
+    它始终是两字母码（whisper 自己的、subsource.iso2 过的轨道标签、用户在源
+    语言里选的，或 subsource.detect_language 判的），所以后缀就是它本身，标
+    签取它的 ISO 639-2/B 形式。
+
+    空字符串＝什么都没判定出来。此时给 orig / und 而不是猜一个：一条诚实标着
+    「未知」的轨道，比一条标着 eng 的日语轨道有用得多。
+    """
+    code = (detected or "").strip().lower()
+    if not code:
+        return ("orig", "und", "原文字幕")
+    return (code, audio.canon_language(code), f"{audio.language_name(code)}字幕")
+
+
 def _start_time(container) -> float:
     st = container.start_time
     # AV_NOPTS_VALUE comes back as a huge number rather than None
@@ -151,13 +169,18 @@ def start_offset(container, video_path: Path) -> float:
     return min(_start_time(container), _first_dts(video_path))
 
 
-def output_path(video: Path, target_language: str, container: str = "mkv") -> Path:
+def output_path(video: Path, target_language: str, container: str = "mkv",
+                suffix: str = "") -> Path:
     """Where the muxed film goes: film.mkv -> film.zh.mkv, same folder.
+
+    *suffix* overrides the one derived from *target_language*: 纯原文按片子自
+    己的语言命名（film.ja.mkv），而那个语言不在 LANGUAGES 里——见
+    source_language_of.
 
     Never returns a path that already exists — overwriting the user's video
     library is not a risk worth taking for a naming collision.
     """
-    suffix = language_of(target_language)[0]
+    suffix = suffix.strip() or language_of(target_language)[0]
     ext = container if container in CONTAINERS else "mkv"
     candidate = video.parent / f"{video.stem}.{suffix}.{ext}"
     n = 2
@@ -415,6 +438,7 @@ def embed(
     progress: Optional[ProgressFn] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     track_title: str = "",
+    track_language: str = "",
 ) -> Path:
     """Write *video_path* to *out_path* with *subtitle_path* as a track.
 
@@ -423,6 +447,10 @@ def embed(
     when cancelled, and anything PyAV raises when the copy or the encode
     fails — the caller is expected to fall back to writing the subtitle file
     rather than losing the job.
+
+    *track_language* is the ISO-639-2/B tag for the subtitle track, already
+    worked out by the caller; it overrides the one derived from
+    *target_language*. 纯原文的轨道语言是片子自己的语言，不是翻译目标。
     """
     opts = opts or EmbedSettings()
     video_path, subtitle_path, out_path = (
@@ -432,7 +460,7 @@ def embed(
     # written under a temporary name: a half-copied film left in the user's
     # library looks exactly like a real one until they try to play it
     part = out_path.with_name(out_path.name + ".part")
-    lang = language_of(target_language)[1]
+    lang = track_language.strip() or language_of(target_language)[1]
     fmt = CONTAINERS.get(opts.container, "matroska")
     mp4 = fmt == "mp4"
 

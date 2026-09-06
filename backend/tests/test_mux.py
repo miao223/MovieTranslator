@@ -96,6 +96,30 @@ def test_an_existing_file_is_never_overwritten(tmp_path):
     assert mux.output_path(tmp_path / "film.mkv", "简体中文").name == "film.zh.2.mkv"
 
 
+def test_the_source_language_names_the_track_and_the_file():
+    """纯原文的产物是片子自己的语言，那不在 LANGUAGES 那七个目标里。"""
+    assert mux.source_language_of("ja") == ("ja", "jpn", "日语字幕")
+    assert mux.source_language_of(" JA ") == ("ja", "jpn", "日语字幕")
+    # 判不出来就说判不出来：标着 und 的轨道比标着 eng 的日语轨道有用得多
+    assert mux.source_language_of("") == ("orig", "und", "原文字幕")
+    # 表外的语言仍然说真话，而不是退回一句「原文」
+    assert mux.source_language_of("sv") == ("sv", "sv", "sv字幕")
+
+
+def test_a_given_suffix_overrides_the_target_language(tmp_path):
+    """纯原文按源语言命名，与目标语言无关。"""
+    out = mux.output_path(tmp_path / "film.mkv", "简体中文", "mkv", suffix="ja")
+    assert out == tmp_path / "film.ja.mkv"
+
+
+def test_the_overriding_suffix_still_refuses_to_overwrite(tmp_path):
+    """防覆盖的循环对新参数同样生效——它防的是用户的片库。"""
+    (tmp_path / "film.ja.mkv").write_bytes(b"someone's video")
+    assert mux.output_path(
+        tmp_path / "film.mkv", "简体中文", "mkv", suffix="ja"
+    ).name == "film.ja.2.mkv"
+
+
 # -------------------------------------------------------------- the remux
 
 
@@ -134,6 +158,19 @@ def test_the_subtitle_track_announces_itself(video, tmp_path):
         assert track.metadata["language"] == "chi"
         assert track.metadata["title"] == "简体中文字幕"
         assert track.disposition & av.stream.Disposition.default
+
+
+def test_the_track_is_tagged_with_the_language_it_is_actually_in(video, tmp_path):
+    """纯原文的轨道装的是原文，标签必须跟着原文走而不是翻译目标——
+    一条内容是日语、标签写 chi 的轨道，播放器和媒体库都会选错。"""
+    out = mux.embed(
+        video, _write_subs(tmp_path, mode="original_only"), tmp_path / "out.mkv",
+        "简体中文", track_title="日语字幕", track_language="jpn",
+    )
+    with av.open(str(out)) as c:
+        track = c.streams.subtitles[0]
+        assert track.metadata["language"] == "jpn"
+        assert track.metadata["title"] == "日语字幕"
 
 
 def test_the_embedded_cues_are_the_ones_we_wrote(video, tmp_path):
@@ -286,6 +323,33 @@ def test_the_stage_embeds_and_keeps_the_subtitle_out_of_the_video_folder(
     assert job.status.video_filename == str(out)
     assert not (video.parent / "film.srt").exists()  # nothing beside the video
     assert (workdir / "film.srt").is_file() and job.srt_path == workdir / "film.srt"
+
+
+def test_the_pure_original_stage_names_everything_after_the_source_language(
+    video, tmp_path, job_factory
+):
+    """detected 一个值，三个落点：文件名后缀、轨道标签、轨道标题。
+
+    片名.zh.mkv 装着日语原文是彻头彻尾的谎；而工作目录里那份字幕也要带后缀，
+    因为它就是「下载字幕」按钮吐给用户的文件名。
+    """
+    from app.services.pipeline import manager
+
+    job = job_factory(video, target_language="简体中文", output_mode="original_only")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    out = manager._embed_subtitle(
+        job, job.request, workdir, video, ".srt",
+        subtitle.build_srt(LINES, SubtitleSettings(), mode="original_only"),
+        detected="ja",
+    )
+
+    assert out == video.parent / "film.ja.mkv" and out.is_file()
+    assert job.srt_path == workdir / "film.ja.srt"
+    with av.open(str(out)) as c:
+        track = c.streams.subtitles[0]
+        assert track.metadata["language"] == "jpn"
+        assert track.metadata["title"] == "日语字幕"
 
 
 def test_a_failed_mux_falls_back_to_writing_the_subtitle(

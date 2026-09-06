@@ -340,9 +340,14 @@ class JobManager:
         same-stem subtitle file (.ass preferred over .srt) in place."""
         settings = config.load_settings()
         video = Path(req.video_path)
+        # 纯原文的产物带语言后缀（片名.ja.srt），两个精确候选认不出来——所以
+        # 在它们之后再兜一层 glob，否则「先跑纯原文、之后补画面翻译」是死路
         target = next(
-            (p for p in (video.with_suffix(".ass"), video.with_suffix(".srt"))
-             if p.is_file()),
+            (p for p in (
+                video.with_suffix(".ass"), video.with_suffix(".srt"),
+                *sorted(video.parent.glob(f"{video.stem}.*.ass")),
+                *sorted(video.parent.glob(f"{video.stem}.*.srt")),
+            ) if p.is_file()),
             None,
         )
         if target is None:
@@ -576,9 +581,10 @@ class JobManager:
             "importing", 50,
             log=f"字幕语言: {detected or '未知'}（{source}）",
         )
-        if detected and detected == subsource.iso2(
-            mux.language_of(req.target_language)[1]
-        ):
+        if (detected and req.output_mode != "original_only" and detected
+                == subsource.iso2(mux.language_of(req.target_language)[1])):
+            # 纯原文除外：那个模式下 target_language 只管画面翻译，对白本来就
+            # 要保持这份字幕的语言——命中正是它的定义，不是可疑信号
             # the most likely explanation is a previous run of this program
             job.publish(
                 "importing", 50,
@@ -780,6 +786,10 @@ class JobManager:
                 detected: str, glossary: str, shared, refine_usage: dict,
                 vet_usage: dict, segments=None) -> None:
         """Mark lyrics, translate, compose, and hand back the result."""
+        # 纯原文：跳过的只有对白翻译这一步，它前后的每一件事照旧——转写预处理、
+        # 歌词识别、二次识别复核、OCR 校对都已经跑完了，这个模式把这条流水线
+        # 当成一个高质量的转写器，而不是「把翻译关掉」。
+        translate = req.output_mode != "original_only"
         # 4. mark what is sung rather than spoken -------------------------
         # After refine, because merging and splitting lines would tear a
         # ♪ … ♪ pair apart; before translation, so the lyrics can be
@@ -801,43 +811,63 @@ class JobManager:
             self._debug_lyric_agreement(debug, lines, segments)
 
         # 3. translate ----------------------------------------------------
-        job.publish("translating", 72, message="AI 翻译中（全局上下文）…")
+        translator = None
+        if translate:
+            job.publish("translating", 72, message="AI 翻译中（全局上下文）…")
 
-        def tr_log(msg: str):
-            job.publish("translating", job.status.progress, log=msg)
+            def tr_log(msg: str):
+                job.publish("translating", job.status.progress, log=msg)
 
-        if shared and len(shared):
-            tr_log(f"剧集模式：沿用本批已确定的 {len(shared)} 条译名")
+            if shared and len(shared):
+                tr_log(f"剧集模式：沿用本批已确定的 {len(shared)} 条译名")
 
-        translator = Translator(
-            settings.llm,
-            target_language=req.target_language,
-            synopsis=req.synopsis,
-            log=tr_log,
-            progress=lambda f: job.publish(
-                "translating", 72 + 23 * min(max(f, 0.0), 1.0),
-                message=f"AI 翻译中… {min(max(f, 0.0), 1.0):.0%}",
-            ),
-            should_cancel=job.cancel_event.is_set,
-            prompts=settings.prompts.model_copy(update={"glossary": glossary}),
-            max_line_chars=settings.subtitle.max_chars_per_line,
-            network=settings.network,
-            debug=debug,
-        )
-        translator.translate(lines)
-        if shared and translator.glossary_text:
-            added, clashes = shared.learn(
-                translator.glossary_text, settings.prompts.glossary
+            translator = Translator(
+                settings.llm,
+                target_language=req.target_language,
+                synopsis=req.synopsis,
+                log=tr_log,
+                progress=lambda f: job.publish(
+                    "translating", 72 + 23 * min(max(f, 0.0), 1.0),
+                    message=f"AI 翻译中… {min(max(f, 0.0), 1.0):.0%}",
+                ),
+                should_cancel=job.cancel_event.is_set,
+                prompts=settings.prompts.model_copy(update={"glossary": glossary}),
+                max_line_chars=settings.subtitle.max_chars_per_line,
+                network=settings.network,
+                debug=debug,
             )
-            tr_log(
-                f"剧集模式：本集新增 {added} 条译名，累计 {len(shared)} 条"
-                + (
-                    f"\n⚠ {len(clashes)} 条与已确定的译法不一致，已沿用先前译法"
-                    "（如需改用新译法，请在设置的术语表里写死）：\n  "
-                    + "\n  ".join(clashes[:20])
-                    if clashes else ""
+            translator.translate(lines)
+            if shared and translator.glossary_text:
+                added, clashes = shared.learn(
+                    translator.glossary_text, settings.prompts.glossary
                 )
+                tr_log(
+                    f"剧集模式：本集新增 {added} 条译名，累计 {len(shared)} 条"
+                    + (
+                        f"\n⚠ {len(clashes)} 条与已确定的译法不一致，已沿用先前译法"
+                        "（如需改用新译法，请在设置的术语表里写死）：\n  "
+                        + "\n  ".join(clashes[:20])
+                        if clashes else ""
+                    )
+                )
+        else:
+            # 阶段名会直接映射成前端的「AI 翻译」标签，所以这里不发 translating
+            # 事件：让一个一次都不调翻译模型的任务顶着那个标签，比进度条从 72
+            # 跳到 95 严重得多。进度停在 72（预处理刚做完，这就是真实状态）。
+            job.publish(
+                "refining", 72,
+                log="纯原文模式：本次不调用翻译模型，对白保持原文。"
+                    "转写预处理 / 歌词识别 / 二次识别复核 / OCR 校对均已照常执行"
+                    + ("；画面翻译仍会译成目标语言" if req.frame_tasks else ""),
             )
+            if shared:
+                # 剧集模式写入侧的唯一输入是译名表，而纯原文不产生译名表；读取
+                # 侧（合并后喂给转写预处理的 glossary）照旧生效，开关不是白开
+                job.publish(
+                    "refining", 72,
+                    log="剧集模式：纯原文不产生新的译名表，本集不会写入本批对照表"
+                        "（设置里的术语表仍然用于转写预处理）",
+                )
         if settings.prompts.mark_lyrics or any(l.is_lyric for l in lines):
             # the model was asked to keep the ♪; a marker it dropped or moved
             # onto the neighbouring line would be worse than none, so the
@@ -845,16 +875,22 @@ class JobManager:
             # covers lyrics marking being off while an imported subtitle
             # brought its own ♪ — those were stripped on the way in and have
             # to be written back, or the source's own marks would vanish.
+            #
+            # 纯原文同样要跑，所以这一段刻意留在 `if translate` 之外：♪ 是
+            # apply_marks 写进文本的（mark_lyrics 只置 is_lyric 标志），把它
+            # 顺手塞进翻译分支里就会静默丢掉全部歌词标记，包括 subsource 从
+            # 片源自带字幕里剥下来、承诺要写回去的那些。
             lyrics.apply_marks(lines)
-        job.publish(
-            "translating", 95,
-            log=(
-                (_usage_line("二次识别复核", vet_usage) + "\n" if vet_usage["calls"] else "")
-                + (_usage_line("歌词识别", lyrics_usage) + "\n" if lyrics_usage["calls"] else "")
-                + _usage_line("转写预处理", refine_usage)
-                + "\n" + translator.report_usage()
-            ),
-        )
+        preprocess = _preprocess_usage(vet_usage, lyrics_usage, refine_usage)
+        if translate:
+            job.publish(
+                "translating", 95,
+                log=preprocess + "\n" + translator.report_usage(),
+            )
+        else:
+            job.publish("refining", 72, log=preprocess)
+        # 纯原文下每行的 translation 是空串——那正是这个模式的数据表达，不必
+        # 换个文件名：这份快照的意义是「送进 composing 的那份行集」
         (workdir / "translation.json").write_text(
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
             encoding="utf-8",
@@ -870,6 +906,8 @@ class JobManager:
         # 4. compose subtitle file -----------------------------------------
         styled = settings.subtitle.style_enabled
         ext = ".ass" if styled else ".srt"
+        # 译文模式下 sidecar 恒为 ""，下面两处文件名与改动前逐字节相同
+        sidecar = _naming(req, detected)[0]
         job.publish("composing", 95, message=f"生成 {ext[1:].upper()} 字幕…")
         if styled:
             srt_text = subtitle.build_ass(lines, settings.subtitle, mode=req.output_mode)
@@ -877,10 +915,11 @@ class JobManager:
             srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
         # embed mode keeps the subtitle in the work dir — the download button
         # and the debug artifacts still want it, the video folder does not
-        muxed = self._embed_subtitle(job, req, workdir, video, ext, srt_text) \
+        muxed = self._embed_subtitle(job, req, workdir, video, ext, srt_text,
+                                     detected=detected) \
             if req.embed_subtitle else None
         if muxed is None:
-            target = video.parent / f"{video.stem}{ext}"
+            target = video.parent / f"{video.stem}{sidecar}{ext}"
             try:
                 target.write_text(srt_text, encoding="utf-8")
                 job.srt_path = target
@@ -888,7 +927,7 @@ class JobManager:
             except OSError as exc:
                 # video dir not writable (read-only share etc.): keep it in the
                 # work dir and let the UI offer a download instead
-                job.srt_path = workdir / f"{video.stem}{ext}"
+                job.srt_path = workdir / f"{video.stem}{sidecar}{ext}"
                 job.srt_path.write_text(srt_text, encoding="utf-8")
                 job.status.srt_in_place = False
                 job.publish(
@@ -905,7 +944,7 @@ class JobManager:
 
     def _embed_subtitle(
         self, job: Job, req: JobRequest, workdir: Path,
-        video: Path, ext: str, srt_text: str,
+        video: Path, ext: str, srt_text: str, detected: str = "",
     ) -> Optional[Path]:
         """Mux the subtitle into a new video. Returns None to fall back.
 
@@ -915,6 +954,11 @@ class JobManager:
 
         A source with no picture is one such failure, decided before anything
         is written: muxing it would produce a video file with nothing to watch.
+
+        *detected* is the language of the original text; only 纯原文 uses it.
+        There the track is in the film's own language, and the file name, the
+        stream tag and the track title all follow it rather than the
+        translation target (see _naming).
         """
         if job.audio_only:
             job.publish(
@@ -922,10 +966,13 @@ class JobManager:
                 log="⚠ 纯音频片源没有画面，无法合成带字幕的视频，已改为生成字幕文件",
             )
             return None
-        job.srt_path = workdir / f"{video.stem}{ext}"
+        sidecar, suffix, lang, title = _naming(req, detected)
+        # 工作目录里这一份也带后缀：它就是「下载字幕」按钮吐给用户的文件名
+        job.srt_path = workdir / f"{video.stem}{sidecar}{ext}"
         job.srt_path.write_text(srt_text, encoding="utf-8")
         job.status.srt_in_place = False
-        out = mux.output_path(video, req.target_language, req.embed.container)
+        out = mux.output_path(video, req.target_language, req.embed.container,
+                              suffix=suffix)
         recoding = req.embed.video_codec != mux.COPY
         how = (f"重编码为 {mux.encoder_label(req.embed.video_codec)}"
                if recoding else "复制音视频流，不重编码")
@@ -946,7 +993,8 @@ class JobManager:
                 video, job.srt_path, out,
                 target_language=req.target_language,
                 opts=req.embed,
-                track_title=f"{req.target_language}字幕",
+                track_title=title,
+                track_language=lang,
                 log=lambda msg: job.publish("composing", job.status.progress, log=msg),
                 progress=lambda f: job.publish(
                     "composing", 95 + 5 * min(max(f, 0.0), 1.0),
@@ -1041,6 +1089,31 @@ class JobManager:
 
 
 
+
+
+def _preprocess_usage(vet_usage: dict, lyrics_usage: dict, refine_usage: dict) -> str:
+    """翻译之外那几个 LLM 环节的 token 汇总——纯原文模式下它就是全部。"""
+    return (
+        (_usage_line("二次识别复核", vet_usage) + "\n" if vet_usage["calls"] else "")
+        + (_usage_line("歌词识别", lyrics_usage) + "\n" if lyrics_usage["calls"] else "")
+        + _usage_line("转写预处理", refine_usage)
+    )
+
+
+def _naming(req: JobRequest, detected: str) -> tuple[str, str, str, str]:
+    """这个任务的产物怎么命名：(字幕文件后缀, 内嵌视频后缀, 轨道标签, 轨道标题)。
+
+    译文模式沿用历史命名——字幕一直是与片源同名的 片名.srt。**那一侧一个字都
+    不能改**，改了所有已经指向它的播放器 / 媒体库全部对不上。
+
+    纯原文两侧都带语言后缀（片名.ja.srt / 片名.ja.mkv）：它的产物极可能和一份
+    译文字幕落在同一个目录里，不加后缀就是互相覆盖。
+    """
+    if req.output_mode == "original_only":
+        suffix, tag, title = mux.source_language_of(detected)
+        return f".{suffix}", suffix, tag, title
+    suffix, tag = mux.language_of(req.target_language)
+    return "", suffix, tag, f"{req.target_language}字幕"
 
 
 def _usage_line(label: str, usage: dict) -> str:

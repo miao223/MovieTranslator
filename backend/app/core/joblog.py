@@ -127,6 +127,13 @@ def _embed_summary(request) -> str:
             f"质量 {embed.quality}／速度 {embed.preset}）")
 
 
+# 排障的第一手段是让用户下载这个文件，而「任务参数」那一节其余每行都是中文
+_OUTPUT_MODES = {
+    "bilingual": "双语（原文 + 译文）",
+    "translation_only": "纯译文",
+    "original_only": "纯原文（不翻译对白，跳过 AI 翻译）",
+}
+
 class JobLogWriter:
     """Appends every published progress line to a file, with a header."""
 
@@ -215,8 +222,10 @@ class JobLogWriter:
         self.section("任务参数", [
             f"原文来源      : {source}",
             f"源语言        : {request.source_language}",
-            f"目标语言      : {request.target_language}",
-            f"字幕形式      : {request.output_mode}",
+            f"目标语言      : {request.target_language}"
+            + ("（纯原文：仅用于画面翻译，对白保持原文）"
+               if request.output_mode == "original_only" else ""),
+            f"字幕形式      : {_OUTPUT_MODES.get(request.output_mode, request.output_mode)}",
             f"输出形式      : {output}",
             f"指定音轨      : {request.audio_track if request.audio_track is not None else '（自动）'}"
             + (f" 语言偏好={request.audio_language}" if request.audio_language else ""),

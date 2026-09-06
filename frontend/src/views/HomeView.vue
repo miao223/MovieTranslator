@@ -335,13 +335,21 @@ const STAGE_LABELS = {
 const running = () =>
   job.value && !['done', 'failed', 'cancelled'].includes(job.value.stage)
 
-const embedExample = computed(() => {
-  const suffix = LANG_SUFFIX[form.target_language] || 'sub'
-  const stem = mode.value === 'single' && form.video_path
-    ? baseName(form.video_path).replace(/\.[^.]+$/, '')
-    : '片名'
-  return `${stem}.${suffix}.${form.embed.container}`
+const isOriginalOnly = computed(() => form.output_mode === 'original_only')
+
+// 纯原文的产物按片子自己的语言命名；选了自动检测就要等识别完才知道，
+// 所以给一个明摆着是占位的写法，而不是拿目标语言冒充
+const langSuffix = computed(() => {
+  if (!isOriginalOnly.value) return LANG_SUFFIX[form.target_language] || 'sub'
+  return form.source_language === 'auto' ? '源语言' : form.source_language
 })
+const stemExample = computed(() =>
+  mode.value === 'single' && form.video_path
+    ? baseName(form.video_path).replace(/\.[^.]+$/, '')
+    : '片名')
+const embedExample = computed(() => `${stemExample.value}.${langSuffix.value}.${form.embed.container}`)
+// 译文字幕一直与片源同名；纯原文带后缀，才不会覆盖同目录已有的那一份
+const sidecarExample = computed(() => `${stemExample.value}.${langSuffix.value}.srt`)
 
 async function start(frameOnly = false) {
   if (!form.video_path) {
@@ -645,13 +653,16 @@ onBeforeUnmount(() => {
           <el-switch v-model="batchForm.recursive" />
           <span class="hint" style="margin-right: 24px">包含子目录</span>
           <el-switch v-model="batchForm.skip_existing_srt" />
-          <span class="hint">跳过已有同名字幕的视频</span>
+          <span class="hint">跳过已有同名字幕的视频<template
+            v-if="isOriginalOnly">（纯原文的产物带语言后缀，这一项认不出来，已跑过的会再跑一遍）</template></span>
         </el-form-item>
         <el-form-item label="剧集模式">
           <el-switch v-model="batchForm.series_mode" />
           <span class="hint">
             本批所有视频共用一份人名/术语译名表：先译出的集数定下的译法，
-            后面每一集都必须沿用。适合整季剧集；目录里是互不相干的影片时请勿开启
+            后面每一集都必须沿用。适合整季剧集；目录里是互不相干的影片时请勿开启<template
+              v-if="isOriginalOnly"><br>纯原文模式不产生新的译名表（没有译文），
+              设置里已有的术语表仍会用于转写预处理</template>
           </span>
         </el-form-item>
         <el-form-item v-if="form.text_source === 'asr'" label="音轨">
@@ -673,12 +684,16 @@ onBeforeUnmount(() => {
         <el-select v-model="form.source_language" style="width: 200px">
           <el-option v-for="l in SOURCE_LANGS" :key="l.value" :value="l.value" :label="l.label" />
         </el-select>
-        <span class="hint">语音识别的源语言，不确定就选自动检测</span>
+        <span class="hint">语音识别的源语言，不确定就选自动检测<template
+          v-if="isOriginalOnly">；纯原文模式下它还决定文件名的语言后缀（选自动检测则以识别结果为准，判不出来时用 <code>orig</code>）</template></span>
       </el-form-item>
       <el-form-item label="目标语言">
         <el-select v-model="form.target_language" style="width: 200px">
           <el-option v-for="l in TARGET_LANGS" :key="l" :value="l" :label="l" />
         </el-select>
+        <span v-if="isOriginalOnly" class="hint">
+          纯原文模式下对白保持原文，这里只决定「画面翻译」译成什么语言
+        </span>
       </el-form-item>
       <el-form-item label="剧情简介">
         <el-input
@@ -692,7 +707,14 @@ onBeforeUnmount(() => {
         <el-radio-group v-model="form.output_mode">
           <el-radio value="bilingual">双语（原文 + 译文）</el-radio>
           <el-radio value="translation_only">纯译文</el-radio>
+          <el-radio value="original_only">纯原文（不翻译）</el-radio>
         </el-radio-group>
+        <div v-if="isOriginalOnly" class="hint" style="margin: 4px 0 0; display: block">
+          只输出识别/读取到的原文，<strong>不调用 AI 翻译</strong>；转写预处理、歌词识别、
+          二次识别复核、图形字幕 OCR 与校对照常执行。<br>
+          文件名会带上源语言后缀（<code>{{ sidecarExample }}</code>），
+          不会覆盖同目录已有的译文字幕。
+        </div>
       </el-form-item>
       <el-form-item label="输出形式">
         <el-radio-group v-model="form.embed_subtitle">
@@ -721,6 +743,10 @@ onBeforeUnmount(() => {
               内嵌轨为纯文本，「字幕样式」不生效；带样式的完整字幕仍可在完成后下载。
             </template><br>
             ⚠️ 这会<strong>完整多出一份视频文件</strong>，批量整季前请先确认磁盘空间。
+          </template>
+          <template v-else-if="isOriginalOnly">
+            在视频所在目录生成 <code>{{ sidecarExample }}</code>（开启「字幕样式」时为 .ass），
+            原视频不动；带源语言后缀是为了不覆盖同目录已有的译文字幕。
           </template>
           <template v-else>
             在视频所在目录生成同名的 .srt（开启「字幕样式」时为 .ass），原视频不动。
@@ -930,6 +956,14 @@ onBeforeUnmount(() => {
       :closable="false"
       style="margin-top: 12px"
       title="将读取每个视频已有的字幕作为原文，跳过语音识别；读不到可用文字字幕的那些会自动改用语音识别"
+    />
+    <!-- 整季跑错模式的代价按小时计，值得在这里再说一遍 -->
+    <el-alert
+      v-if="isOriginalOnly"
+      type="info"
+      :closable="false"
+      style="margin-top: 12px"
+      title="纯原文模式：不调用 AI 翻译，每个视频生成带源语言后缀的原文字幕（如 片名.ja.srt）"
     />
     <!-- a mixed folder is the common shape here: the audio files can only
          ever produce a subtitle file, whatever the output switch says -->

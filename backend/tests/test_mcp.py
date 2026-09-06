@@ -110,6 +110,22 @@ async def test_a_bad_output_mode_is_rejected_before_a_job_starts(mcp, monkeypatc
 
 
 @pytest.mark.anyio
+async def test_the_pure_original_mode_reaches_the_job_request(mcp, monkeypatch):
+    """白名单是手写的元组，加了 Literal 值忘了改这里，MCP 客户端就用不上。"""
+    seen = {}
+
+    def capture(request):
+        seen["mode"] = request.output_mode
+        return FakeJob()
+
+    monkeypatch.setattr(mcp_server.manager, "create", capture)
+    out = await call(mcp, "translate_video", video_path="/v/f.mkv",
+                     output_mode="original_only")
+    assert out["job_id"] == "abc123"   # 起了任务，而不是被白名单挡回来
+    assert seen["mode"] == "original_only"
+
+
+@pytest.mark.anyio
 async def test_unknown_ids_report_instead_of_raising(mcp, monkeypatch):
     def missing(job_id):
         raise KeyError(job_id)

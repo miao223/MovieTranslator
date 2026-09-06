@@ -308,7 +308,10 @@ class JobRequest(BaseModel):
     source_language: str = "auto"  # whisper language code or "auto"
     target_language: str = "简体中文"
     synopsis: str = ""  # optional plot synopsis to steer the translation
-    output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+    # bilingual 双语；translation_only 只要译文；original_only 只要原文——
+    # 跳过 LLM 翻译，但转写预处理 / 歌词识别 / 二次识别复核 / 图形字幕 OCR
+    # 与校对一个都不少。target_language 在这个模式下只作用于画面翻译。
+    output_mode: Literal["bilingual", "translation_only", "original_only"] = "bilingual"
     # produce one new .mkv carrying the subtitle as a switchable soft track
     # instead of a subtitle file next to the video (services/mux.py). The
     # picture is copied, never re-encoded.
@@ -339,7 +342,8 @@ class BatchRequest(BaseModel):
     source_language: str = "auto"
     target_language: str = "简体中文"
     synopsis: str = ""  # shared synopsis is useful for TV series batches
-    output_mode: Literal["bilingual", "translation_only"] = "bilingual"
+    # see JobRequest.output_mode — original_only 跳过翻译，只输出原文
+    output_mode: Literal["bilingual", "translation_only", "original_only"] = "bilingual"
     # see JobRequest.embed_subtitle — one muxed .mkv per video instead of a
     # subtitle file. Note it writes a second copy of every film in the batch.
     embed_subtitle: bool = False

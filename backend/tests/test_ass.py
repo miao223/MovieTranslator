@@ -43,3 +43,20 @@ def test_ass_translation_top_and_only():
     only = build_ass(make_lines(), s, mode="translation_only")
     assert "Hello there." not in only.split("[Events]")[1]
     assert "你好。" in only
+
+
+def test_ass_original_only_uses_the_translation_style():
+    """原文在这里是唯一一行，所以走 Default（设置里的「译文」字号/颜色）。
+
+    original_font_size 那套小字灰色是给双语副行准备的，单独用会读成注释——
+    所以内联的 \\fs36 一次都不该出现。
+    """
+    s = SubtitleSettings(
+        style_enabled=True, font_size=60, original_font_size=36,
+        translation_color="#FFEE00", original_color="#B4B4B4",
+    )
+    ass = build_ass(make_lines(), s, mode="original_only")
+    assert "Style: Default,Arial,60,&H0000EEFF," in ass
+    body = ass.split("[Events]")[1]
+    assert "Hello there." in body and "你好。" not in body
+    assert "\\fs36" not in body and "&H00B4B4B4&" not in body

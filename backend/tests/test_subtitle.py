@@ -44,6 +44,33 @@ def test_translation_only_and_fallback():
     assert blocks[1].splitlines()[2] == "General Kenobi!"
 
 
+def test_original_only_ignores_the_translation():
+    """纯原文必须有自己的分支，不能靠「空译文回退成原文」实现。
+
+    那条回退是给译文模式兜底的（部分翻译失败时成品仍要能看），拿它当纯原文
+    用的话，bilingual 会把同一句原文输出两遍。所以这里译文是齐的，输出里也
+    一个字的译文都不许有。
+    """
+    srt = build_srt(make_lines(), SubtitleSettings(), mode="original_only")
+    blocks = srt.strip().split("\n\n")
+    assert blocks[0].splitlines()[2:] == ["Hello there."]
+    assert blocks[1].splitlines()[2:] == ["General Kenobi!"]
+    assert "你好。" not in srt and "肯诺比将军！" not in srt
+
+
+def test_a_frame_cue_is_still_translated_in_original_only():
+    """画面翻译与纯原文共存：对白保持原文，画面文字仍是目标语言。
+
+    靠的是 is_frame 排在 mode 判断之前——这条断言就是那个顺序的守门员。
+    """
+    lines = make_lines()
+    lines[1].is_frame = True
+    lines[1].text = ""  # 画面 cue 没有原文，内容全在 translation 上
+    srt = build_srt(lines, SubtitleSettings(), mode="original_only")
+    assert "{\\an7}肯诺比将军！" in srt
+    assert "Hello there." in srt and "你好。" not in srt
+
+
 # ------------------------------------------------------- display wrapping
 
 

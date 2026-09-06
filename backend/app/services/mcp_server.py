@@ -221,7 +221,11 @@ def build() -> Optional["FastMCP"]:
         video_path: 服务器本机的视频或音频文件绝对路径。
         source_language: 影片原始语言代码（如 ja / en），auto 为自动判断。
         synopsis: 剧情简介，可显著提升人名与代词的翻译准确度。
-        output_mode: bilingual 双语，translation_only 只要译文。
+        output_mode: bilingual 双语，translation_only 只要译文，
+            original_only 只要原文——跳过 AI 翻译，但转写预处理、歌词识别、
+            二次识别复核、图形字幕 OCR 与校对照常执行。产物带源语言后缀
+            （片名.ja.srt，内嵌时 片名.ja.mkv，轨道标为该语言）。此时
+            target_language 只作用于画面翻译，对白保持原文。
         audio_track: 音轨的容器序号，留空用默认音轨。
         audio_language: 按语言标签选音轨（如 jpn），仅在 audio_track 留空时生效。
         text_source: asr 走语音识别；subtitle 直接读片源已有的字幕，跳过识别——
@@ -230,7 +234,7 @@ def build() -> Optional["FastMCP"]:
             指向图形字幕（PGS/VobSub）会直接失败，因为那里面没有文字。
         subtitle_file: 改为读取这个外挂字幕文件（.srt/.ass），优先于 subtitle_track。
         embed_subtitle: 开启后不生成字幕文件，而是在同目录产出一个内嵌软字幕的
-            新视频（片名.zh.mkv，音视频不重编码）。会完整复制一份视频，注意磁盘空间。
+            新视频（片名.zh.mkv，纯原文时后缀是源语言；音视频不重编码）。会完整复制一份视频，注意磁盘空间。
             片源原有的字幕轨会保留。生成路径见 get_job 的 video_filename 字段。
             纯音频片源没有画面可合成，会自动改为生成字幕文件。
         container: 新视频的容器，mkv 或 mp4。mp4 兼容性最好，但只能带纯文本字幕轨，
@@ -239,8 +243,8 @@ def build() -> Optional["FastMCP"]:
             要重编码就填编码器 id，可用的用 get_server_info 查。重编码整部影片
             动辄数小时，画质只减不增。
         """
-        if output_mode not in ("bilingual", "translation_only"):
-            return {"error": "output_mode 只能是 bilingual 或 translation_only"}
+        if output_mode not in ("bilingual", "translation_only", "original_only"):
+            return {"error": "output_mode 只能是 bilingual、translation_only 或 original_only"}
         if text_source not in ("asr", "subtitle"):
             return {"error": "text_source 只能是 asr 或 subtitle"}
         # the encoder half is left to manager.create, which knows whether this
@@ -299,13 +303,17 @@ def build() -> Optional["FastMCP"]:
         subtitle_language 按语言标签挑轨（如 eng；各文件的轨道序号不同）。
         找不到可读字幕的那个文件会自动改用语音识别，不影响整批。
 
+        output_mode：同 translate_video，整批共用。original_only（纯原文）跳过
+        AI 翻译，每个文件产出带源语言后缀的原文字幕（片名.ja.srt）；此时剧集模式
+        不会积累新的译名表，因为没有译文。
+
         container / video_codec：同 translate_video，整批共用。
         embed_subtitle：同 translate_video——每个视频产出一个内嵌软字幕的新 mkv，
         不生成字幕文件。整季剧集会因此多占一整份磁盘空间。目录里的纯音频文件
         没有画面可合成，会各自改为生成字幕文件，不影响整批。
         """
-        if output_mode not in ("bilingual", "translation_only"):
-            return {"error": "output_mode 只能是 bilingual 或 translation_only"}
+        if output_mode not in ("bilingual", "translation_only", "original_only"):
+            return {"error": "output_mode 只能是 bilingual、translation_only 或 original_only"}
         if text_source not in ("asr", "subtitle"):
             return {"error": "text_source 只能是 asr 或 subtitle"}
         bad = _embed_error(container, video_codec)
