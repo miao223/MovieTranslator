@@ -188,3 +188,34 @@ def test_version_endpoint_reports_the_running_build():
         body = client.get("/api/version").json()
     assert body["version"] == APP_VERSION
     assert body["version"][0].isdigit()
+
+
+def test_the_api_recognition_engine_is_named_without_its_key(logdir):
+    """Which engine ran is the first thing support reads — and the third
+    API key must be as absent as the other two."""
+    from app.models.schemas import AppSettings
+
+    settings = AppSettings()
+    settings.asr.engine = "api"
+    settings.llm.audio_base_url = "https://listen.example/v1"
+    settings.llm.audio_api_key = "sk-audio-secret-value"
+    settings.llm.audio_model = "gemini-3.8-flash-high"
+    w = joblog.JobLogWriter("k3", "x.mkv")
+    w.write_settings(settings)
+    text = w.path.read_text(encoding="utf-8")
+
+    assert "sk-audio-secret-value" not in text
+    assert "识别引擎      : API 多模态模型 gemini-3.8-flash-high @" in text
+    assert "API key: 已配置" in text
+    assert "API 引擎不适用" in text  # the second pass does not apply here
+
+
+def test_the_local_engine_still_reports_the_whisper_model(logdir):
+    from app.models.schemas import AppSettings
+
+    w = joblog.JobLogWriter("k4", "x.mkv")
+    w.write_settings(AppSettings())
+    text = w.path.read_text(encoding="utf-8")
+
+    assert "识别引擎      : 本地 faster-whisper" in text
+    assert "识别模型      : large-v2" in text

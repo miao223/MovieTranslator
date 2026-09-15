@@ -185,7 +185,12 @@ def build() -> Optional["FastMCP"]:
                    ("done", "failed", "cancelled")]
         return {
             "version": joblog.APP_VERSION,
-            "asr_model": settings.asr.model_path.strip() or settings.asr.model_size,
+            "asr_engine": settings.asr.engine,
+            "asr_model": (
+                (settings.llm.audio_model or settings.llm.model)
+                if settings.asr.engine == "api"
+                else settings.asr.model_path.strip() or settings.asr.model_size
+            ),
             "asr_device": settings.asr.device,
             "llm_model": settings.llm.model,
             "second_pass": settings.asr.second_pass,

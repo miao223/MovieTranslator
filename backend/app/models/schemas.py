@@ -24,6 +24,14 @@ class LLMSettings(BaseModel):
     # inside one job, so without this only one of them can be reached.
     vision_base_url: str = ""
     vision_api_key: str = ""
+    # ...and the same again for the model that listens, used when
+    # ASRSettings.engine is "api". Its own endpoint for the same reason as
+    # the vision one: recognition runs at the start of a job and translation
+    # at the end, so both have to be reachable at once. Empty = the main
+    # endpoint; the key is never inherited across a different base_url.
+    audio_model: str = ""
+    audio_base_url: str = ""
+    audio_api_key: str = ""
     temperature: float = Field(0.3, ge=0.0, le=2.0)
     # Lines translated per output batch, bounded by the model's max output
     # tokens. Bigger batches mean fewer round trips and a conversation that
@@ -108,12 +116,52 @@ class ASRSettings(BaseModel):
     # pass produced none. Costs roughly a second transcription in time, and
     # more LLM tokens downstream because there is more text to process.
     second_pass: bool = True
+    # Fallback for sources silero cannot hear at all: run the FIRST pass as
+    # VAD-off windows over the whole timeline, instead of letting the VAD
+    # gate it and leaving the second pass to recover the rest. Off by
+    # default and self-limiting — it only engages when the VAD kept under
+    # 10% of the film AND there is at least that much audio outside it at
+    # speech loudness (asr.windowed_first_pass). Measured: a VHS capture
+    # kept 5.2% and had 5366s of loud audio outside, while a DVD kept 28%
+    # and a Blu-ray 64%, so neither of those can trigger it.
+    windowed_first_pass: bool = False
     # source-language hint fed to whisper as `initial_prompt`: proper nouns
     # it keeps mis-hearing (character names above all). MUST be written in
     # the spoken language — a prompt in another language drags the whole
     # transcript toward that language, which is why the plot synopsis and
     # the translation glossary are deliberately NOT reused here.
     initial_prompt: str = ""
+    # Prepend a punctuated, capitalised sample sentence in the source
+    # language to `initial_prompt`. Whisper conditions its output on that
+    # prompt, so the prompt's shape is the shape it tends to write in — and
+    # a transcript with no sentence-final punctuation is what pushes the
+    # segmenter onto its "merge nothing here, let refine do it" path (two
+    # Japanese films came back 72% and 57% open-ended). Off by default: it
+    # changes decoding, and a change to decoding has to be measured before
+    # it becomes the default (asr.STYLE_EXEMPLARS).
+    style_prompt: bool = False
+    # Local faster-whisper, or a multimodal LLM that takes audio (see
+    # services/asr_api.py, credentials in LLMSettings.audio_*). Local is the
+    # default for the same reason OcrSettings.engine's is: it costs nothing,
+    # needs no network, and a switch that starts uploading the film's
+    # soundtrack on its own is the wrong default whatever its quality.
+    engine: Literal["local", "api"] = "local"
+    # api engine: seconds of audio per request. Measured on gemini-3.8-flash
+    # through a relay: 300s of audio costs ~7.5k input tokens and drifts by
+    # ≤±0.5s inside the window. The cap is not a cost limit but a trust one —
+    # a model whose clock slips does it progressively, so a window that runs
+    # for ten minutes makes its own timestamps unusable. Each window is
+    # anchored to a locally known offset, so drift can never accumulate
+    # across a film.
+    api_window_seconds: float = Field(300.0, ge=60.0, le=420.0)
+    # mp3 is ~1/8 the bytes of wav at 16kHz mono and both OpenAI and Gemini
+    # accept it; wav is the escape hatch for an endpoint that will not
+    # decode mp3.
+    api_audio_format: Literal["mp3", "wav"] = "mp3"
+    # windows in flight at once. Unlike whisper this engine is network-bound,
+    # so a film is as fast as the endpoint allows; raise it only as far as
+    # the endpoint's rate limit.
+    api_concurrency: int = Field(3, ge=1, le=8)
 
 
 class SubtitleSettings(BaseModel):

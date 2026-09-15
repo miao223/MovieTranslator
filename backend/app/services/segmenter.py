@@ -186,8 +186,16 @@ def _lines_from_words(words: Sequence[Word], settings: SubtitleSettings) -> List
         rest = buf[split_at:] if split_at is not None else []
         text = "".join(w.text for w in take).strip()
         if text:
-            end = max(take[-1].end, take[0].start + MIN_LINE_DURATION)
+            # The floor has to be measured from the start this cue actually
+            # gets, not from the first word's: _trustworthy_start steps over
+            # a bogus gap, and flooring against the timestamp it just
+            # discarded protects nothing. Measured on a VHS source, whisper
+            # emitted a zero-duration word ('先生' at 2187.520-2187.520)
+            # after such a gap, and the cue came out 2187.520 -> 2187.520 —
+            # a zero-length line, which subtitle.py then writes as
+            # `00:36:27,520 --> 00:36:27,520`.
             start = _trustworthy_start(take)
+            end = max(take[-1].end, start + MIN_LINE_DURATION)
             # backstop for anything the scan above did not catch: a span far
             # beyond max_duration is a bad timestamp, not a long line, and
             # the end is the trustworthy side of it (that is where the audio
@@ -408,7 +416,19 @@ def _fix_overlaps(lines: List[SubtitleLine]) -> int:
     fixed = 0
     for prev, line in zip(lines, lines[1:]):
         if line.start < prev.end:
-            line.start = round(min(prev.end, line.end - 0.05), 3)
+            # `min(prev.end, line.end - 0.05)` used to stand here, and it
+            # left the overlap in place in exactly the case it was meant
+            # to handle: when a cue ends no later than its predecessor,
+            # `line.end - 0.05` is still behind `prev.end`, so the start
+            # moved and the two cues stayed on screen together — counted
+            # as fixed. Measured on a VHS transfer where whisper collapsed
+            # nine words onto one instant (2199.82): `私、口屋さんないわね。`
+            # 2199.90–2200.32 with `そうね。` 2200.27–2200.32 inside it.
+            # A cue sitting inside its predecessor cannot be fixed by
+            # moving its start alone; the end has to come with it.
+            line.start = round(prev.end, 3)
+            if line.end <= line.start:
+                line.end = round(line.start + MIN_LINE_DURATION, 3)
             fixed += 1
     return fixed
 

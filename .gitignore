@@ -2,8 +2,30 @@
 CLAUDE.md
 .claude/
 
+# 本机测试用的接口地址 / 密钥，永不提交、永不上传 GitHub
+.env
+.env.*
+
 # 本地字幕质量比对素材（人工翻译 / 软件输出 / 日志），仅供本机测试
 text/
+
+# 本机测试用的片源与它们的产物（几个 GB 一部，永不提交）。
+# 只锚定仓库根目录，不影响任何子目录里的源码。
+/*.mkv
+/*.mp4
+/*.mpg
+/*.mpeg
+/*.m2ts
+/*.ts
+/*.avi
+/*.mov
+/*.flv
+/*.webm
+/*.wmv
+/*.srt
+/*.ass
+/*.log
+/*.api.*
 
 # Python
 backend/.venv/

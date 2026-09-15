@@ -182,3 +182,20 @@ def test_server_info_hides_the_token_from_remote_callers(settings_file):
     )
     assert remote_client(app()).get("/api/server/info").json()["token"] == ""
     assert local_client(app()).get("/api/server/info").json()["token"] == "s3cret"
+
+
+def test_the_audio_key_is_masked_and_kept_the_same_way(settings_file):
+    """The third key in the same object. Every one of them needs both
+    halves of the round trip, or one save from the LAN wipes it."""
+    from app.api.routes import MASKED
+    from app.core import config
+
+    settings_file(
+        server__lan_access=True, server__require_token=False,
+        llm__api_key="sk-real", llm__audio_api_key="sk-audio",
+    )
+    c = remote_client(app())
+    body = c.get("/api/settings").json()
+    assert body["llm"]["audio_api_key"] == MASKED
+    assert c.put("/api/settings", json=body).status_code == 200
+    assert config.load_settings().llm.audio_api_key == "sk-audio"

@@ -14,6 +14,7 @@ const settings = ref(null)
 const saving = ref(false)
 const testing = ref(false)
 const testingVision = ref(false)
+const testingAsrApi = ref(false)
 const modelDownloaded = ref(null) // null = unknown / loading
 const cuda = ref(null) // { available, device_count }
 const storageInfo = ref(null) // { effective_dir, is_default }
@@ -112,6 +113,25 @@ function fmtModelSize(mb) {
 }
 const COMPUTE_TYPES = ['int8', 'int8_float16', 'float16', 'float32']
 
+// One control for what used to be two. "Which engine" and "which device"
+// are not independent choices to a user: picking the API engine means no
+// device at all, and the device radio was hidden in that case anyway. So
+// they read as one list — CPU / GPU / 自动 / API — while the settings
+// underneath stay exactly as they were. Leaving api selected keeps the
+// last local device, so switching back does not silently land on CPU.
+const asrTarget = computed(() =>
+  settings.value?.asr.engine === 'api' ? 'api' : settings.value?.asr.device
+)
+
+function setAsrTarget(value) {
+  if (value === 'api') {
+    settings.value.asr.engine = 'api'
+    return
+  }
+  settings.value.asr.engine = 'local'
+  settings.value.asr.device = value
+}
+
 // which recognition model reads the graphic subtitles (services/ocr.py)
 const OCR_LANGS = [
   { value: '', label: '自动判定' },
@@ -149,8 +169,12 @@ async function refreshModelStatus() {
 onMounted(async () => {
   try {
     settings.value = await api.getSettings()
-    refreshModelStatus()
-    api.cudaStatus().then((r) => (cuda.value = r)).catch(() => {})
+    if (settings.value.asr.engine === 'local') {
+      // the API engine loads no model and touches no GPU; asking would only
+      // put a 「未下载」 tag next to something it never uses
+      refreshModelStatus()
+      api.cudaStatus().then((r) => (cuda.value = r)).catch(() => {})
+    }
     api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
     api.logs().then((r) => (logInfo.value = r)).catch(() => {})
     refreshServerInfo()
@@ -165,7 +189,7 @@ async function save() {
     settings.value = await api.saveSettings(settings.value)
     ElMessage.success('设置已保存')
     api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
-    refreshModelStatus()
+    if (settings.value.asr.engine === 'local') refreshModelStatus()
     refreshServerInfo()
   } catch (e) {
     ElMessage.error('保存失败: ' + e.message)
@@ -234,6 +258,38 @@ async function testLLM() {
     ElMessage.error(e.message)
   } finally {
     testing.value = false
+  }
+}
+
+async function testAsrApi() {
+  testingAsrApi.value = true
+  try {
+    const r = await api.testAsrApi(settings.value.llm)
+    const at = `${r.model} @ ${r.endpoint}`
+    if (!r.ok) {
+      ElMessage({ type: 'error', duration: 8000, message: `语音接口连接失败（${at}）：${r.error}` })
+    } else if (r.carried_audio === false) {
+      // the reply can look perfect while the audio never arrived: only the
+      // token count the server reports gives that away
+      ElMessage({
+        type: 'warning', duration: 10000,
+        message: `接口通了（${at}），但服务端只收到了文字的 token 量`
+          + `（${r.prompt_tokens}，带音频应约 ${r.expected_tokens}）——`
+          + '中转多半把音频部分丢掉了，这样识别出来的内容全是编的',
+      })
+    } else if (r.heard_it) {
+      ElMessage.success(`语音接口可用（${at}），正确听出了测试音的音调走向（${r.asked}）`)
+    } else {
+      ElMessage({
+        type: 'warning', duration: 8000,
+        message: `接口通了（${at}），但模型没听出测试音是${r.asked}的，回复是「${r.reply}」——`
+          + '多半是这个模型不支持音频输入',
+      })
+    }
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    testingAsrApi.value = false
   }
 }
 
@@ -321,6 +377,25 @@ async function testVision() {
                     placeholder="（可选）本地服务通常不需要" />
           <span class="hint">仅在填了上面那个地址时使用；主模型的 Key 不会被发往另一个地址</span>
         </el-form-item>
+        <el-form-item label="语音模型">
+          <el-input v-model="settings.llm.audio_model" placeholder="（可选）支持音频输入的多模态模型" />
+          <span class="hint">
+            「语音识别」的引擎选为 API 时使用；留空则用上方主模型。
+            必须是能接收音频输入的多模态模型，纯文本模型不行。
+          </span>
+        </el-form-item>
+        <el-form-item label="语音 API 地址">
+          <el-input v-model="settings.llm.audio_base_url" placeholder="（可选）http://127.0.0.1:1234/v1" />
+          <span class="hint">
+            留空＝与上方主接口相同。识别在任务开头、翻译在任务结尾，中途改不了设置，
+            所以两者可以指向不同的服务商。<strong>注意结尾的 /v1 不能少。</strong>
+          </span>
+        </el-form-item>
+        <el-form-item label="语音 API Key">
+          <el-input v-model="settings.llm.audio_api_key" type="password" show-password
+                    placeholder="（可选）本地服务通常不需要" />
+          <span class="hint">仅在填了上面那个地址时使用；主模型的 Key 不会被发往另一个地址</span>
+        </el-form-item>
         <el-form-item label="关闭思考模式">
           <el-switch v-model="settings.llm.disable_thinking" />
           <span class="hint">
@@ -347,17 +422,50 @@ async function testVision() {
         <el-form-item>
           <el-button :loading="testing" @click="testLLM">测试连接</el-button>
           <el-button :loading="testingVision" @click="testVision">测试视觉模型</el-button>
+          <el-button :loading="testingAsrApi" @click="testAsrApi">测试语音模型</el-button>
           <span class="hint">
             视觉测试会发一张写着字的图片过去，要求模型读出来——纯文本模型能答完文字测试，
-            却会在第一条字幕上失败。
+            却会在第一条字幕上失败。语音测试会发一段音调变化的测试音过去要求听出方向，
+            并核对服务端收到的 token 量：中转把音频丢掉时，模型照样会答得头头是道。
           </span>
         </el-form-item>
       </el-form>
     </el-card>
 
     <el-card shadow="never" class="section">
-      <template #header>🎙️ 语音识别（Faster Whisper）</template>
+      <template #header>🎙️ 语音识别</template>
       <el-form label-width="150px">
+        <el-form-item label="识别设备">
+          <el-radio-group :model-value="asrTarget" @update:model-value="setAsrTarget">
+            <el-radio value="cpu">CPU</el-radio>
+            <el-radio value="cuda">CUDA (GPU)</el-radio>
+            <el-radio value="auto">自动</el-radio>
+            <el-radio value="api">API（多模态大模型）</el-radio>
+          </el-radio-group>
+          <el-tag v-if="cuda && asrTarget !== 'api'" :type="cuda.available ? 'success' : 'info'" class="tag">
+            {{ cuda.available ? `检测到 ${cuda.device_count} 个 CUDA 设备` : '本机未检测到可用 CUDA' }}
+          </el-tag>
+          <div class="hint" style="margin: 4px 0 0; display: block">
+            <template v-if="settings.asr.engine === 'local'">
+              在本机运行 Faster Whisper，音频不出本机，不花钱。需要下载模型（下方），
+              大模型在 CPU 上很慢。<br />
+              GPU 需安装 CUDA 运行库：pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+            </template>
+            <template v-else>
+              <strong>音频会分段上传</strong>到「翻译模型」一栏里配置的「语音模型」接口——
+              这是本软件唯一会上传音频的情况。不下模型、不占 GPU，按 token 计费
+              （音频约 25 tokens/秒，两小时影片约 18 万输入 token）。<br />
+              时间轴由本机决定：先用本地语音检测在静音处切段，模型只在每段内部计时，
+              所以它的时钟就算不准也不会越走越偏。<br />
+              代价：<strong>没有词级时间戳</strong>（断句精度略降），同一段音频两次识别
+              结果不会完全一样，且「二次识别」对本引擎不适用。<br />
+              <strong>目前只针对 gemini-3.8-flash-high 做过调优</strong>：窗口长度、
+              时间戳格式、标点要求、失败重试都是按它的实测行为定的。换用别的模型仍然可以跑，
+              但这些参数未必合适，建议先用下方「测试语音模型」确认音频真的送达、方向题答对。
+            </template>
+          </div>
+        </el-form-item>
+        <template v-if="settings.asr.engine === 'local'">
         <el-form-item label="模型">
           <el-select v-model="settings.asr.model_size" style="width: 260px" @change="refreshModelStatus">
             <el-option v-for="m in WHISPER_MODELS" :key="m.value" :value="m.value" :label="m.value">
@@ -388,17 +496,6 @@ async function testVision() {
           />
           <span class="hint">填写后优先使用该目录并忽略上面的模型选择，完全离线；适合手动下载好的模型</span>
         </el-form-item>
-        <el-form-item label="设备">
-          <el-radio-group v-model="settings.asr.device">
-            <el-radio value="cpu">CPU</el-radio>
-            <el-radio value="cuda">CUDA (GPU)</el-radio>
-            <el-radio value="auto">自动</el-radio>
-          </el-radio-group>
-          <el-tag v-if="cuda" :type="cuda.available ? 'success' : 'info'" class="tag">
-            {{ cuda.available ? `检测到 ${cuda.device_count} 个 CUDA 设备` : '本机未检测到可用 CUDA' }}
-          </el-tag>
-          <span class="hint">GPU 需安装 CUDA 运行库：pip install nvidia-cublas-cu12 nvidia-cudnn-cu12</span>
-        </el-form-item>
         <el-form-item label="计算精度">
           <el-select v-model="settings.asr.compute_type" style="width: 200px">
             <el-option v-for="c in COMPUTE_TYPES" :key="c" :value="c" :label="c" />
@@ -425,6 +522,50 @@ async function testVision() {
             片源对白清晰、字幕数量正常时可关闭。
           </span>
         </el-form-item>
+        <el-form-item label="分窗识别兜底">
+          <el-switch v-model="settings.asr.windowed_first_pass" />
+          <span class="hint">
+            给<strong>严重劣化</strong>的片源准备的——不是「模拟片源」这么宽，实测两盘普通的 VHS 转录
+            语音检测都正常工作。真正会失灵的是劣化到人耳都听得费劲的采集：一盘 96 分钟的带子里
+            检测只认出 5 分钟是「语音」，于是第一遍几乎什么都没识别，全靠二次识别去捡，
+            而复核又没有足够的已确认台词可以对照。
+            <br />开启后，遇到这种片源时第一遍改成「把整条时间轴切成 5 分钟一段、关掉语音检测逐段识别」，
+            语音检测也听得到的那些行照旧算第一遍结果，只有关掉检测才看得见的行才送 AI 复核——
+            删除权限和不开本项时完全一样。
+            <br /><strong>只在语音检测保留不到 10% 且检测之外确实还有接近人声音量的声音时才会触发</strong>，
+            数字片源（BD/DVD）永远不会触发，空音轨或选错音轨也不会。默认关闭。
+          </span>
+        </el-form-item>
+        </template>
+        <template v-else>
+        <el-form-item label="每段时长">
+          <el-input-number v-model="settings.asr.api_window_seconds" :min="60" :max="420" :step="30" />
+          <span class="hint">
+            秒，默认 300。每段单独发一次请求，段内时间由模型给、段的起点由本机给。
+            上限 420 秒不是为了省钱：多模态模型的时间戳会随音频变长而越走越偏，
+            段太长它自己的时间就不能用了。
+          </span>
+        </el-form-item>
+        <el-form-item label="音频格式">
+          <el-radio-group v-model="settings.asr.api_audio_format">
+            <el-radio value="mp3">mp3</el-radio>
+            <el-radio value="wav">wav</el-radio>
+          </el-radio-group>
+          <span class="hint">mp3 体积只有 wav 的八分之一，两者服务端都接受；接口拒收 mp3 时才改 wav</span>
+        </el-form-item>
+        <el-form-item label="同时请求数">
+          <el-input-number v-model="settings.asr.api_concurrency" :min="1" :max="8" />
+          <span class="hint">几段同时发。接口限流（429）时调小；两小时影片约 24 段</span>
+        </el-form-item>
+        <el-form-item label="最短语音时长">
+          <el-input-number v-model="settings.asr.vad_min_speech_ms" :min="0" :max="5000" :step="50" />
+          <span class="hint">毫秒；本引擎只用它来判断哪里是停顿、可以切段</span>
+        </el-form-item>
+        <el-form-item label="最短静默时长">
+          <el-input-number v-model="settings.asr.vad_min_silence_ms" :min="100" :max="10000" :step="100" />
+          <span class="hint">毫秒；同上。切段永远切在静音处，不会把一句话切成两半</span>
+        </el-form-item>
+        </template>
         <el-form-item label="识别提示词">
           <el-input
             v-model="settings.asr.initial_prompt"
@@ -436,11 +577,20 @@ async function testVision() {
             <strong>必须用影片的原始语言书写</strong>——写成中文会把整篇转写结果带偏，因此剧情简介和译名对照表不会自动用作提示词。
           </span>
         </el-form-item>
-        <el-form-item label="VAD 语音检测">
+        <el-form-item v-if="settings.asr.engine === 'local'" label="标点示例句">
+          <el-switch v-model="settings.asr.style_prompt" />
+          <span class="hint">
+            在识别提示词前面自动加一句带标点、带大小写的源语言示范句。语音识别模型会朝着提示词的样子写，
+            而它经常整片不给句号——实测两部日语片有 72% / 57% 的行没有句末标点，断句只能整体推迟到转写预处理去做。
+            <br />源语言选「自动」时会先做一次语言预检测，只用来挑示范句，不影响识别本身对语言的判断；
+            没有对应示范句的语言不加。把示范句原样念回来的行会被丢弃。默认关闭。
+          </span>
+        </el-form-item>
+        <el-form-item v-if="settings.asr.engine === 'local'" label="VAD 语音检测">
           <el-switch v-model="settings.asr.vad_filter" />
           <span class="hint">过滤无语音片段，减少幻听字幕</span>
         </el-form-item>
-        <template v-if="settings.asr.vad_filter">
+        <template v-if="settings.asr.engine === 'local' && settings.asr.vad_filter">
           <el-form-item label="VAD 预设">
             <div>
               <el-button
@@ -474,6 +624,8 @@ async function testVision() {
         </template>
       </el-form>
       <div class="model-notes">
+        <p>· <strong>选 API 引擎时，下面这些都不生效</strong>：模型、设备、计算精度、Beam、词级时间戳、
+          二次识别、VAD 阈值与前后填充。本机只负责切段，识别全在服务端。</p>
         <p><strong>📌 模型选择说明</strong>（列表右侧为下载体积，模型仅在首次选用时下载一次）</p>
         <p>· <strong>为什么默认 large-v2</strong>：large-v3 在安静的基准测试中略准，但在真实影视音频中幻觉率明显更高（第三方实测约为 v2 的 4 倍）——电影中大量的配乐、音效和静默正是幻觉的高发场景，会凭空产生不存在的台词。因此默认使用更稳定的 large-v2。</p>
         <p>· <strong>CrisperWhisper</strong>：针对幻觉和逐字转写强化的模型，能更忠实地转写每个词、词级时间戳更准。仅支持英语和德语影片。</p>

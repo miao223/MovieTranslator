@@ -56,8 +56,33 @@ _VERDICT_RE = re.compile(
     r"^\s*[*\-•]?\s*\[?\s*R\s*(\d+)\s*\]?\s*[:：]?\s*(保留|丢弃|keep|drop)\s*[:：,，]?\s*(.*?)\s*$",
     re.IGNORECASE,
 )
+# The same line minus the verdict word, so a line that names a number but
+# whose verdict cannot be read is distinguishable from one that never came.
+_NUMBERED_RE = re.compile(
+    r"^\s*[*\-•]?\s*\[?\s*R\s*(\d+)\s*\]?\s*[:：]?\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*$")
 _DROP_WORDS = {"丢弃", "drop"}
+
+# How much of one chunk may come back without a usable verdict before the
+# whole chunk is voided. Measured, on the run that motivated this: 547
+# lines sent, and the model answered all 547 — but wrote `保保留` for two
+# of them, so the verdict regex could not see those lines and 985 seconds
+# of real dialogue were thrown away, twice in a row. Chunks of 41 and 112
+# lines came back perfect; the two slips were 0.37% and 0.18%.
+#
+# The budget is `int(n * share)`, floored on purpose: below 50 lines it is
+# zero, i.e. exactly today's behaviour, so the tests that pin "one missing
+# verdict voids the chunk" keep their meaning instead of resting on a
+# coincidence of percentages. A truncated reply (27% of the chunk missing
+# on the same run) still fails, which is the case that must keep failing.
+MAX_UNJUDGED_SHARE = 0.02
+# Both of these end up as a *drop*. Reading `保保留` as 保留 would be
+# tuning on a typo, and the floor this module rests on is that a line we
+# cannot judge is treated as if the second pass had never produced it.
+UNJUDGED_REASON = "未判定"
+UNREADABLE_REASON = "判定无法解析"
 
 # One request restates the transcript but answers with one short verdict per
 # reviewed line, so the binding constraint is the input side only — chunks
@@ -168,23 +193,64 @@ def render_transcript(
     return "\n".join(out)
 
 
-def parse_verdicts(reply: str) -> Dict[int, Tuple[bool, str]]:
-    """Parse ``[R12] 保留`` / ``[R12] 丢弃 reason`` into {n: (keep, reason)}."""
+def parse_reply(reply: str) -> Tuple[Dict[int, Tuple[bool, str]], set]:
+    """({n: (keep, reason)}, {n whose verdict word was unreadable}).
+
+    The second set exists because of one measured failure: the model
+    answered every number, but typed `[R163] 保保留`. That line is not a
+    missing answer — it is an unreadable one, and saying so in the log is
+    the difference between "the model skipped lines" and "the model
+    fumbled three characters out of eleven hundred".
+    """
     result: Dict[int, Tuple[bool, str]] = {}
+    unreadable: set = set()
     for raw in reply.splitlines():
         if _FENCE_RE.match(raw):
             continue
         m = _VERDICT_RE.match(raw)
-        if not m:
+        if m:
+            keep = m.group(2).lower() not in _DROP_WORDS
+            result[int(m.group(1))] = (keep, m.group(3).strip())
             continue
-        keep = m.group(2).lower() not in _DROP_WORDS
-        result[int(m.group(1))] = (keep, m.group(3).strip())
-    return result
+        numbered = _NUMBERED_RE.match(raw)
+        if numbered:
+            unreadable.add(int(numbered.group(1)))
+    return result, unreadable - set(result)
 
 
-def _covers_exactly(verdicts: Dict[int, Tuple[bool, str]], expected: Sequence[int]) -> bool:
-    """A verdict for every reviewed line, and for nothing else."""
-    return bool(expected) and set(verdicts) == set(expected)
+def parse_verdicts(reply: str) -> Dict[int, Tuple[bool, str]]:
+    """Parse ``[R12] 保留`` / ``[R12] 丢弃 reason`` into {n: (keep, reason)}."""
+    return parse_reply(reply)[0]
+
+
+def _coverage_shortfall(
+    verdicts: Dict[int, Tuple[bool, str]], expected: Sequence[int]
+) -> List[int]:
+    """Which reviewed lines got no verdict, if few enough to tolerate.
+
+    Raises ValueError — which voids the chunk, as before — for a number
+    that was never sent (the model is answering about something else, and
+    that is a misalignment signal, not a slip) or for more absent verdicts
+    than ``MAX_UNJUDGED_SHARE`` allows.
+    """
+    if not expected:
+        raise ValueError("本块没有需要判定的行")
+    unknown = sorted(set(verdicts) - set(expected))
+    if unknown:
+        raise ValueError(
+            f"判定覆盖校验未通过（回复里出现未送审的编号："
+            + " ".join(f"R{n}" for n in unknown[:10])
+            + ("…" if len(unknown) > 10 else "") + "）"
+        )
+    missing = [n for n in expected if n not in verdicts]
+    budget = int(len(expected) * MAX_UNJUDGED_SHARE)
+    if len(missing) > budget:
+        raise ValueError(
+            f"判定覆盖校验未通过（送审 {len(expected)} 条，"
+            f"收到 {len(verdicts)} 条有效判定，缺 {len(missing)} 条，"
+            f"超出容许的 {budget} 条）"
+        )
+    return missing
 
 
 def _chunks(segments: Sequence[Segment], context_limit: int) -> List[List[Segment]]:
@@ -271,11 +337,16 @@ def vet_recovered(
         if no_context:
             dbg.kv("对照上下文", "无（第一遍识别为空）")
         dbg.kv("分块数", len(chunks))
+        # ~10 output tokens per line, measured: 547 lines came back as 5,614.
+        # A chunk the input budget allows can still overrun the output side,
+        # and that shows up as a truncated reply, not as an error.
+        dbg.kv("预计输出", f"约 {len(review) * 10:,} tokens（约 10 tokens/条）")
         dbg.block("system prompt", system)
 
     dropped: List[Tuple[Segment, str]] = []
     kept: List[Segment] = []
     failed_chunks = 0
+    unjudged_total = 0
     consecutive_failures = 0
     no_thinking = llm.disable_thinking
     plain_seen = 0
@@ -302,7 +373,10 @@ def vet_recovered(
             dbg.block(f"第 {n} 块 请求", user)
 
         verdicts: Optional[Dict[int, Tuple[bool, str]]] = None
+        unreadable: set = set()
+        unjudged: List[int] = []
         last_error: Optional[Exception] = None
+        last_unjudged: List[int] = []
         # One retry, because a network blip must not silently eat real
         # dialogue. At temperature 0 a repeat of the same request would just
         # repeat the same bad answer, so a format failure gets told what
@@ -313,12 +387,15 @@ def vet_recovered(
                 {"role": "user", "content": user},
             ]
             if attempt == 2 and isinstance(last_error, ValueError):
-                messages.append({
-                    "role": "user",
-                    "content": "上一次的回答没有对每个编号各给恰好一行判定。"
-                               "请重新输出，必须且只能覆盖以下编号，每个一行：\n"
-                               + " ".join(f"R{i}" for i in expected),
-                })
+                complaint = ("上一次的回答没有对每个编号各给恰好一行判定。"
+                             "请重新输出，必须且只能覆盖以下编号，每个一行：\n"
+                             + " ".join(f"R{i}" for i in expected))
+                if last_unjudged:
+                    shown = " ".join(f"R{i}" for i in last_unjudged[:20])
+                    complaint += ("\n其中上次未给出可识别判定的有：" + shown
+                                  + (f" 等 {len(last_unjudged)} 个"
+                                     if len(last_unjudged) > 20 else ""))
+                messages.append({"role": "user", "content": complaint})
             try:
                 resp, no_thinking = chat_completion(
                     client,
@@ -331,13 +408,10 @@ def vet_recovered(
                 _tally(usage, resp, dbg)
                 if dbg:
                     dbg.block(f"第 {n} 块 响应（第 {attempt} 次）", reply)
-                parsed = parse_verdicts(reply)
-                if not _covers_exactly(parsed, expected):
-                    raise ValueError(
-                        f"判定覆盖校验未通过（送审 {len(expected)} 条，"
-                        f"收到 {len(parsed)} 条有效判定）"
-                    )
-                verdicts = parsed
+                parsed, garbled = parse_reply(reply)
+                last_unjudged = [n for n in expected if n not in parsed]
+                missing = _coverage_shortfall(parsed, expected)
+                verdicts, unreadable, unjudged = parsed, garbled, missing
                 break
             except (InterruptedError, KeyboardInterrupt):
                 raise
@@ -359,8 +433,19 @@ def vet_recovered(
             continue
 
         consecutive_failures = 0
+        if unjudged:
+            unjudged_total += len(unjudged)
+            shown = " ".join(f"R{i}" for i in unjudged[:20])
+            log(f"⚠ 第 {n} 块有 {len(unjudged)} 条未收到可识别的判定（{shown}"
+                + (f" 等 {len(unjudged)} 个" if len(unjudged) > 20 else "")
+                + f"），已按丢弃处理（{len(unjudged)}/{len(expected)}，在容许范围内）")
         for seg in pending:
-            keep, reason = verdicts[ids[id(seg)]]
+            number = ids[id(seg)]
+            if number not in verdicts:
+                dropped.append((seg, UNREADABLE_REASON if number in unreadable
+                                else UNJUDGED_REASON))
+                continue
+            keep, reason = verdicts[number]
             if keep:
                 kept.append(seg)
             else:
@@ -374,6 +459,7 @@ def vet_recovered(
         f"保留 {len(kept)} 段 / {_duration(kept):.0f}s，"
         f"丢弃 {len(dropped)} 段 / {_duration([s for s, _ in dropped]):.0f}s"
         + (f"（其中 {failed_chunks} 块因复核失败整块丢弃）" if failed_chunks else "")
+        + (f"（其中 {unjudged_total} 条未收到判定，按丢弃处理）" if unjudged_total else "")
     )
     if dbg:
         from app.core.debuglog import fmt_time

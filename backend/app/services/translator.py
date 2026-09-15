@@ -70,6 +70,29 @@ def make_vision_client(settings: LLMSettings, network: Optional[NetworkSettings]
     )
 
 
+def make_audio_client(settings: LLMSettings, network: Optional[NetworkSettings] = None):
+    """Client for the model that listens (ASRSettings.engine == "api").
+
+    Same shape and the same reason as the vision client above: recognition
+    happens at the start of a job and translation at the end, so a setup
+    with the listening model on one endpoint and the translator on another
+    has to work — and it cannot be reconfigured half way through.
+
+    Its key is never inherited either: a base URL pointing somewhere else
+    is a different operator.
+    """
+    base = settings.audio_base_url.strip()
+    if not base:
+        return make_openai_client(settings, network)
+    return make_openai_client(
+        settings.model_copy(update={
+            "base_url": base,
+            "api_key": settings.audio_api_key.strip(),
+        }),
+        network,
+    )
+
+
 def build_system_prompt(
     prompts: PromptSettings,
     target_language: str,
@@ -186,6 +209,30 @@ class TranslationError(Exception):
     pass
 
 
+class EmptyReplyError(TranslationError):
+    """A 200 answer carrying no choices at all.
+
+    A subclass rather than a flag because the two shapes that land here
+    need opposite advice. A server that has never heard of the route, or
+    that refuses the model, also answers without choices, and for those
+    "check the base_url, try another model" is exactly right. But the
+    audio engine sees a second shape: the usage block shows the clip
+    arrived and was charged for, and the candidate list still comes back
+    empty. That is a fault on the way back, not a misconfiguration, and
+    sending someone to change models over it points them at the one thing
+    that is working. Callers that can tell the two apart — asr_api has
+    the usage numbers to do it — catch this and say so; everyone else
+    keeps catching TranslationError and is unaffected.
+
+    The usage block travels with the exception because it is the evidence,
+    and it is read where the response itself no longer is.
+    """
+
+    def __init__(self, message: str, usage=None):
+        super().__init__(message)
+        self.usage = usage
+
+
 # DeepSeek (and several other OpenAI-compatible providers) run a reasoning
 # pass by default. Both jobs here are mechanical — restate these lines with
 # the sentence breaks fixed, translate these lines one for one — and the
@@ -240,7 +287,9 @@ def reply_text(resp) -> str:
     choices = getattr(resp, "choices", None)
     if not choices:
         complaint = _server_complaint(resp)
-        raise TranslationError(f"接口没有返回结果：{complaint}{_routing_hint(complaint)}")
+        raise EmptyReplyError(
+            f"接口没有返回结果：{complaint}{_routing_hint(complaint)}",
+            getattr(resp, "usage", None))
     message = getattr(choices[0], "message", None)
     content = getattr(message, "content", None)
     if isinstance(content, (list, tuple)):  # content parts rather than a string

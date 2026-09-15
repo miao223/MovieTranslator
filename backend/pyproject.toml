@@ -11,7 +11,10 @@ dependencies = [
     # add_stream_from_template, used since the first embed release, needs 14.0 —
     # the old >=12.0 floor was never actually satisfiable by this code.
     "av>=17.0",
-    "faster-whisper>=1.0",
+    # 1.1 is the floor for WhisperModel.detect_language, used to choose the
+    # source-language sample sentence when the language is set to auto
+    # (asr._pick_exemplar).
+    "faster-whisper>=1.1",
     # MCP server (services/mcp_server.py). Held below 2.0 on purpose: that
     # line switched to httpx2 and pydantic>=2.12, which risks pulling the
     # openai/fastapi dependency tree apart for a feature that is off by

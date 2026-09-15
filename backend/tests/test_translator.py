@@ -7,6 +7,7 @@ from app.services.translator import (
     TranslationError,
     Translator,
     estimate_tokens,
+    make_audio_client,
     make_vision_client,
     parse_translations,
     reply_text,
@@ -81,6 +82,36 @@ def test_the_vision_endpoint_can_carry_its_own_key():
         vision_api_key="sk-vision",
     ))
     assert client.api_key == "sk-vision"
+
+
+# ------------------------------------------------------- the audio client
+
+
+def test_the_audio_model_uses_the_main_endpoint_by_default():
+    client = make_audio_client(settings(base_url="https://api.x.com/v1",
+                                        api_key="sk-main"))
+    assert str(client.base_url).startswith("https://api.x.com/v1")
+    assert client.api_key == "sk-main"
+
+
+def test_an_audio_endpoint_of_its_own_is_used_and_inherits_no_key():
+    """Same rule as the vision endpoint: recognition and translation happen
+    in one job and may live at two operators, and the main key has no
+    business travelling to the second one."""
+    client = make_audio_client(settings(
+        base_url="https://api.deepseek.com/v1", api_key="sk-main",
+        audio_base_url="http://127.0.0.1:1234/v1",
+    ))
+    assert str(client.base_url).startswith("http://127.0.0.1:1234/v1")
+    assert client.api_key != "sk-main"
+
+
+def test_the_audio_endpoint_can_carry_its_own_key():
+    client = make_audio_client(settings(
+        api_key="sk-main", audio_base_url="https://listen.example/v1",
+        audio_api_key="sk-audio",
+    ))
+    assert client.api_key == "sk-audio"
 
 
 # -------------------------------------------------- reading the response

@@ -88,13 +88,39 @@ def _server_line(settings) -> str:
 def _settings_lines(settings) -> list[str]:
     asr, llm, sub, net = settings.asr, settings.llm, settings.subtitle, settings.network
     model_src = asr.model_path.strip() or asr.model_size
+    api_asr = asr.engine == "api"
+    if api_asr:
+        # Which engine ran is the first thing support needs, and under the
+        # api one most of the whisper settings below are inert — say so
+        # here rather than let someone tune a slider nothing reads.
+        own_endpoint = llm.audio_base_url.strip()
+        same = "" if llm.audio_model.strip() else "（同主模型）"
+        recogniser = [
+            f"识别引擎      : API 多模态模型 "
+            f"{llm.audio_model.strip() or llm.model}{same} @ "
+            f"{own_endpoint or llm.base_url}"
+            + (f" (API key: {'已配置' if llm.audio_api_key.strip() else '未配置'})"
+               if own_endpoint else "（同主接口）"),
+            f"  每段={asr.api_window_seconds:.0f}s 格式={asr.api_audio_format} "
+            f"并发={asr.api_concurrency}（音频分段上传，不使用本地模型）",
+            f"VAD           : 仅用于决定切分位置（固定阈值），"
+            f"最短语音={asr.vad_min_speech_ms}ms 最短静默={asr.vad_min_silence_ms}ms",
+        ]
+    else:
+        recogniser = [
+            f"识别引擎      : 本地 faster-whisper",
+            f"识别模型      : {model_src} ({asr.device}/{asr.compute_type}) "
+            f"beam={asr.beam_size} 词级时间戳={'开' if asr.word_timestamps else '关'}",
+            f"VAD           : {'开' if asr.vad_filter else '关'} 阈值={asr.vad_threshold} "
+            f"填充={asr.vad_speech_pad_ms}ms 最短语音={asr.vad_min_speech_ms}ms "
+            f"最短静默={asr.vad_min_silence_ms}ms",
+        ]
     return [
-        f"识别模型      : {model_src} ({asr.device}/{asr.compute_type}) "
-        f"beam={asr.beam_size} 词级时间戳={'开' if asr.word_timestamps else '关'}",
-        f"VAD           : {'开' if asr.vad_filter else '关'} 阈值={asr.vad_threshold} "
-        f"填充={asr.vad_speech_pad_ms}ms 最短语音={asr.vad_min_speech_ms}ms "
-        f"最短静默={asr.vad_min_silence_ms}ms",
+        *recogniser,
         f"识别提示词    : {asr.initial_prompt.strip() or '（未设置）'}",
+        f"标点示例句    : "
+        + ("（API 引擎不适用）" if api_asr
+           else "开（在识别提示词前加一句源语言示范）" if asr.style_prompt else "关"),
         f"翻译模型      : {llm.model} @ {llm.base_url} "
         f"(API key: {'已配置' if llm.api_key.strip() else '未配置'}) "
         f"temp={llm.temperature} 每批={llm.batch_size} 上下文={llm.context_limit}",
@@ -103,7 +129,13 @@ def _settings_lines(settings) -> list[str]:
            f"(API key: {'已配置' if llm.vision_api_key.strip() else '未配置'})"
            if llm.vision_base_url.strip() else "（同主接口）"),
         f"转写预处理    : {'开' if settings.prompts.refine_enabled else '关'}",
-        f"二次识别      : {'开（产物经 LLM 复核）' if asr.second_pass else '关'}",
+        f"二次识别      : "
+        + ("（API 引擎不适用，窗口已覆盖整条时间轴）" if api_asr
+           else '开（产物经 LLM 复核）' if asr.second_pass else '关'),
+        f"分窗识别兜底  : "
+        + ("（API 引擎不适用）" if api_asr
+           else "开（VAD 几乎全片失效时，第一遍改为关 VAD 分窗）"
+           if asr.windowed_first_pass else "关"),
         f"歌词识别      : {'开（歌词标为 ♪ … ♪）' if settings.prompts.mark_lyrics else '关'}",
         f"调试模式      : {'开（字幕同目录生成 .debug.log）' if settings.debug_mode else '关'}",
         f"字幕          : 每行{sub.max_chars_per_line}字 单条≤{sub.max_duration}s "

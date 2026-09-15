@@ -156,6 +156,118 @@ def test_level_profile_is_one_value_per_second():
     assert math.isclose(levels[1], -6.0, abs_tol=0.5)  # 0.5 full scale ≈ -6 dBFS
 
 
+# ------------------------------------------------ when silero stops working
+#
+# On a VHS capture silero called 199s of 5760 speech (3.5%) and every
+# number derived from it went wrong at once — 93% coverage, 40 chars per
+# speech-second, r=+0.61, -266 ms/s drift — without one line saying the
+# yardstick had collapsed. Two signals have to agree before that is
+# declared, because either alone is wrong on a real film.
+
+
+def _noise(seconds: float, level: float = 0.1):
+    import numpy as np
+
+    rng = np.random.default_rng(11)
+    return (level * rng.standard_normal(int(seconds * 16000))).astype("float32")
+
+
+def test_a_source_silero_cannot_hear_is_called_out(tmp_path):
+    from app.core.debuglog import DebugLog
+    from app.services import asr
+    from app.models.schemas import ASRSettings
+
+    audio = _noise(600.0)
+    segments = [asr.Segment(float(t), float(t + 9), "x") for t in range(0, 600, 10)]
+    logged = []
+    debug = DebugLog(tmp_path / "d.log", enabled=True)
+    verdict = asr._report_coverage(audio, ASRSettings(), segments, logged.append,
+                                   debug, intervals=[(10.0, 15.0)])
+    assert verdict is not None and verdict.vad_blind
+    assert any("基本失聪" in line for line in logged)
+    # the coverage line is still printed, but not as an accusation
+    coverage_lines = [line for line in logged if "识别覆盖率" in line]
+    assert coverage_lines and not coverage_lines[0].startswith("⚠")
+    assert "VAD 失聪，仅供参考" in coverage_lines[0]
+    assert "VAD 失聪" in (tmp_path / "d.log").read_text(encoding="utf-8")
+
+
+def test_a_film_that_is_mostly_music_is_not_called_blind():
+    """Low vad_share alone is the normal state of a scored film."""
+    from app.services import asr
+    from app.models.schemas import ASRSettings
+
+    audio = _noise(600.0)
+    # silero hears a fifth of the film, and the transcript sits inside it
+    segments = [asr.Segment(float(t), float(t + 9), "x") for t in range(0, 120, 10)]
+    logged = []
+    verdict = asr._report_coverage(audio, ASRSettings(), segments, logged.append,
+                                   None, intervals=[(0.0, 120.0)])
+    assert verdict.transcript_in_vad > 0.9
+    assert not verdict.vad_blind
+    assert not any("基本失聪" in line for line in logged)
+
+
+def test_too_little_loud_audio_to_judge_is_not_blind():
+    from app.services import asr
+    from app.models.schemas import ASRSettings
+
+    import numpy as np
+
+    audio = np.concatenate([_noise(30.0), np.zeros(30 * 16000, dtype="float32")])
+    segments = [asr.Segment(0.0, 30.0, "x")]
+    verdict = asr._report_coverage(audio, ASRSettings(), segments, None, None,
+                                   intervals=[(0.0, 1.0)])
+    assert verdict.loud < asr.VAD_BLIND_MIN_LOUD
+    assert not verdict.vad_blind
+
+
+def test_no_speech_at_all_says_so_instead_of_saying_nothing(tmp_path):
+    """The silent early return left the films that need it most with no line."""
+    from app.core.debuglog import DebugLog
+    from app.services import asr
+    from app.models.schemas import ASRSettings
+
+    audio = _noise(300.0)
+    logged = []
+    debug = DebugLog(tmp_path / "d.log", enabled=True)
+    verdict = asr._report_coverage(audio, ASRSettings(), [asr.Segment(0, 10, "x")],
+                                   logged.append, debug, intervals=[])
+    assert verdict is not None and verdict.coverage is None
+    assert any("一段语音都没找到" in line for line in logged)
+    written = (tmp_path / "d.log").read_text(encoding="utf-8")
+    assert "每分钟音量剖面" in written
+
+
+def test_a_normal_film_gains_no_new_lines():
+    """Regression guard: a sighted source logs exactly what it logged before."""
+    from app.services import asr
+    from app.models.schemas import ASRSettings
+
+    audio = _noise(600.0)
+    segments = [asr.Segment(float(t), float(t + 9), "x",
+                            words=[asr.Word(float(t), float(t + 9), "x")])
+                for t in range(0, 600, 10)]
+    logged = []
+    asr._report_coverage(audio, ASRSettings(), segments, logged.append, None,
+                         intervals=[(float(t), float(t + 9)) for t in range(0, 600, 10)])
+    assert len(logged) == 1
+    assert logged[0].lstrip("⚠ ").startswith("识别覆盖率")
+    assert "失聪" not in logged[0]
+
+
+def test_silero_is_not_run_twice_when_the_caller_already_has_it(monkeypatch):
+    from app.services import asr
+    from app.models.schemas import ASRSettings
+
+    calls = []
+    monkeypatch.setattr(asr, "speech_intervals_of",
+                        lambda audio, s: calls.append(1) or [(0.0, 5.0)])
+    asr._report_coverage(_noise(60.0), ASRSettings(), [asr.Segment(0, 5, "x")],
+                         None, None, intervals=[(0.0, 5.0)])
+    assert calls == []
+
+
 # ------------------------------------------------------ second ASR pass
 
 

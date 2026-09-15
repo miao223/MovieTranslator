@@ -2,7 +2,7 @@ import pytest
 
 from app.models.schemas import SubtitleSettings
 from app.services.asr import Segment, Word
-from app.services.segmenter import _split_text, segment_lines
+from app.services.segmenter import MIN_LINE_DURATION, _split_text, segment_lines
 
 
 def test_short_segment_untouched():
@@ -447,3 +447,67 @@ def test_ordinary_cues_are_left_in_the_order_they_arrived():
     ]
     lines = segment_lines(segs, SubtitleSettings())
     assert [l.text for l in lines] == ["ちゃんと話そう", "それでいいよね"]
+
+
+def test_a_zero_duration_word_after_a_gap_does_not_make_a_zero_length_cue():
+    """Whisper can emit a word whose start equals its end.
+
+    Measured on a VHS source: `先生` came back as 2187.520-2187.520, 1.8s
+    after `はい、`. The gap would normally break the line, but `はい、` is a
+    two-character fragment so the break is suppressed and both words stay
+    together — and then _trustworthy_start moves the cue's start over the
+    gap to 2187.520 while the end sits at the same instant. The cue shipped
+    as `00:36:27,520 --> 00:36:27,520`.
+
+    The floor on a cue's length has to be measured from the start the cue
+    actually gets, not from the first word's timestamp, which
+    _trustworthy_start has just decided is wrong.
+    """
+    segs = [Segment(2185.260, 2187.520, "はい、先生", words=[
+        Word(2185.260, 2185.700, "はい、"), Word(2187.520, 2187.520, "先生")])]
+    lines = segment_lines(segs, SubtitleSettings())
+    assert lines, "the cue must survive, not be dropped"
+    for line in lines:
+        assert line.end - line.start >= MIN_LINE_DURATION, (
+            f"{line.start} -> {line.end} is not a readable cue")
+    assert lines[0].start == pytest.approx(2187.520)  # the trustworthy side
+
+
+def test_the_length_floor_holds_when_the_start_is_not_moved():
+    """The ordinary path is unchanged: no gap, so the first word's start
+    stays, and a short cue is still padded to MIN_LINE_DURATION."""
+    segs = [Segment(10.0, 10.2, "はい", words=[Word(10.0, 10.2, "はい")])]
+    lines = segment_lines(segs, SubtitleSettings())
+    assert lines[0].start == pytest.approx(10.0)
+    assert lines[0].end - lines[0].start >= MIN_LINE_DURATION
+
+
+def test_a_cue_sitting_inside_its_predecessor_is_moved_clear():
+    """Moving the start alone cannot fix a cue that ends no later.
+
+    Measured on a VHS transfer: whisper collapsed nine words of one
+    sentence onto a single instant, and the cue built from the next
+    segment landed entirely inside the one before it. The old clamp,
+    `min(prev.end, line.end - 0.05)`, moved the start to a point still
+    behind `prev.end` and counted it fixed — two cues on screen at once,
+    which is the one artefact a player cannot recover from.
+    """
+    def w(a, b, t):
+        return Word(start=a, end=b, text=t)
+
+    segments = [
+        Segment(start=2199.40, end=2199.82,
+                text="そうよ。私、口屋さんないわね。", words=[
+                            w(2199.40, 2199.82, "そう"), w(2199.82, 2199.82, "よ。"),
+                            w(2199.82, 2199.82, "私、"), w(2199.82, 2199.82, "口"),
+                            w(2199.82, 2199.82, "屋"), w(2199.82, 2199.82, "さん"),
+                            w(2199.82, 2199.82, "ない"), w(2199.82, 2199.82, "わ"),
+                            w(2199.82, 2199.82, "ね。")]),
+        Segment(start=2199.82, end=2200.04, text="そうね。", words=[
+            w(2199.82, 2199.90, "そう"), w(2199.90, 2200.04, "ね。")]),
+    ]
+    lines = segment_lines(segments, SubtitleSettings())
+
+    assert all(b.start >= a.end for a, b in zip(lines, lines[1:])), \
+        [(l.start, l.end, l.text) for l in lines]
+    assert all(l.end > l.start for l in lines)

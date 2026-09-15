@@ -704,9 +704,9 @@ class JobManager:
 
         # 2a. download the ASR model first if it's missing, with progress --
         asr_lo = 10.0
-        if not settings.asr.model_path.strip() and not asr.is_model_cached(
-            settings.asr.model_size
-        ):
+        if (settings.asr.engine == "local"
+                and not settings.asr.model_path.strip()
+                and not asr.is_model_cached(settings.asr.model_size)):
             asr_lo = self._download_model_with_progress(job, settings, check_cancel)
 
         # 2b. transcribe ----------------------------------------------------
@@ -724,6 +724,7 @@ class JobManager:
             job.publish("transcribing", job.status.progress, log=msg)
 
         language = None if req.source_language == "auto" else req.source_language
+        asr_usage = {"calls": 0, "prompt": 0, "completion": 0}
         segments, detected = asr.transcribe(
             str(wav),
             settings.asr,
@@ -733,6 +734,10 @@ class JobManager:
             should_cancel=job.cancel_event.is_set,
             network=settings.network,
             debug=debug,
+            llm=settings.llm,  # only the api engine uses it
+            # ...and its tokens are reported on their own line, not folded
+            # into the preprocessing total: recognition is not preprocessing
+            usage=asr_usage,
         )
         if not segments:
             raise RuntimeError("未识别到任何语音内容")

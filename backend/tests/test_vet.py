@@ -261,3 +261,144 @@ def test_parse_accepts_english_verdicts():
         1: (True, ""),
         2: (False, "off-topic"),
     }
+
+
+# --------------------------------------------------- a slip in a long chunk
+#
+# The run that motivated the tolerance: 547 recovered lines went out in one
+# request, the model answered every one of them, and two of its answers read
+# `[R163] 保保留`. The verdict regex could not see those two lines, coverage
+# was declared broken, and 985 seconds of real dialogue were discarded —
+# twice, because the retry fumbled a different line. What follows pins both
+# halves: a slip of a few lines in five hundred costs those lines only, and
+# a reply that is actually short still voids the chunk.
+
+
+def big(n_recovered=547, anchors_every=10):
+    """A transcript shaped like that run: mostly recovered, anchors between."""
+    segments = []
+    for i in range(1, n_recovered + 1):
+        if i % anchors_every == 0:
+            segments.append(S(i * 2.0, i * 2.0 + 1.0, f"確認済みの台詞 {i}"))
+        segments.append(S(i * 2.0 + 1.0, i * 2.0 + 1.8, f"補足の台詞 {i}", recovered=True))
+    return segments
+
+
+def reply_for(numbers, drop=(), garble=(), omit=()):
+    """The model's answer, with the named numbers mistyped or missing."""
+    lines = []
+    for n in numbers:
+        if n in omit:
+            continue
+        if n in garble:
+            lines.append(f"[R{n}] 保保留")  # the measured typo
+        elif n in drop:
+            lines.append(f"[R{n}] 丢弃 与本片无关")
+        else:
+            lines.append(f"[R{n}] 保留")
+    return "\n".join(lines)
+
+
+def recovered_texts(segments):
+    return [s.text for s in segments if s.text.startswith("補足")]
+
+
+def test_exact_coverage_is_what_it_was_before_the_tolerance():
+    segments = big()
+    numbers = range(1, 548)
+    out, client = run([reply_for(numbers)], segments=segments)
+    assert len(recovered_texts(out)) == 547
+    assert len(client.calls) == 1
+
+
+def test_a_slip_of_two_in_five_hundred_drops_only_those_two():
+    segments = big()
+    logged = []
+    out, client = run([reply_for(range(1, 548), omit={163, 259})],
+                      segments=segments, log=logged.append)
+    assert len(client.calls) == 1, "a two-line slip must not cost a retry"
+    assert len(recovered_texts(out)) == 545
+    assert "補足の台詞 163" not in recovered_texts(out)
+    assert "補足の台詞 259" not in recovered_texts(out)
+    assert any("R163 R259" in line for line in logged)
+    assert any("未收到可识别的判定" in line for line in logged)
+
+
+def test_a_garbled_verdict_word_is_dropped_not_kept():
+    """`保保留` is unreadable, and unreadable is never read as 保留."""
+    segments = big()
+    out, client = run([reply_for(range(1, 548), garble={163, 259})],
+                      segments=segments)
+    assert len(client.calls) == 1
+    assert "補足の台詞 163" not in recovered_texts(out)
+    assert len(recovered_texts(out)) == 545
+
+
+def test_the_reason_says_which_kind_of_failure_it_was():
+    from app.services.vet import UNJUDGED_REASON, UNREADABLE_REASON, parse_reply
+
+    verdicts, unreadable = parse_reply("[R1] 保留\n[R2] 保保留\n")
+    assert set(verdicts) == {1}
+    assert unreadable == {2}
+    assert UNJUDGED_REASON != UNREADABLE_REASON
+
+
+def test_a_truncated_reply_still_fails_and_retries():
+    """400 of 547 answered is a cut-off response, not a slip."""
+    segments = big()
+    short = reply_for(range(1, 401))
+    out, client = run([short, short], segments=segments)
+    assert len(client.calls) == 2
+    assert recovered_texts(out) == []
+
+
+def test_the_budget_is_zero_below_fifty_items():
+    """Under 50 lines the tolerance rounds to nothing — today's behaviour."""
+    small = big(n_recovered=49, anchors_every=1000)
+    out, client = run([reply_for(range(1, 50), omit={7})] * 2, segments=small)
+    assert recovered_texts(out) == []
+    assert len(client.calls) == 2
+
+    fifty = big(n_recovered=50, anchors_every=1000)
+    out, client = run([reply_for(range(1, 51), omit={7})], segments=fifty)
+    assert len(recovered_texts(out)) == 49
+    assert len(client.calls) == 1
+
+
+def test_an_unknown_number_still_voids_the_chunk_even_with_full_coverage():
+    """A number nobody sent means the model lost its place — not a slip."""
+    segments = big(n_recovered=100, anchors_every=1000)
+    reply = reply_for(range(1, 101)) + "\n[R101] 保留"
+    out, client = run([reply, reply], segments=segments)
+    assert recovered_texts(out) == []
+    assert len(client.calls) == 2
+
+
+def test_unjudged_lines_are_never_kept():
+    import random
+
+    rng = random.Random(7)
+    segments = big()
+    missing = set(rng.sample(range(1, 548), 10))
+    out, _ = run([reply_for(range(1, 548), omit=missing)], segments=segments)
+    survived = set(recovered_texts(out))
+    assert all(f"補足の台詞 {n}" not in survived for n in missing)
+    assert len(survived) == 547 - len(missing)
+
+
+def test_two_consecutive_failures_stop_the_calls():
+    """GIVE_UP_AFTER: an unreachable endpoint costs two calls, not one a chunk."""
+    from app.services import vet
+
+    long_transcript = []
+    for i in range(1, 1201):
+        long_transcript.append(S(i * 2.0, i * 2.0 + 1.5,
+                                 f"これは十分に長い確認済みの台詞です {i}"))
+        long_transcript.append(S(i * 2.0 + 1.5, i * 2.0 + 1.9,
+                                 f"補足の台詞 {i}", recovered=True))
+    chunks = vet._chunks(long_transcript, LLM.context_limit)
+    assert len(chunks) >= 3, "the transcript must actually split"
+
+    out, client = run(["garbage"] * 10, segments=long_transcript)
+    assert len(client.calls) == vet.GIVE_UP_AFTER * 2
+    assert recovered_texts(out) == []

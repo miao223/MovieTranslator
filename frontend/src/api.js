@@ -35,6 +35,8 @@ export const api = {
     request('/api/settings/test-llm', { method: 'POST', body: JSON.stringify(llm) }),
   testVision: (llm) =>
     request('/api/settings/test-vision', { method: 'POST', body: JSON.stringify(llm) }),
+  testAsrApi: (llm) =>
+    request('/api/settings/test-asr-api', { method: 'POST', body: JSON.stringify(llm) }),
   browse: (path) =>
     request(`/api/fs/browse?path=${encodeURIComponent(path || '')}`),
   resolvePath: (path) =>

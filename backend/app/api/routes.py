@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import string
 import sys
 from pathlib import Path
@@ -212,6 +213,8 @@ def get_settings(request: Request) -> AppSettings:
         remote.llm.api_key = MASKED
     if remote.llm.vision_api_key:
         remote.llm.vision_api_key = MASKED
+    if remote.llm.audio_api_key:
+        remote.llm.audio_api_key = MASKED
     return remote
 
 
@@ -222,6 +225,8 @@ def put_settings(settings: AppSettings, request: Request) -> AppSettings:
         settings.llm.api_key = stored.llm.api_key
     if settings.llm.vision_api_key == MASKED:
         settings.llm.vision_api_key = stored.llm.vision_api_key
+    if settings.llm.audio_api_key == MASKED:
+        settings.llm.audio_api_key = stored.llm.audio_api_key
     # a LAN user who just switched the switch on still needs a way in
     server.ensure_token(settings)
     config.save_settings(settings)
@@ -373,6 +378,81 @@ def test_vision(llm: LLMSettings):
         "model": model,
         "endpoint": endpoint,
         "read_it": _squash(VISION_PROBE) in _squash(reply),
+    }
+
+
+# What the test clip does. Measured on a real endpoint: this model cannot
+# count beeps at all — it answered 6 for one beep, 3 for three, and 5 for
+# two seconds of pure silence — but it identifies a rising or falling sweep
+# every time. So the probe asks the question the model can answer, and the
+# direction is drawn at random so a guess cannot keep passing.
+PROBE_SECONDS = 4.0
+PROBE_QUESTION = ("这段音频是一个单一的纯音。它的音调是一直升高还是一直降低？"
+                  "只回答「升高」或「降低」两个词之一，不要任何解释。")
+
+
+@router.post("/settings/test-asr-api")
+def test_asr_api(llm: LLMSettings):
+    """Prove the audio endpoint works — by sending it actual audio.
+
+    Two different things can be wrong and they need different answers. The
+    model may not listen at all (a text-only model answers this question
+    happily and then fails on the first window), or the relay in between
+    may drop the audio part and pass the text through — measured on a real
+    endpoint, and invisible in the reply, because the model answers
+    plausibly either way.
+
+    So two independent signals: the pitch question, which needs ears, and
+    the number of prompt tokens the server reports, which is arithmetic —
+    audio costs about 25 tokens a second and text alone cannot fake that.
+
+    The clip is built with the engine's own encoder, the same way
+    test-vision draws its picture with ocr.py's own helpers.
+    """
+    import random
+
+    import numpy as np
+
+    from app.services import asr_api
+    from app.services.translator import make_audio_client, reply_text
+
+    model = llm.audio_model.strip() or llm.model
+    endpoint = llm.audio_base_url.strip() or llm.base_url
+
+    rate = asr_api.SAMPLE_RATE
+    rising = random.choice((True, False))
+    steps = np.arange(int(rate * PROBE_SECONDS))
+    sweep = np.linspace(400.0, 1600.0, len(steps))
+    clip = (0.5 * np.sin(2 * np.pi * np.cumsum(
+        sweep if rising else sweep[::-1]) / rate)).astype("float32")
+
+    try:
+        client = make_audio_client(llm, config.load_settings().network)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": PROBE_QUESTION},
+                asr_api.audio_part(asr_api.encode_samples(clip, "mp3"), "mp3"),
+            ]}],
+            temperature=0,
+        )
+        reply = reply_text(resp)
+    except Exception as exc:  # noqa: BLE001 — report connectivity errors verbatim
+        return {"ok": False, "error": str(exc), "model": model, "endpoint": endpoint}
+
+    said, other = ("升高", "降低") if rising else ("降低", "升高")
+    usage = getattr(resp, "usage", None)
+    return {
+        "ok": True,
+        "reply": reply,
+        "model": model,
+        "endpoint": endpoint,
+        "asked": said,
+        "heard_it": said in reply and other not in reply,
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "expected_tokens": int(asr_api.AUDIO_TOKENS_PER_SECOND * PROBE_SECONDS),
+        # None when the server reports no usage at all
+        "carried_audio": asr_api.audio_reached_the_model(usage, PROBE_SECONDS),
     }
 
 
