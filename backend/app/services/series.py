@@ -27,9 +27,13 @@ disk unless the user presses 「保存到设置的术语表」.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
+import time
 from collections import OrderedDict
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -91,6 +95,7 @@ class SeriesGlossary:
     terms: "OrderedDict[str, str]" = field(default_factory=OrderedDict)
     # rewrites that were refused, newest last — the human review list
     conflicts: List[str] = field(default_factory=list)
+    touched: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __len__(self) -> int:
@@ -115,6 +120,7 @@ class SeriesGlossary:
                 elif settled != target:
                     clashes.append(f"{source}: 沿用「{settled}」，本集模型给出「{target}」")
             self.conflicts.extend(clashes)
+            self.touched = time.time()
         return added, clashes
 
     def render(self) -> str:
@@ -143,15 +149,92 @@ class SeriesGlossary:
 
 
 # ------------------------------------------------------------------ store
+#
+# Kept in memory and mirrored to disk. Memory alone was fine while a batch
+# was a single burst of work in one process; with a persistent queue a
+# season can span a restart, and the second half would start naming people
+# from scratch — which is the one thing series mode exists to prevent.
+#
+# Written next to settings.json rather than into the cache, which is wiped
+# on every startup, and derived from settings_path() so the tests' temp
+# directory carries it along.
 
 _store: Dict[str, SeriesGlossary] = {}
 _store_lock = threading.Lock()
+# Seasons are not immortal: a table nobody has added to in this long is
+# from a batch that finished or was abandoned.
+KEEP_GLOSSARY_DAYS = 30
+
+
+def glossary_path() -> Path:
+    from app.core import config
+
+    return config.settings_path().parent / "glossaries.json"
+
+
+def _write() -> None:
+    """Mirror the whole store to disk. Called with _store_lock held."""
+    payload = {
+        "version": 1,
+        "series": {
+            sid: {"terms": list(g.terms.items()), "conflicts": g.conflicts,
+                  "touched": g.touched}
+            for sid, g in _store.items()
+        },
+    }
+    path = glossary_path()
+    part = path.with_name(path.name + ".part")
+    try:
+        part.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        os.replace(part, path)
+    except OSError:
+        # A glossary is an optimisation, never the job. Failing to save one
+        # must not fail the episode that just translated fine.
+        part.unlink(missing_ok=True)
+
+
+def load() -> None:
+    """Read the saved tables back, without disturbing any already in memory.
+
+    Disk is the fallback for what this process does not have, never an
+    overwrite of what it does: a table in memory has been added to since it
+    was last written, so loading over it would throw away the newer names.
+    Safe to call more than once, and at any time.
+    """
+    try:
+        raw = json.loads(glossary_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    cutoff = time.time() - KEEP_GLOSSARY_DAYS * 86400
+    with _store_lock:
+        for sid, item in (raw.get("series") or {}).items():
+            if sid in _store:
+                continue          # memory is the newer copy
+            if not isinstance(item, dict) or item.get("touched", 0) < cutoff:
+                continue
+            glossary = SeriesGlossary(id=sid)
+            for pair in item.get("terms") or []:
+                if isinstance(pair, list) and len(pair) == 2:
+                    glossary.terms[str(pair[0])] = str(pair[1])
+            glossary.conflicts = [str(c) for c in item.get("conflicts") or []]
+            glossary.touched = float(item.get("touched") or 0.0)
+            _store[sid] = glossary
 
 
 def create(series_id: str) -> SeriesGlossary:
-    glossary = SeriesGlossary(id=series_id)
+    """Start a table, or pick up one the last run left behind.
+
+    Reused rather than replaced: a queued season interrupted at episode 5
+    should carry episodes 1-4's names into episode 5, not start over.
+    """
     with _store_lock:
+        existing = _store.get(series_id)
+        if existing is not None:
+            return existing
+        glossary = SeriesGlossary(id=series_id)
         _store[series_id] = glossary
+        _write()
     return glossary
 
 
@@ -160,6 +243,12 @@ def get(series_id: str) -> Optional[SeriesGlossary]:
         return None
     with _store_lock:
         return _store.get(series_id)
+
+
+def save() -> None:
+    """Persist the store; called after an episode learns something."""
+    with _store_lock:
+        _write()
 
 
 def for_job(series_id: str, user_glossary: str) -> Tuple[Optional[SeriesGlossary], str]:

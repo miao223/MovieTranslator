@@ -460,6 +460,20 @@ def embed(
     # written under a temporary name: a half-copied film left in the user's
     # library looks exactly like a real one until they try to play it
     part = out_path.with_name(out_path.name + ".part")
+    # A previous run killed outright (SIGKILL, power cut) leaves this behind,
+    # and it can be several gigabytes. Opening for write would truncate it
+    # anyway; it is removed explicitly so the log can say it was there,
+    # because otherwise nothing ever tells anyone. The file is named exactly
+    # after the output this run is about to produce, so nothing else can be
+    # caught by it — a stale .part for a film that is never translated again
+    # is still left alone, deliberately: guessing at other people's
+    # half-written files is not this program's business.
+    if part.exists():
+        stale = part.stat().st_size
+        if log:
+            log(f"⚠ 发现上次未写完的残留文件（{stale / 1_000_000_000:.1f} GB），已删除："
+                f"{part.name}")
+        part.unlink(missing_ok=True)
     lang = track_language.strip() or language_of(target_language)[1]
     fmt = CONTAINERS.get(opts.container, "matroska")
     mp4 = fmt == "mp4"

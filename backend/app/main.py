@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
+from app.services import series
 from app.services.jobqueue import queue_manager
 from app.core import config, server
 from app.core.auth import MCP_PREFIX, AccessGuard
@@ -47,6 +48,7 @@ async def lifespan(_app: FastAPI):
     # in a test must not spawn a runner thread. load() also repairs anything
     # left marked running by a crash, so this is where a queue picks itself
     # back up after the power went out.
+    series.load()      # season glossaries outlive the process; see series.py
     queue_manager.start()
     async with contextlib.AsyncExitStack() as stack:
         mcp = mcp_server.build()

@@ -923,6 +923,10 @@ class JobManager:
                 added, clashes = shared.learn(
                     translator.glossary_text, settings.prompts.glossary
                 )
+                # Persisted per episode, not at the end of the batch: a
+                # season that spans a restart should carry the names it has
+                # already settled on into the episodes still to come.
+                series.save()
                 tr_log(
                     f"剧集模式：本集新增 {added} 条译名，累计 {len(shared)} 条"
                     + (

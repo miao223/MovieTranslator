@@ -723,3 +723,77 @@ def test_a_live_batch_keeps_its_members_reachable(settings_file, monkeypatch, tm
         manager.create(req(str(film))).status.stage = "done"
 
     assert member.id in manager.jobs
+
+
+# ------------------------------------------------------- the three gaps
+
+
+def test_a_language_suffixed_subtitle_counts_as_already_translated(tmp_path):
+    """original_only writes film.ja.srt, and the scan used to miss it.
+
+    A season translated in that mode was rescanned as untranslated every
+    time, which with a queue means re-running the lot by accident.
+    """
+    from app.core.media import scan_media
+
+    (tmp_path / "a.mkv").write_bytes(b"x")
+    (tmp_path / "a.ja.srt").write_text("1")          # 纯原文 的产物
+    (tmp_path / "b.mkv").write_bytes(b"x")
+    (tmp_path / "b.srt").write_text("1")             # 译文的产物
+    (tmp_path / "c.mkv").write_bytes(b"x")           # 没有字幕
+    (tmp_path / "d.mkv").write_bytes(b"x")
+    (tmp_path / "d.backup.srt").write_text("1")      # 不是本程序写的
+
+    todo, skipped, _ = scan_media(tmp_path)
+    assert sorted(p.name for p in todo) == ["c.mkv", "d.mkv"]
+    assert sorted(p.name for p in skipped) == ["a.mkv", "b.mkv"]
+
+
+def test_a_season_glossary_survives_a_restart(settings_file):
+    """Series mode assumes the whole season agrees; a restart used to reset it."""
+    from app.services import series
+
+    settings_file()
+    series._store.clear()
+    shared = series.create("season-1")
+    shared.learn("佐藤健一 → 佐藤健一\nユキ → 雪")
+    series.save()
+
+    series._store.clear()                 # a restart
+    series.load()
+    again = series.get("season-1")
+    assert again is not None
+    assert "佐藤健一" in again.render() and "雪" in again.render()
+
+
+def test_loading_never_overwrites_a_table_already_in_memory(settings_file):
+    """Disk is the fallback for what this process lacks, not an overwrite.
+
+    A table in memory has been added to since it was last written, so
+    loading over it would throw the newer names away.
+    """
+    from app.services import series
+
+    settings_file()
+    series._store.clear()
+    shared = series.create("season-2")
+    series.save()                         # written while still empty
+    shared.learn("ユキ → 雪")              # ...learned afterwards, not saved
+
+    series.load()
+    assert "雪" in series.get("season-2").render()
+
+
+def test_an_abandoned_glossary_is_eventually_forgotten(settings_file):
+    from app.services import series
+
+    settings_file()
+    series._store.clear()
+    old = series.create("ancient")
+    old.learn("あ → 阿")
+    old.touched = 0.0                     # long ago
+    series.save()
+
+    series._store.clear()
+    series.load()
+    assert series.get("ancient") is None

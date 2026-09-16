@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import glob
+import re
+
 from pathlib import Path
 from typing import List, Tuple
 
@@ -47,8 +50,9 @@ def scan_media(
 
     Returns (to_translate, skipped, shadowed):
 
-    *skipped* are files that already have a same-stem .srt next to them (only
-    when skip_existing_srt). *shadowed* are audio files dropped because a video
+    *skipped* are files that already have a subtitle next to them (only when
+    skip_existing_srt) — either ``film.srt`` or the language-suffixed
+    ``film.ja.srt`` that original_only mode writes. *shadowed* are audio files dropped because a video
     of the same stem sits in the same folder — both would write the same .srt,
     so the one with the picture wins and the audio (usually extracted from it)
     steps aside. Hidden directories/files (dot-prefixed) are ignored.
@@ -80,5 +84,33 @@ def scan_media(
         return files, [], shadowed
     to_translate, skipped = [], []
     for f in files:
-        (skipped if f.with_suffix(".srt").exists() else to_translate).append(f)
+        (skipped if has_subtitle(f) else to_translate).append(f)
     return to_translate, skipped, shadowed
+
+
+# A language suffix as original_only writes it: two or three letters, or the
+# "orig"/"und" it falls back to when the language could not be determined.
+_LANG_SUFFIX = re.compile(r"^[a-z]{2,3}$|^orig$|^und$")
+
+
+def has_subtitle(video: Path) -> bool:
+    """Is there already a subtitle for this file next to it?
+
+    Both shapes count. Translated output is ``film.srt``, but original_only
+    writes ``film.ja.srt`` — and only checking the first meant a season run
+    in that mode was rescanned as untranslated every time, re-running the
+    lot. The language is not knowable at scan time when source_language is
+    auto, so the suffix is matched by shape rather than by value.
+
+    Deliberately narrow: ``film.backup.srt`` and ``film.v2.srt`` are not
+    subtitles this program wrote, and skipping a file because of one would
+    be the worse mistake.
+    """
+    if video.with_suffix(".srt").exists():
+        return True
+    stem = video.stem
+    for sibling in video.parent.glob(f"{glob.escape(stem)}.*.srt"):
+        middle = sibling.name[len(stem) + 1: -len(".srt")]
+        if _LANG_SUFFIX.match(middle.lower()):
+            return True
+    return False
