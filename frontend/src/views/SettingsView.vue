@@ -18,6 +18,25 @@ const testingAsrApi = ref(false)
 const modelDownloaded = ref(null) // null = unknown / loading
 const cuda = ref(null) // { available, device_count }
 const storageInfo = ref(null) // { effective_dir, is_default }
+const storageUsage = ref(null) // { checkpoints: {dir,count,bytes}, days, max_gb }
+const clearing = ref(false)
+const resumeOn = computed(
+  () => (settings.value?.checkpoint_days || 0) > 0
+     && (settings.value?.checkpoint_max_gb || 0) > 0
+)
+
+async function clearCheckpoints() {
+  clearing.value = true
+  try {
+    const r = await api.clearCheckpoints()
+    ElMessage.success(`已清除 ${(r.freed / 1024 ** 3).toFixed(2)} GB`)
+    storageUsage.value = await api.storageUsage()
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    clearing.value = false
+  }
+}
 const logInfo = ref(null) // { dir, files: [{name, size, modified}] }
 const serverInfo = ref(null) // { configured, running, lan_ips, urls, mcp, token }
 const download = ref({ status: 'idle', progress: 0 })
@@ -176,6 +195,7 @@ onMounted(async () => {
       api.cudaStatus().then((r) => (cuda.value = r)).catch(() => {})
     }
     api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
+    api.storageUsage().then((r) => (storageUsage.value = r)).catch(() => {})
     api.logs().then((r) => (logInfo.value = r)).catch(() => {})
     refreshServerInfo()
   } catch (e) {
@@ -189,6 +209,7 @@ async function save() {
     settings.value = await api.saveSettings(settings.value)
     ElMessage.success('设置已保存')
     api.storageInfo().then((r) => (storageInfo.value = r)).catch(() => {})
+    api.storageUsage().then((r) => (storageUsage.value = r)).catch(() => {})
     if (settings.value.asr.engine === 'local') refreshModelStatus()
     refreshServerInfo()
   } catch (e) {
@@ -647,6 +668,35 @@ async function testVision() {
           <div class="storage-path">
             📂 模型当前实际存放于：<code>{{ storageInfo.effective_dir }}</code>
             <el-tag v-if="storageInfo.is_default" size="small" type="info" style="margin-left: 8px">默认位置</el-tag>
+          </div>
+        </el-form-item>
+        <el-form-item label="断点续跑">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+            <span class="hint" style="margin: 0">保留</span>
+            <el-input-number v-model="settings.checkpoint_days" :min="0" :max="90" size="small" style="width: 110px" />
+            <span class="hint" style="margin: 0">天，最多</span>
+            <el-input-number v-model="settings.checkpoint_max_gb" :min="0" :max="500" size="small" style="width: 110px" />
+            <span class="hint" style="margin: 0">GB</span>
+            <el-tag v-if="!resumeOn" size="small" type="info">已关闭</el-tag>
+          </div>
+          <span class="hint" style="display: block">
+            任务被中断后（关程序、断电、崩溃），下次从<strong>没做完的那一步</strong>继续，
+            不用重新提音频、重新识别、重新翻译。<strong>任一项填 0 即关闭</strong>，什么都不保留。<br />
+            只有「片源、设置、任务参数、程序版本」四样全都没变，上次的半成品才会被沿用；
+            变了任何一样都会重新来过。
+          </span>
+        </el-form-item>
+        <el-form-item v-if="storageUsage" label=" ">
+          <div class="storage-path">
+            🗃️ 已保留的半成品：<strong>{{ (storageUsage.checkpoints.bytes / 1024 ** 3).toFixed(2) }} GB</strong>
+            （{{ storageUsage.checkpoints.count }} 份）
+            <el-button size="small" style="margin-left: 10px" :loading="clearing" @click="clearCheckpoints">
+              立即清除
+            </el-button>
+            <div class="hint" style="margin-left: 0">
+              <code>{{ storageUsage.checkpoints.dir }}</code> ·
+              超过天数或总量时自动清理（启动时与每个任务结束后各扫一次）；清除只影响半成品，已生成的字幕不受影响
+            </div>
           </div>
         </el-form-item>
         <el-form-item v-if="logInfo" label="日志文件夹">

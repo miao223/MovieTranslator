@@ -58,6 +58,9 @@ export const api = {
     request(`/api/asr/download-status?model_size=${encodeURIComponent(modelSize)}`),
   encoders: () => request('/api/media/encoders'),
   serverInfo: () => request('/api/server/info'),
+  storageUsage: () => request('/api/storage/usage'),
+  clearCheckpoints: () =>
+    request('/api/storage/clear-checkpoints', { method: 'POST' }),
   regenerateToken: () =>
     request('/api/server/token/regenerate', { method: 'POST' }),
   resultUrl: (id) => `/api/jobs/${id}/result`,

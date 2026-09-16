@@ -241,6 +241,14 @@ class AppSettings(BaseModel):
     # where downloaded whisper models are stored; empty = HuggingFace default
     # cache (~/.cache/huggingface/hub). changing it does NOT move old models
     model_cache_dir: str = ""
+    # Half-finished work kept so an interrupted film can carry on instead of
+    # buying its audio and transcription again (core/cache.py). Two limits,
+    # whichever bites first; audio is ~230 MB for a two-hour film, so the
+    # size one usually does. Either at 0 turns resuming off and keeps
+    # nothing — the setting for someone who would rather spend tokens than
+    # disk.
+    checkpoint_days: int = Field(7, ge=0, le=90)
+    checkpoint_max_gb: int = Field(10, ge=0, le=500)
     # deep-diagnostics log next to the subtitle output (core/debuglog.py):
     # raw ASR output, every segmentation/merge decision, full LLM traffic.
     # off by default because the file runs to several MB per film

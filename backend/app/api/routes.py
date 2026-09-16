@@ -593,6 +593,42 @@ def asr_storage_info():
     }
 
 
+@router.get("/storage/usage")
+def storage_usage() -> dict:
+    """What this program is keeping on disk, so it can be seen and dropped.
+
+    Half-finished work is the only part that grows with use: a two-hour
+    film's audio is about 230 MB, and it is kept so an interrupted run does
+    not have to buy its audio and transcription again. Both limits are in
+    settings, and either at 0 turns the whole thing off.
+    """
+    from app.core.cache import checkpoints_usage
+
+    settings = config.load_settings()
+    kept = checkpoints_usage()
+    return {
+        "checkpoints": kept,
+        "days": settings.checkpoint_days,
+        "max_gb": settings.checkpoint_max_gb,
+        "enabled": settings.checkpoint_days > 0 and settings.checkpoint_max_gb > 0,
+        "logs_dir": str(joblog.logs_dir()),
+    }
+
+
+@router.post("/storage/clear-checkpoints")
+def clear_checkpoints() -> dict:
+    """Drop every half-finished run. Finished subtitles are untouched."""
+    import shutil
+
+    from app.core.cache import checkpoints_root, checkpoints_usage
+
+    before = checkpoints_usage()["bytes"]
+    root = checkpoints_root()
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    return {"freed": before}
+
+
 @router.get("/asr/cuda-status")
 def asr_cuda_status():
     """Whether CUDA is usable by ctranslate2 on this machine."""

@@ -497,6 +497,13 @@ class QueueManager:
             entry.finished_at = time.time()
             self.store.save()
         self._current = None
+        # Swept after every entry, not only at startup: a queue left
+        # running for days would otherwise never come back under its limit.
+        from app.core.cache import prune_checkpoints
+        try:
+            prune_checkpoints()
+        except OSError:
+            pass          # housekeeping must never stop the queue
 
     # -- commands --------------------------------------------------------
 

@@ -35,7 +35,7 @@ from app.services import series
 from app.services.jobqueue import queue_manager
 from app.core import config, server
 from app.core.auth import MCP_PREFIX, AccessGuard
-from app.core.cache import clear_cache
+from app.core.cache import clear_cache, prune_checkpoints
 from app.services import mcp_server
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -48,6 +48,12 @@ async def lifespan(_app: FastAPI):
     # in a test must not spawn a runner thread. load() also repairs anything
     # left marked running by a crash, so this is where a queue picks itself
     # back up after the power went out.
+    # Kept work is bounded by age and by total size, and both are the
+    # user's own settings. Swept at startup and again after every job, so
+    # a queue running for days cannot quietly fill the disk.
+    freed = prune_checkpoints()
+    if freed:
+        print(f"[checkpoints] 清理了 {freed / 1024 ** 3:.1f} GB 过期的半成品")
     series.load()      # season glossaries outlive the process; see series.py
     queue_manager.start()
     async with contextlib.AsyncExitStack() as stack:

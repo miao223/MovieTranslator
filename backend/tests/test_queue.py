@@ -797,3 +797,123 @@ def test_an_abandoned_glossary_is_eventually_forgotten(settings_file):
     series._store.clear()
     series.load()
     assert series.get("ancient") is None
+
+
+# --------------------------------------------------- resuming, and its cost
+
+
+def test_resuming_reuses_the_work_and_a_changed_setting_does_not(settings_file, tmp_path):
+    """The directory name is the whole validity check.
+
+    Same film, same settings → same key → last time's work is found. Change
+    anything that would make that work wrong to continue from, and the key
+    moves, so nothing has to be compared afterwards and no check can be
+    forgotten.
+    """
+    from app.services.pipeline import Job, checkpoint_key
+
+    settings_file(llm__model="model-A")
+    film = tmp_path / "f.mkv"
+    film.write_bytes(b"x")
+
+    first = checkpoint_key(Job(req(str(film)), audio_only=True), jobqueue.snapshot())
+    same = checkpoint_key(Job(req(str(film)), audio_only=True), jobqueue.snapshot())
+    assert first == same
+
+    settings_file(llm__model="model-B")               # 设置变了
+    assert checkpoint_key(Job(req(str(film)), audio_only=True),
+                          jobqueue.snapshot()) != first
+
+    settings_file(llm__model="model-A")
+    film.write_bytes(b"different content")            # 片源变了
+    assert checkpoint_key(Job(req(str(film)), audio_only=True),
+                          jobqueue.snapshot()) != first
+
+
+def test_a_different_request_is_different_work(settings_file, tmp_path):
+    """Same film and settings, but translated into another language."""
+    from app.services.pipeline import Job, checkpoint_key
+
+    settings_file()
+    film = tmp_path / "f.mkv"
+    film.write_bytes(b"x")
+    snap = jobqueue.snapshot()
+    a = Job(JobRequest(video_path=str(film), target_language="简体中文"), audio_only=True)
+    b = Job(JobRequest(video_path=str(film), target_language="English"), audio_only=True)
+    assert checkpoint_key(a, snap) != checkpoint_key(b, snap)
+
+
+def test_the_program_version_invalidates_kept_work(settings_file, tmp_path, monkeypatch):
+    from app.core import joblog
+    from app.services.pipeline import Job, checkpoint_key
+
+    settings_file()
+    film = tmp_path / "f.mkv"
+    film.write_bytes(b"x")
+    snap = jobqueue.snapshot()
+    before = checkpoint_key(Job(req(str(film)), audio_only=True), snap)
+    monkeypatch.setattr(joblog, "APP_VERSION", "99.0.0")
+    assert checkpoint_key(Job(req(str(film)), audio_only=True), snap) != before
+
+
+def test_old_and_oversized_checkpoints_are_swept(settings_file, monkeypatch):
+    """Disk must not grow without bound: age first, then total size."""
+    import os
+    from app.core import cache
+
+    settings_file(checkpoint_days=7, checkpoint_max_gb=1)
+    root = cache.checkpoints_root()
+    for d in root.iterdir():
+        if d.is_dir():
+            __import__("shutil").rmtree(d, ignore_errors=True)
+
+    stale = cache.checkpoint_dir("stale")
+    (stale / "audio.wav").write_bytes(b"x" * 10)
+    old = __import__("time").time() - 30 * 86400
+    os.utime(stale / "audio.wav", (old, old))
+
+    fresh = cache.checkpoint_dir("fresh")
+    (fresh / "audio.wav").write_bytes(b"x" * 10)
+
+    cache.prune_checkpoints()
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+def test_turning_resuming_off_keeps_nothing_at_all(settings_file):
+    from app.core import cache
+
+    settings_file(checkpoint_days=0)
+    kept = cache.checkpoint_dir("doomed")
+    (kept / "audio.wav").write_bytes(b"x" * 10)
+
+    assert cache.checkpoints_enabled() is False
+    cache.prune_checkpoints()
+    assert not kept.exists()
+
+
+def test_the_size_cap_drops_the_oldest_first(settings_file):
+    import os
+    import time
+    from app.core import cache
+
+    settings_file(checkpoint_days=90, checkpoint_max_gb=0)   # 0 = 关闭
+    assert cache.checkpoints_enabled() is False
+
+    # and with a real cap, the oldest goes first
+    settings_file(checkpoint_days=90, checkpoint_max_gb=1)
+    root = cache.checkpoints_root()
+    for d in list(root.iterdir()):
+        if d.is_dir():
+            __import__("shutil").rmtree(d, ignore_errors=True)
+    now = time.time()
+    for i, name in enumerate(("oldest", "newest")):
+        d = cache.checkpoint_dir(name)
+        (d / "audio.wav").write_bytes(b"x" * 1024)
+        os.utime(d / "audio.wav", (now - (10 - i) * 3600,) * 2)
+    monkey = 1500          # a cap below the total but above one of them
+    from unittest import mock
+    with mock.patch.object(cache, "_limits", lambda: (90, monkey)):
+        cache.prune_checkpoints()
+    assert not (root / "oldest").exists()
+    assert (root / "newest").exists()

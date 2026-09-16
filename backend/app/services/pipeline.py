@@ -7,6 +7,7 @@ and are wiped on the next application startup.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -18,7 +19,8 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
 from app.core import config
-from app.core.cache import job_dir
+from app.core.cache import (
+    checkpoint_dir, checkpoints_enabled, job_dir, prune_checkpoints)
 from app.core.debuglog import DebugLog, open_debug_log
 from app.core.joblog import JobLogWriter, _settings_lines as joblog_settings_lines
 from app.models.schemas import (
@@ -83,6 +85,35 @@ _run_slot = threading.Semaphore(1)  # one CPU-heavy job at a time
 LIVE_KEY_FIELDS = ("api_key", "vision_api_key", "audio_api_key")
 
 
+def checkpoint_key(job: Job, settings: AppSettings) -> str:
+    """Identifies this exact piece of work, for resuming it.
+
+    Every reason a half-finished result would be wrong to continue from is
+    folded into the name: change the source file, the settings, or the
+    program, and the work lands in a different directory and starts clean.
+    Nothing is compared afterwards, so there is no check that can be
+    forgotten — a key that matches cannot be stale.
+
+    Deliberately not the job id: that is new every run, which is precisely
+    what stopped anything being reused.
+    """
+    from app.core.joblog import APP_VERSION
+    from app.services.jobqueue import settings_hash
+
+    video = Path(job.request.video_path)
+    try:
+        stat = video.stat()
+        stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        stamp = "missing"
+    raw = "|".join([
+        str(video.resolve()), stamp, settings_hash(settings), APP_VERSION,
+        # the request decides what is produced, not just how
+        job.request.model_dump_json(),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def _settings_for(job: Job) -> AppSettings:
     """The settings this job runs with: its own snapshot, or the live ones.
 
@@ -119,6 +150,7 @@ class Job:
         # a client must not be able to hand us the settings to run under —
         # a LAN browser's copy has its API keys masked to ********.
         self.settings = settings
+        self.checkpoint = ""      # set by _workdir_for when resuming is on
         self.status = JobStatus(id=self.id, video_path=request.video_path)
         self.cancel_event = threading.Event()
         self.events: List[ProgressEvent] = []
@@ -240,6 +272,48 @@ class JobManager:
 
     # ---------------------------------------------------------- pipeline
 
+    def _resume_lines(self, job: Job, path: Path, what: str):
+        """Lines a previous attempt already produced, or None.
+
+        Only ever reads from the checkpoint directory, whose name encodes
+        the source file, the settings and the program version — so a file
+        found here was produced by the same work this run is doing. The
+        check is the location, not the contents.
+        """
+        if not job.checkpoint or not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            lines = [SubtitleLine.model_validate(item) for item in raw]
+        except (OSError, ValueError) as exc:
+            job.publish(job.status.stage, job.status.progress,
+                        log=f"⚠ 上次的{what}结果读不出来（{exc}），本次重做")
+            return None
+        if not lines:
+            return None
+        job.publish(job.status.stage, job.status.progress,
+                    log=f"↻ 沿用上次的{what}结果（{len(lines)} 条），跳过这一步")
+        return lines
+
+    def _resume_meta(self, workdir: Path) -> dict:
+        try:
+            return json.loads((workdir / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _workdir_for(self, job: Job) -> Path:
+        """Where this job writes — a resumable place when that is allowed.
+
+        Keyed on the work rather than on the job id, so a second attempt at
+        the same film under the same settings finds the first attempt's
+        results sitting there. With resuming switched off it is the old
+        per-job directory, which the next startup wipes.
+        """
+        if not checkpoints_enabled():
+            return job_dir(job.id)
+        job.checkpoint = checkpoint_key(job, _settings_for(job))
+        return checkpoint_dir(job.checkpoint)
+
     def _stage_progress(self, job: Job, stage: str):
         lo, hi = STAGE_RANGES[stage]
 
@@ -250,7 +324,7 @@ class JobManager:
 
     def _run(self, job: Job) -> None:
         req = job.request
-        workdir = job_dir(job.id)
+        workdir = self._workdir_for(job)
         job.publish("pending", 0, message="排队中…")
         # Acquired with a timeout rather than `with _run_slot:` so that a job
         # waiting its turn can still be cancelled. Blocking outright put the
@@ -538,13 +612,28 @@ class JobManager:
             if got is not None:
                 lines, detected, source_kind = got
         if source_kind == "asr":
-            lines, detected, segments = self._transcribe(
-                job, req, settings, workdir, debug, check_cancel, vet_usage
-            )
+            done = self._resume_lines(job, workdir / "transcript.json", "转写")
+            if done is not None:
+                # The detected language is not recoverable from the lines,
+                # and everything downstream needs it — the subtitle's name
+                # suffix in original_only mode, and the prompts. It is
+                # stored beside the transcript for exactly this reason.
+                lines = done
+                detected = self._resume_meta(workdir).get("language", "") or detected
+                job.publish("transcribing", 60,
+                            message=f"沿用上次的转写，共 {len(lines)} 条")
+            else:
+                lines, detected, segments = self._transcribe(
+                    job, req, settings, workdir, debug, check_cancel, vet_usage
+                )
         (workdir / "transcript.json").write_text(
             json.dumps([l.model_dump() for l in lines], ensure_ascii=False, indent=1),
             encoding="utf-8",
         )
+        if job.checkpoint:
+            (workdir / "meta.json").write_text(
+                json.dumps({"language": detected or ""}, ensure_ascii=False),
+                encoding="utf-8")
 
         # 3. preprocess the transcript --------------------------------------
         # rejoin sentences the ASR cut mid-phrase, in the source language and
@@ -564,6 +653,12 @@ class JobManager:
                 log="使用已有字幕作为原文，已跳过转写预处理"
                     "（它是为修复语音识别缺陷设计的，对人工字幕只会打乱断句）",
             )
+        elif settings.prompts.refine_enabled and (
+                done := self._resume_lines(
+                    job, workdir / "transcript_refined.json", "转写预处理")):
+            lines = done
+            job.publish("refining", 72,
+                        message=f"沿用上次的预处理结果，共 {len(lines)} 条字幕")
         elif settings.prompts.refine_enabled:
             job.publish(
                 "refining", 60,
@@ -592,6 +687,7 @@ class JobManager:
                 encoding="utf-8",
             )
             job.publish("refining", 72, message=f"预处理完成，共 {len(lines)} 条字幕")
+
 
         self._finish(job, req, settings, workdir, video, debug, lines, detected,
                      glossary, shared, refine_usage, vet_usage, segments)
@@ -731,6 +827,16 @@ class JobManager:
         # 1. extract audio ------------------------------------------------
         job.publish("extracting", 0, message="提取音频…")
         wav = workdir / "audio.wav"
+        if wav.exists() and wav.stat().st_size > 0:
+            # Left by a run that was interrupted later on. The directory
+            # name already guarantees it came from this same source file
+            # under these same settings, so there is nothing to re-check.
+            job.publish("extracting", 10,
+                        message="沿用上次已提取的音频",
+                        log=f"↻ 沿用上次提取的音频 audio.wav"
+                            f"（{wav.stat().st_size / 1048576:.1f} MB），跳过提取")
+            return self._transcribe_from(job, req, settings, workdir, wav,
+                                         debug, check_cancel, vet_usage)
         extract_cb = self._stage_progress(job, "extracting")
 
         def extract_progress(fraction: float):
@@ -778,7 +884,14 @@ class JobManager:
             "extracting", 10,
             log=f"音频提取完成: audio.wav（{wav.stat().st_size / 1048576:.1f} MB）",
         )
+        return self._transcribe_from(job, req, settings, workdir, wav,
+                                     debug, check_cancel, vet_usage)
 
+    def _transcribe_from(self, job: Job, req: JobRequest, settings, workdir: Path,
+                         wav: Path, debug: DebugLog, check_cancel,
+                         vet_usage: dict):
+        """Everything after the audio exists — split out so a resumed run
+        can join here with the audio it already had."""
         # 2a. download the ASR model first if it's missing, with progress --
         asr_lo = 10.0
         if (settings.asr.engine == "local"
@@ -894,6 +1007,15 @@ class JobManager:
 
         # 3. translate ----------------------------------------------------
         translator = None
+        # The most expensive thing here to lose. Resuming skips the series
+        # glossary too, which is why the season's table is saved per
+        # episode rather than at the end of the batch.
+        if translate and (done := self._resume_lines(
+                job, workdir / "translation.json", "翻译")):
+            lines = done
+            translate = False
+            job.publish("translating", 95,
+                        message=f"沿用上次的译文，共 {len(lines)} 条")
         if translate:
             job.publish("translating", 72, message="AI 翻译中（全局上下文）…")
 
