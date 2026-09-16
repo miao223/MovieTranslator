@@ -138,7 +138,7 @@ def build() -> Optional["FastMCP"]:
             不支持内嵌合成新视频，也没有画面翻译。
         shadowed: 与同名视频重名而被让位的音频文件（两者会写同一份字幕）。
         """
-        found, skipped, shadowed = await anyio.to_thread.run_sync(
+        found, skipped, shadowed, _with_source = await anyio.to_thread.run_sync(
             scan_media, directory, recursive, skip_translated
         )
         return {

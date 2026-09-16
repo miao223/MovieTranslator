@@ -506,6 +506,7 @@ async function startBatchScan() {
   try {
     const r = await api.batchScan(
       batchForm.directory, batchForm.recursive, batchForm.skip_existing_srt,
+      form.target_language,
     )
     if (!r.total) {
       ElMessage.warning(
@@ -997,8 +998,29 @@ onBeforeUnmount(() => {
     <div v-if="scanResult" class="scan-list">
       <div v-for="v in scanResult.videos" :key="v" class="scan-item">
         {{ (scanResult.audio || []).includes(v) ? '🎵' : '🎬' }} {{ baseName(v) }}
+        <el-tag
+          v-if="(scanResult.with_source || []).includes(v)"
+          size="small" type="success" style="margin-left: 6px"
+        >已有外语字幕</el-tag>
       </div>
     </div>
+    <!-- Reported, never acted on. Translating from a subtitle someone typed
+         against the picture is faster and more accurate than recognising
+         the speech, but which source to use is the user's call. -->
+    <el-alert
+      v-if="scanResult && scanResult.with_source_count"
+      type="success"
+      :closable="false"
+      show-icon
+      style="margin-top: 12px"
+    >
+      <template #title>
+        其中 {{ scanResult.with_source_count }} 个文件旁边已有<strong>非{{ form.target_language }}</strong>的字幕
+      </template>
+      把上方「原文来源」改成<strong>「片源已有的字幕」</strong>，就能直接拿它们当原文翻译：
+      十几秒读完、不下模型、不占 GPU，而且断句、标点、人名都是人对着画面敲的，比语音识别准得多。
+      <br />保持现在的「语音识别」也可以，只是会慢很多、也更容易出错。
+    </el-alert>
     <!-- the mistake worth catching here is series mode left on for a folder
          of unrelated films: the names of one would be forced onto the rest -->
     <el-alert

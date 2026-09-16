@@ -728,25 +728,57 @@ def test_a_live_batch_keeps_its_members_reachable(settings_file, monkeypatch, tm
 # ------------------------------------------------------- the three gaps
 
 
-def test_a_language_suffixed_subtitle_counts_as_already_translated(tmp_path):
-    """original_only writes film.ja.srt, and the scan used to miss it.
+SRT_EN = ("1\n00:00:01,000 --> 00:00:03,000\n"
+          "What are you doing here at this hour?\n")
+SRT_ZH = "1\n00:00:01,000 --> 00:00:03,000\n你这个时候来干什么？\n"
+SRT_JA = "1\n00:00:01,000 --> 00:00:03,000\nこんな時間に何をしているの？\n"
 
-    A season translated in that mode was rescanned as untranslated every
-    time, which with a queue means re-running the lot by accident.
+
+def test_an_existing_subtitle_is_judged_by_its_language_not_its_name(tmp_path):
+    """"Already has a subtitle" is two different situations.
+
+    A subtitle in the target language means the film is done. A subtitle in
+    any other language is not a result at all — it is material, and better
+    material than speech recognition. The filename cannot tell them apart:
+    this program's own original_only output and a subtitle downloaded from
+    anywhere else are both film.ja.srt.
     """
     from app.core.media import scan_media
 
-    (tmp_path / "a.mkv").write_bytes(b"x")
-    (tmp_path / "a.ja.srt").write_text("1")          # 纯原文 的产物
-    (tmp_path / "b.mkv").write_bytes(b"x")
-    (tmp_path / "b.srt").write_text("1")             # 译文的产物
-    (tmp_path / "c.mkv").write_bytes(b"x")           # 没有字幕
-    (tmp_path / "d.mkv").write_bytes(b"x")
-    (tmp_path / "d.backup.srt").write_text("1")      # 不是本程序写的
+    (tmp_path / "done.mkv").write_bytes(b"x")
+    (tmp_path / "done.srt").write_text(SRT_ZH, encoding="utf-8")
+    (tmp_path / "japanese.mkv").write_bytes(b"x")
+    (tmp_path / "japanese.ja.srt").write_text(SRT_JA, encoding="utf-8")
+    (tmp_path / "english.mkv").write_bytes(b"x")
+    (tmp_path / "english.srt").write_text(SRT_EN, encoding="utf-8")
+    (tmp_path / "bare.mkv").write_bytes(b"x")
 
-    todo, skipped, _ = scan_media(tmp_path)
-    assert sorted(p.name for p in todo) == ["c.mkv", "d.mkv"]
-    assert sorted(p.name for p in skipped) == ["a.mkv", "b.mkv"]
+    todo, skipped, _, with_source = scan_media(tmp_path, target_language="简体中文")
+
+    assert sorted(p.name for p in skipped) == ["done.mkv"]
+    assert sorted(p.name for p in todo) == ["bare.mkv", "english.mkv", "japanese.mkv"]
+    # the two that can be translated from text instead of from speech
+    assert sorted(p.name for p in with_source) == ["english.mkv", "japanese.mkv"]
+
+
+def test_without_a_target_language_any_subtitle_still_counts_as_done(tmp_path):
+    """Nothing to compare against means the old, conservative rule."""
+    from app.core.media import scan_media
+
+    (tmp_path / "a.mkv").write_bytes(b"x")
+    (tmp_path / "a.srt").write_text(SRT_EN, encoding="utf-8")
+    todo, skipped, _, with_source = scan_media(tmp_path)
+    assert [p.name for p in skipped] == ["a.mkv"] and not todo and not with_source
+
+
+def test_a_subtitle_that_is_not_ours_by_name_is_left_alone(tmp_path):
+    """film.backup.srt is nobody's language tag, so it is not consulted."""
+    from app.core.media import scan_media
+
+    (tmp_path / "d.mkv").write_bytes(b"x")
+    (tmp_path / "d.backup.srt").write_text(SRT_EN, encoding="utf-8")
+    todo, skipped, _, _ = scan_media(tmp_path, target_language="简体中文")
+    assert [p.name for p in todo] == ["d.mkv"] and not skipped
 
 
 def test_a_season_glossary_survives_a_restart(settings_file):

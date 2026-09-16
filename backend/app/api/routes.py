@@ -114,10 +114,12 @@ def cancel_job(job_id: str):
 
 
 @router.get("/batch/scan")
-def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True):
+def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True,
+               target_language: str = ""):
     """Preview which videos and audio files a batch would translate."""
     try:
-        found, skipped, shadowed = scan_media(path, recursive, skip_existing)
+        found, skipped, shadowed, with_source = scan_media(
+            path, recursive, skip_existing, target_language)
     except NotADirectoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     audio_files = [str(f) for f in found if kind_of(f) == "audio"]
@@ -130,6 +132,12 @@ def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True):
         "audio": audio_files,
         "audio_count": len(audio_files),
         "shadowed": [str(s) for s in shadowed],
+        # files that already carry a subtitle in some OTHER language. Not
+        # acted on — reported, so the user can choose to translate from
+        # that text instead of from speech, which is faster and more
+        # accurate. Which source to use is their call, not ours.
+        "with_source": [str(s) for s in with_source],
+        "with_source_count": len(with_source),
     }
 
 
@@ -918,8 +926,9 @@ def enqueue_batch(req: BatchRequest) -> dict:
     of settings is the problem this feature exists to prevent.
     """
     try:
-        videos, skipped, _shadowed = scan_media(
-            req.directory, req.recursive, req.skip_existing_srt)
+        videos, skipped, _shadowed, _with_source = scan_media(
+            req.directory, req.recursive, req.skip_existing_srt,
+            req.target_language)
     except NotADirectoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not videos:

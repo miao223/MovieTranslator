@@ -19,8 +19,12 @@ export const api = {
   createJob: (payload) =>
     request('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
   getJob: (id) => request(`/api/jobs/${id}`),
-  batchScan: (path, recursive, skipExisting) =>
-    request(`/api/batch/scan?path=${encodeURIComponent(path)}&recursive=${recursive}&skip_existing=${skipExisting}`),
+  // targetLanguage decides what counts as "already translated": a subtitle
+  // in that language means done, one in any other language is material
+  batchScan: (path, recursive, skipExisting, targetLanguage = '') =>
+    request(`/api/batch/scan?path=${encodeURIComponent(path)}&recursive=${recursive}`
+            + `&skip_existing=${skipExisting}`
+            + `&target_language=${encodeURIComponent(targetLanguage)}`),
   createBatch: (payload) =>
     request('/api/batch', { method: 'POST', body: JSON.stringify(payload) }),
   getBatch: (id) => request(`/api/batch/${id}`),

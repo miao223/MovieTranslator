@@ -30,7 +30,7 @@ def add_audio(root: Path):
 
 def test_scan_recursive_with_skip(tmp_path):
     make_tree(tmp_path)
-    videos, skipped, shadowed = scan_media(
+    videos, skipped, shadowed, _ = scan_media(
         tmp_path, recursive=True, skip_existing_srt=True
     )
     names = [v.name for v in videos]
@@ -41,7 +41,7 @@ def test_scan_recursive_with_skip(tmp_path):
 
 def test_scan_non_recursive_no_skip(tmp_path):
     make_tree(tmp_path)
-    videos, skipped, _ = scan_media(
+    videos, skipped, _, _ = scan_media(
         tmp_path, recursive=False, skip_existing_srt=False
     )
     assert [v.name for v in videos] == ["a.mkv", "b.mp4"]
@@ -58,7 +58,7 @@ def test_audio_files_are_scanned_like_videos(tmp_path):
     feature; the .srt skip has to apply to it the same way."""
     make_tree(tmp_path)
     add_audio(tmp_path)
-    found, skipped, shadowed = scan_media(
+    found, skipped, shadowed, _ = scan_media(
         tmp_path, recursive=True, skip_existing_srt=True
     )
     assert [f.name for f in found] == ["a.mkv", "e.mp3", "c.avi", "f.flac"]
@@ -72,7 +72,7 @@ def test_an_audio_twin_of_a_video_steps_aside(tmp_path):
     make_tree(tmp_path)
     (tmp_path / "a.mp3").write_bytes(b"x")
     (tmp_path / "solo.mp3").write_bytes(b"x")
-    found, _, shadowed = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
+    found, _, shadowed, _ = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
     names = [f.name for f in found]
     assert "a.mkv" in names and "a.mp3" not in names
     assert "solo.mp3" in names  # no video of that name, so it stands
@@ -84,7 +84,7 @@ def test_a_video_already_subtitled_still_shadows_its_audio(tmp_path):
     lets b.mp3 live on and overwrite the subtitle b.mp4 already has."""
     make_tree(tmp_path)
     (tmp_path / "b.mp3").write_bytes(b"x")
-    found, skipped, shadowed = scan_media(
+    found, skipped, shadowed, _ = scan_media(
         tmp_path, recursive=True, skip_existing_srt=True
     )
     assert "b.mp3" not in [f.name for f in found]
