@@ -888,16 +888,16 @@ def test_the_program_version_invalidates_kept_work(settings_file, tmp_path, monk
     assert checkpoint_key(Job(req(str(film)), audio_only=True), snap) != before
 
 
-def test_old_and_oversized_checkpoints_are_swept(settings_file, monkeypatch):
+def test_old_and_oversized_checkpoints_are_swept(settings_file, tmp_path):
     """Disk must not grow without bound: age first, then total size."""
     import os
     from app.core import cache
 
-    settings_file(checkpoint_days=7, checkpoint_max_gb=1)
+    # work_dir, not just settings_path: cache._base_dir() falls back to the
+    # real user cache directory, so without this the test writes into the
+    # developer's own ~/.cache and leaves files behind.
+    settings_file(work_dir=str(tmp_path), checkpoint_days=7, checkpoint_max_gb=1)
     root = cache.checkpoints_root()
-    for d in root.iterdir():
-        if d.is_dir():
-            __import__("shutil").rmtree(d, ignore_errors=True)
 
     stale = cache.checkpoint_dir("stale")
     (stale / "audio.wav").write_bytes(b"x" * 10)
@@ -912,10 +912,10 @@ def test_old_and_oversized_checkpoints_are_swept(settings_file, monkeypatch):
     assert fresh.exists()
 
 
-def test_turning_resuming_off_keeps_nothing_at_all(settings_file):
+def test_turning_resuming_off_keeps_nothing_at_all(settings_file, tmp_path):
     from app.core import cache
 
-    settings_file(checkpoint_days=0)
+    settings_file(work_dir=str(tmp_path), checkpoint_days=0)
     kept = cache.checkpoint_dir("doomed")
     (kept / "audio.wav").write_bytes(b"x" * 10)
 
@@ -924,20 +924,17 @@ def test_turning_resuming_off_keeps_nothing_at_all(settings_file):
     assert not kept.exists()
 
 
-def test_the_size_cap_drops_the_oldest_first(settings_file):
+def test_the_size_cap_drops_the_oldest_first(settings_file, tmp_path):
     import os
     import time
     from app.core import cache
 
-    settings_file(checkpoint_days=90, checkpoint_max_gb=0)   # 0 = 关闭
+    settings_file(work_dir=str(tmp_path), checkpoint_days=90, checkpoint_max_gb=0)
     assert cache.checkpoints_enabled() is False
 
     # and with a real cap, the oldest goes first
-    settings_file(checkpoint_days=90, checkpoint_max_gb=1)
+    settings_file(work_dir=str(tmp_path), checkpoint_days=90, checkpoint_max_gb=1)
     root = cache.checkpoints_root()
-    for d in list(root.iterdir()):
-        if d.is_dir():
-            __import__("shutil").rmtree(d, ignore_errors=True)
     now = time.time()
     for i, name in enumerate(("oldest", "newest")):
         d = cache.checkpoint_dir(name)

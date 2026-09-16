@@ -8,6 +8,38 @@ from app.core import config
 from app.models.schemas import AppSettings
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _contained_cache(tmp_path_factory):
+    """Keep the whole test session out of the developer's real cache dir.
+
+    cache._base_dir() falls back to platformdirs' user cache whenever
+    work_dir is unset, so any test that builds a Job writes into the real
+    ~/.cache/MovieTranslator. That stayed invisible while the only thing
+    landing there was jobs/, which the app wipes on every startup — but
+    checkpoints/ is deliberately never wiped, so test leftovers accumulated
+    and stayed.
+
+    Done by setting XDG_CACHE_HOME rather than by patching _base_dir,
+    because monkeypatch is undone when a test ends and the threads a test
+    started are not: a job thread outliving its test wrote one directory
+    into the real cache every run. The environment variable holds for the
+    whole session, threads included.
+
+    Session-scoped and autouse: the rule is about every test, not the ones
+    that remember to ask.
+    """
+    import os
+
+    base = tmp_path_factory.mktemp("appcache")
+    old = os.environ.get("XDG_CACHE_HOME")
+    os.environ["XDG_CACHE_HOME"] = str(base)
+    yield base
+    if old is None:
+        os.environ.pop("XDG_CACHE_HOME", None)
+    else:
+        os.environ["XDG_CACHE_HOME"] = old
+
+
 def local_client(app, **kwargs):
     """A TestClient that looks like the browser on this machine.
 
