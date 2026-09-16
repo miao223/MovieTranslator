@@ -151,6 +151,7 @@ class Job:
         # a LAN browser's copy has its API keys masked to ********.
         self.settings = settings
         self.checkpoint = ""      # set by _workdir_for when resuming is on
+        self.source_subtitle = ""  # the sidecar the text was read from, if any
         self.status = JobStatus(id=self.id, video_path=request.video_path)
         self.cancel_event = threading.Event()
         self.events: List[ProgressEvent] = []
@@ -720,6 +721,10 @@ class JobManager:
                 tracks, req.subtitle_track, req.subtitle_file, req.subtitle_language
             )
             stats: dict = {}
+            # Remembered so the output cannot be written over its own source.
+            # The track may be a sidecar even when the request named none of
+            # them by path — batch mode picks by language tag.
+            job.source_subtitle = track.get("path") or ""
             if track["text"]:
                 kind = "subtitle"
                 lines = subsource.read_cues(
@@ -1127,7 +1132,13 @@ class JobManager:
                                      detected=detected) \
             if req.embed_subtitle else None
         if muxed is None:
-            target = video.parent / f"{video.stem}{sidecar}{ext}"
+            target, moved = output_target(
+                video, sidecar, ext, req.target_language, job.source_subtitle)
+            if moved:
+                job.publish(
+                    "composing", 95,
+                    log=f"⚠ 原文就是 {Path(job.source_subtitle).name}，"
+                        f"译文改写到 {target.name}，不覆盖它")
             try:
                 target.write_text(srt_text, encoding="utf-8")
                 job.srt_path = target
@@ -1306,6 +1317,24 @@ def _preprocess_usage(vet_usage: dict, lyrics_usage: dict, refine_usage: dict) -
         + (_usage_line("歌词识别", lyrics_usage) + "\n" if lyrics_usage["calls"] else "")
         + _usage_line("转写预处理", refine_usage)
     )
+
+
+def output_target(video: Path, sidecar: str, ext: str, target_language: str,
+                  source_subtitle: str = "") -> tuple[Path, bool]:
+    """Where the subtitle goes, and whether it had to step aside.
+
+    A translation is named film.srt by design and that must not change.
+    But when the text was read from a sidecar of exactly that name — a
+    downloaded film.srt holding English, translated into Chinese — writing
+    there puts the result on top of the original, silently, with nothing to
+    recover it from. The original is not ours to destroy, so in that one
+    case the translation takes a language suffix instead.
+    """
+    target = video.parent / f"{video.stem}{sidecar}{ext}"
+    if source_subtitle and Path(source_subtitle) == target:
+        lang = mux.language_of(target_language)[0]
+        return video.parent / f"{video.stem}.{lang}{ext}", True
+    return target, False
 
 
 def _naming(req: JobRequest, detected: str) -> tuple[str, str, str, str]:

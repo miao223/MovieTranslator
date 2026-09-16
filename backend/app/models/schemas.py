@@ -247,8 +247,8 @@ class AppSettings(BaseModel):
     # size one usually does. Either at 0 turns resuming off and keeps
     # nothing — the setting for someone who would rather spend tokens than
     # disk.
-    checkpoint_days: int = Field(7, ge=0, le=90)
-    checkpoint_max_gb: int = Field(10, ge=0, le=500)
+    checkpoint_days: int = Field(3, ge=0, le=90)
+    checkpoint_max_gb: int = Field(5, ge=0, le=500)
     # deep-diagnostics log next to the subtitle output (core/debuglog.py):
     # raw ASR output, every segmentation/merge decision, full LLM traffic.
     # off by default because the file runs to several MB per film

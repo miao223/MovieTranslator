@@ -67,10 +67,10 @@ def job_dir(job_id: str) -> Path:
 # else and starts fresh.
 
 # Defaults; the user's own limits come from settings (see _limits).
-CHECKPOINT_DAYS = 7
+CHECKPOINT_DAYS = 3
 # Audio is kept too (it is the expensive part of a restart), and that is
 # ~230 MB for a two-hour film, so age alone is not enough of a bound.
-MAX_CHECKPOINT_GB = 10
+MAX_CHECKPOINT_GB = 5
 
 
 def _limits() -> tuple[int, int]:

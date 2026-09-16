@@ -917,3 +917,34 @@ def test_the_size_cap_drops_the_oldest_first(settings_file):
         cache.prune_checkpoints()
     assert not (root / "oldest").exists()
     assert (root / "newest").exists()
+
+
+def test_a_translation_never_overwrites_the_subtitle_it_was_read_from(tmp_path):
+    """film.srt holding English, translated to Chinese, must not land on it.
+
+    The output name for a translation is film.srt by design, and when the
+    source text came from a sidecar of that same name the write went
+    straight over the original — silently, and with nothing to recover it
+    from. The translation steps aside instead.
+    """
+    from app.models.schemas import JobRequest
+    from app.services.pipeline import _naming, output_target
+
+    film = tmp_path / "film.mkv"
+    film.write_bytes(b"x")
+    source = tmp_path / "film.srt"
+    source.write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
+
+    req = JobRequest(video_path=str(film), text_source="subtitle",
+                     subtitle_file=str(source), target_language="简体中文")
+    sidecar = _naming(req, "en")[0]
+    # the naming rule on its own lands exactly on the source
+    assert film.parent / f"{film.stem}{sidecar}.srt" == source
+
+    target, moved = output_target(film, sidecar, ".srt", "简体中文", str(source))
+    assert moved and target != source
+    assert target.name == "film.zh.srt"
+
+    # and a normal job — no sidecar source — is untouched by any of this
+    plain, moved2 = output_target(film, sidecar, ".srt", "简体中文", "")
+    assert plain == source and moved2 is False
