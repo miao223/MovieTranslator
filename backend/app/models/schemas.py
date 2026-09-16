@@ -468,3 +468,92 @@ class BatchStatus(BaseModel):
     # series mode: the 原文 → 译名 table accumulated so far, one per line.
     # Empty when the mode is off, so the UI can key off it directly.
     glossary: str = ""
+
+
+# ------------------------------------------------------------------ queue
+
+
+class QueueEntry(BaseModel):
+    """One persisted item of work, with the settings it was enqueued under.
+
+    The snapshot is the whole point: a job keeps the settings that were in
+    effect when the button was pressed, so editing settings afterwards
+    steers the next job rather than the ones already lined up.
+
+    `settings` is None only when a snapshot written by another version
+    could not be validated even leniently; the entry then falls back to
+    live settings and says so in `note`.
+    """
+
+    id: str
+    kind: str = "job"          # a free string, not a Literal: an entry from a
+                               # newer version should report itself, not fail
+    status: Literal["queued", "running", "done", "failed", "cancelled"] = "queued"
+    title: str = ""            # survives even when the rest cannot be parsed
+    created_at: float = 0.0
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    job_id: str = ""
+    request: Optional[JobRequest] = None
+    settings: Optional[AppSettings] = None
+    error: str = ""
+    note: str = ""
+    # How many times this entry was interrupted by the process dying. Kept
+    # separate from `note`, which is cleared when the entry starts again:
+    # "it ran" and "it had to be started over twice" are different facts,
+    # and the second one is the only sign that something keeps killing the
+    # server. Never reset.
+    interrupted: int = 0
+    # Copied off JobStatus when the job ends. A restart empties
+    # JobManager.jobs, so without these a finished entry could not say what
+    # it produced — and the queue exists to survive restarts.
+    result_srt: str = ""
+    result_video: str = ""
+    result_in_place: bool = False
+    # Files enqueued from one directory share these, so the UI can collapse
+    # them into a single row instead of drowning the list.
+    group_id: str = ""
+    group_title: str = ""
+
+
+class QueueEntryView(BaseModel):
+    """A queue entry as the UI sees it: no snapshot, plus the live stage.
+
+    The snapshot runs to a couple of kilobytes; the list is polled every
+    few seconds, so the full text lives behind /api/queue/{id}/settings and
+    only its fingerprint travels here.
+    """
+
+    id: str
+    kind: str = "job"
+    status: str = "queued"
+    title: str = ""
+    summary: str = ""          # "ja → 简体中文 · 双语"
+    created_at: float = 0.0
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    job_id: str = ""
+    error: str = ""
+    note: str = ""
+    settings_hash: str = ""
+    settings_differs: bool = False
+    interrupted: int = 0
+    # live, and only while the job is still in memory
+    stage: str = ""
+    progress: float = 0.0
+    message: str = ""
+    job_live: bool = False
+    has_log: bool = False
+    result_srt: str = ""
+    result_video: str = ""
+    result_in_place: bool = False
+    group_id: str = ""
+    group_title: str = ""
+
+
+class QueueView(BaseModel):
+    paused: bool = False
+    worker_alive: bool = False
+    active_id: str = ""        # answers "why is nothing running"
+    settings_hash: str = ""    # fingerprint of the CURRENT settings
+    entries: list[QueueEntryView] = []

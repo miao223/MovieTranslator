@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
+from app.services.jobqueue import queue_manager
 from app.core import config, server
 from app.core.auth import MCP_PREFIX, AccessGuard
 from app.core.cache import clear_cache
@@ -42,6 +43,11 @@ FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     clear_cache()
+    # Started after the cache is cleared, never at import: importing routes
+    # in a test must not spawn a runner thread. load() also repairs anything
+    # left marked running by a crash, so this is where a queue picks itself
+    # back up after the power went out.
+    queue_manager.start()
     async with contextlib.AsyncExitStack() as stack:
         mcp = mcp_server.build()
         if mcp is not None:
@@ -55,6 +61,7 @@ async def lifespan(_app: FastAPI):
             yield
         finally:
             mcp_server.mount.inner = None
+            queue_manager.stop()
 
 
 app = FastAPI(title="MovieTranslator", lifespan=lifespan)

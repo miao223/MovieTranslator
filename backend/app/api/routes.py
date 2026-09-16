@@ -7,12 +7,14 @@ import os
 import re
 import string
 import sys
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core import config, joblog, server
+from app.core.cache import job_dir
 from app.core.auth import MCP_PREFIX
 from app.core.media import MEDIA_EXTS, kind_of, scan_media
 from app.models.schemas import (
@@ -23,9 +25,12 @@ from app.models.schemas import (
     JobRequest,
     JobStatus,
     LLMSettings,
+    QueueEntryView,
+    QueueView,
     SubtitleTrack,
 )
-from app.services import audio, mcp_server, mux, series, subsource
+from app.services import audio, jobqueue, mcp_server, mux, series, subsource
+from app.services.jobqueue import queue_manager
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
 
@@ -47,8 +52,11 @@ def get_version() -> dict:
 
 @router.post("/jobs", response_model=JobStatus)
 def create_job(req: JobRequest) -> JobStatus:
+    # Snapshotted here too, not just for the queue: what the settings said
+    # when the button was pressed is what this job runs with, whether it
+    # starts now or waits behind something else.
     try:
-        job = manager.create(req)
+        job = manager.create(req, settings=jobqueue.snapshot())
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return job.status
@@ -128,7 +136,9 @@ def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True):
 @router.post("/batch", response_model=BatchStatus)
 def create_batch(req: BatchRequest) -> BatchStatus:
     try:
-        return batch_manager.create(req)
+        # One snapshot for the whole batch: editing settings while a season
+        # is half done used to change the parameters from that episode on.
+        return batch_manager.create(req, settings=jobqueue.snapshot())
     except (NotADirectoryError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -782,3 +792,229 @@ def fs_browse(path: str = ""):
     else:
         parent = str(p.parent)
     return {"path": str(p), "parent": parent, "dirs": dirs, "files": files}
+
+
+# ------------------------------------------------------------------ queue
+
+
+def _entry_view(entry, current_hash: str) -> QueueEntryView:
+    """One entry as the UI sees it: no snapshot, plus the live stage.
+
+    The snapshot runs to a couple of kilobytes and this list is polled, so
+    only its fingerprint travels here; the text lives behind
+    /api/queue/{id}/settings.
+
+    A terminal entry is rendered entirely from what it recorded when it
+    finished — never from manager.jobs, which a restart empties. That rule
+    is what lets a finished entry still say what it produced tomorrow.
+    """
+    stage, progress, message, live = entry.status, 0.0, "", False
+    if entry.status == "running" and entry.job_id:
+        try:
+            status = manager.get(entry.job_id).status
+            stage, progress, message, live = (
+                status.stage, status.progress, status.message, True)
+        except KeyError:
+            pass
+    fingerprint = jobqueue.settings_hash(entry.settings)
+    return QueueEntryView(
+        id=entry.id, kind=entry.kind, status=entry.status, title=entry.title,
+        summary=jobqueue.describe(entry.request),
+        created_at=entry.created_at, started_at=entry.started_at,
+        finished_at=entry.finished_at, job_id=entry.job_id,
+        error=entry.error, note=entry.note,
+        settings_hash=fingerprint,
+        settings_differs=bool(fingerprint) and fingerprint != current_hash,
+        interrupted=entry.interrupted,
+        stage=stage, progress=progress, message=message, job_live=live,
+        has_log=bool(entry.job_id) and joblog.find_log(entry.job_id) is not None,
+        result_srt=entry.result_srt, result_video=entry.result_video,
+        result_in_place=entry.result_in_place,
+        group_id=entry.group_id, group_title=entry.group_title,
+    )
+
+
+def _queue_view() -> QueueView:
+    store = queue_manager.store
+    current = jobqueue.settings_hash(jobqueue.snapshot())
+    with store.lock:
+        entries = [_entry_view(e, current) for e in store.entries]
+        active = next((e.id for e in store.entries if e.status == "running"), "")
+        return QueueView(paused=store.paused, worker_alive=queue_manager.alive,
+                         active_id=active, settings_hash=current, entries=entries)
+
+
+@router.get("/queue", response_model=QueueView)
+def get_queue() -> QueueView:
+    return _queue_view()
+
+
+@router.post("/queue/jobs")
+def enqueue_job(req: JobRequest) -> dict:
+    """Add one film, frozen under the settings as they stand right now.
+
+    The body is a JobRequest and nothing else — there is deliberately no
+    field through which a client could hand us the settings to freeze. A
+    LAN browser's copy has its API keys masked to ********, and freezing
+    those would produce a job that cannot authenticate.
+    """
+    video = Path(req.video_path)
+    if not video.is_file():
+        raise HTTPException(status_code=400, detail=f"片源文件不存在: {video}")
+    try:
+        entry = queue_manager.store.add(req, jobqueue.snapshot())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    queue_manager.nudge()
+    waiting = [e for e in queue_manager.store.entries if e.status == "queued"]
+    position = next((i + 1 for i, e in enumerate(waiting) if e.id == entry.id), 0)
+    return {"entry": _entry_view(entry, jobqueue.settings_hash(entry.settings)),
+            "position": position}
+
+
+@router.post("/queue/batch")
+def enqueue_batch(req: BatchRequest) -> dict:
+    """Add a directory, expanded into one entry per file straight away.
+
+    Expanded now rather than when its turn comes, so the list shows exactly
+    what will run and individual files can be reordered or dropped. All of
+    them share one snapshot — a season translated under two different sets
+    of settings is the problem this feature exists to prevent.
+    """
+    try:
+        videos, skipped, _shadowed = scan_media(
+            req.directory, req.recursive, req.skip_existing_srt)
+    except NotADirectoryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not videos:
+        raise HTTPException(status_code=400, detail="目录中没有需要翻译的视频或音频文件")
+
+    settings = jobqueue.snapshot()
+    group_id = uuid.uuid4().hex[:12]
+    series_id = group_id if req.series_mode else ""
+    added = []
+    try:
+        for video in videos:
+            added.append(queue_manager.store.add(
+                JobRequest(
+                    video_path=str(video),
+                    audio_language=req.audio_language,
+                    text_source=req.text_source,
+                    subtitle_language=req.subtitle_language,
+                    # a season where one episode ships without a subtitle
+                    # should translate that episode, not stop the batch
+                    subtitle_fallback_asr=True,
+                    source_language=req.source_language,
+                    target_language=req.target_language,
+                    synopsis=req.synopsis,
+                    output_mode=req.output_mode,
+                    embed_subtitle=req.embed_subtitle,
+                    embed=req.embed,
+                    series_id=series_id,
+                ),
+                settings, group_id=group_id, group_title=req.directory))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    queue_manager.nudge()
+    current = jobqueue.settings_hash(settings)
+    return {"entries": [_entry_view(e, current) for e in added],
+            "count": len(added), "skipped": [str(p) for p in skipped]}
+
+
+@router.post("/queue/pause")
+def pause_queue(body: dict) -> dict:
+    queue_manager.store.set_paused(bool(body.get("paused", True)))
+    if not queue_manager.store.paused:
+        queue_manager.nudge()
+    return {"paused": queue_manager.store.paused}
+
+
+@router.put("/queue/order", response_model=QueueView)
+def reorder_queue(body: dict) -> QueueView:
+    try:
+        queue_manager.store.reorder([str(i) for i in body.get("ids", [])])
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _queue_view()
+
+
+# Registered before /queue/{entry_id}: routes match in registration order,
+# so the other way round "finished" would be read as an entry id.
+@router.delete("/queue/finished")
+def clear_finished() -> dict:
+    return {"removed": queue_manager.store.clear_finished()}
+
+
+@router.get("/queue/{entry_id}/settings")
+def queue_entry_settings(entry_id: str) -> dict:
+    """The settings this entry froze, rendered the way the job log renders them.
+
+    Reuses joblog._settings_lines so that what you approve before the run
+    and what the downloadable log says during it are the same text — and
+    that rendering never prints a key.
+    """
+    entry = queue_manager.store.get(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="列队里没有这条任务")
+    current = config.load_settings()
+    if entry.settings is None:
+        return {"lines": joblog._settings_lines(current), "differs": [],
+                "same_as_current": True, "unreadable": True}
+    lines = joblog._settings_lines(entry.settings)
+    live = joblog._settings_lines(current)
+    differs = [line for line in lines if line not in live]
+    return {"lines": lines, "differs": differs,
+            "same_as_current": not differs, "unreadable": False}
+
+
+@router.post("/queue/{entry_id}/cancel")
+def cancel_queue_entry(entry_id: str) -> dict:
+    try:
+        return {"status": queue_manager.cancel(entry_id)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="列队里没有这条任务")
+
+
+@router.post("/queue/{entry_id}/retry")
+def retry_queue_entry(entry_id: str, body: dict | None = None) -> dict:
+    fresh = bool((body or {}).get("fresh", False))
+    try:
+        entry = queue_manager.retry(entry_id, fresh=fresh)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="列队里没有这条任务")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"entry": _entry_view(entry, jobqueue.settings_hash(entry.settings)),
+            "used_current_settings": fresh}
+
+
+@router.get("/queue/{entry_id}/result")
+def queue_entry_result(entry_id: str):
+    """The subtitle this entry produced.
+
+    Served from the path the entry recorded rather than through the job,
+    so it still works after the restart that emptied JobManager.jobs.
+    """
+    entry = queue_manager.store.get(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="列队里没有这条任务")
+    name = entry.result_video or entry.result_srt
+    if not name:
+        raise HTTPException(status_code=404, detail="这条任务还没有产物")
+    if entry.result_in_place or entry.result_video:
+        path = Path(entry.title).parent / name
+    else:
+        path = Path(job_dir(entry.job_id)) / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件已不在原位置：{path}")
+    return FileResponse(str(path), filename=path.name)
+
+
+@router.delete("/queue/{entry_id}")
+def remove_queue_entry(entry_id: str) -> dict:
+    try:
+        if not queue_manager.store.remove(entry_id):
+            raise HTTPException(status_code=404, detail="列队里没有这条任务")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True}

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from app.core.media import scan_media
-from app.models.schemas import BatchRequest, BatchStatus, JobRequest
+from app.models.schemas import AppSettings, BatchRequest, BatchStatus, JobRequest
 from app.services import series
 from app.services.pipeline import manager as job_manager
 
@@ -34,7 +34,15 @@ class BatchManager:
     def __init__(self):
         self.batches: Dict[str, Batch] = {}
 
-    def create(self, req: BatchRequest) -> BatchStatus:
+    def create(self, req: BatchRequest,
+               settings: Optional[AppSettings] = None) -> BatchStatus:
+        """Fan the directory out into one job per file.
+
+        *settings* is the frozen snapshot every file of this batch runs
+        with. One snapshot for the whole batch on purpose: editing settings
+        while a season is half done used to change the parameters from that
+        episode on, while the series glossary assumes all of them match.
+        """
         videos, skipped, _shadowed = scan_media(
             req.directory, req.recursive, req.skip_existing_srt
         )
@@ -68,7 +76,8 @@ class BatchManager:
                         embed_subtitle=req.embed_subtitle,
                         embed=req.embed,
                         series_id=batch.series_id,
-                    )
+                    ),
+                    settings=settings,
                 )
                 batch.job_ids.append(job.id)
             except Exception as exc:  # noqa: BLE001 — one bad file must not kill the batch

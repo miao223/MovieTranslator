@@ -64,4 +64,24 @@ export const api = {
   jobLogUrl: (id) => `/api/logs/job/${id}`,
   logs: () => request('/api/logs'),
   eventsUrl: (id) => `/api/jobs/${id}/events`,
+
+  // ------------------------------------------------------------- 列队
+  queue: () => request('/api/queue'),
+  enqueueJob: (payload) =>
+    request('/api/queue/jobs', { method: 'POST', body: JSON.stringify(payload) }),
+  enqueueBatch: (payload) =>
+    request('/api/queue/batch', { method: 'POST', body: JSON.stringify(payload) }),
+  pauseQueue: (paused) =>
+    request('/api/queue/pause', { method: 'POST', body: JSON.stringify({ paused }) }),
+  reorderQueue: (ids) =>
+    request('/api/queue/order', { method: 'PUT', body: JSON.stringify({ ids }) }),
+  clearFinished: () => request('/api/queue/finished', { method: 'DELETE' }),
+  queueEntrySettings: (id) => request(`/api/queue/${id}/settings`),
+  cancelQueueEntry: (id) => request(`/api/queue/${id}/cancel`, { method: 'POST' }),
+  retryQueueEntry: (id, fresh = false) =>
+    request(`/api/queue/${id}/retry`, { method: 'POST', body: JSON.stringify({ fresh }) }),
+  removeQueueEntry: (id) => request(`/api/queue/${id}`, { method: 'DELETE' }),
+  // an <a download> href, so it cannot be a fetch: /api/jobs/{id}/result
+  // 404s once a restart has emptied the in-memory job table
+  queueResultUrl: (id) => `/api/queue/${id}/result`,
 }

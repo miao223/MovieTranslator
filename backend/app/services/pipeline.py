@@ -22,6 +22,7 @@ from app.core.cache import job_dir
 from app.core.debuglog import DebugLog, open_debug_log
 from app.core.joblog import JobLogWriter, _settings_lines as joblog_settings_lines
 from app.models.schemas import (
+    AppSettings,
     JobRequest,
     JobStatus,
     ProgressEvent,
@@ -73,9 +74,34 @@ def _eta(started: float, fraction: float, recoding: bool) -> str:
 
 _run_slot = threading.Semaphore(1)  # one CPU-heavy job at a time
 
+# Credentials are the one thing a frozen snapshot does NOT keep. Everything
+# else about a queued job is settled when it is enqueued, but a key that
+# expired or was rotated since then should repair the queue rather than
+# break it — so these three are read live, at the moment the work starts.
+# jobqueue blanks them before writing, so a snapshot never carries one and
+# this is the only path by which a key reaches a queued job at all.
+LIVE_KEY_FIELDS = ("api_key", "vision_api_key", "audio_api_key")
+
+
+def _settings_for(job: Job) -> AppSettings:
+    """The settings this job runs with: its own snapshot, or the live ones.
+
+    Resolved here rather than where the job was dequeued: a job can sit
+    parked on _run_slot for hours after its turn came up, and "run time"
+    has to mean the moment the work actually starts.
+    """
+    live = config.load_settings()
+    if job.settings is None:
+        return live
+    return job.settings.model_copy(update={
+        "llm": job.settings.llm.model_copy(
+            update={f: getattr(live.llm, f) for f in LIVE_KEY_FIELDS}),
+    })
+
 
 class Job:
-    def __init__(self, request: JobRequest, audio_only: Optional[bool] = None):
+    def __init__(self, request: JobRequest, audio_only: Optional[bool] = None,
+                 settings: Optional[AppSettings] = None):
         self.id = uuid.uuid4().hex[:12]
         self.request = request
         # A source with no picture cannot be muxed into a video and has no
@@ -87,6 +113,12 @@ class Job:
             audio_only if audio_only is not None
             else not audio.has_picture(request.video_path)
         )
+        # Frozen settings, or None for "read them live when you start".
+        # A Job field and deliberately not a JobRequest field, for the same
+        # reason audio_only is not one: JobRequest is the outward schema and
+        # a client must not be able to hand us the settings to run under —
+        # a LAN browser's copy has its API keys masked to ********.
+        self.settings = settings
         self.status = JobStatus(id=self.id, video_path=request.video_path)
         self.cancel_event = threading.Event()
         self.events: List[ProgressEvent] = []
@@ -132,11 +164,44 @@ class Job:
                     self.subscribers.remove(q)
 
 
+# Finished jobs are kept so the UI can still read their status, but not
+# forever: every Job holds its whole event list (about half a megabyte for
+# a feature film). A few jobs a day by hand is nothing; a queue running
+# unattended for a week is hundreds of megabytes that never come back.
+KEEP_FINISHED_JOBS = 100
+
+
 class JobManager:
     def __init__(self):
         self.jobs: Dict[str, Job] = {}
 
-    def create(self, request: JobRequest) -> Job:
+    def _evict_old(self) -> None:
+        """Drop the oldest finished jobs, sparing any a live batch still reads.
+
+        BatchManager.status walks its members with job_manager.get(), so a
+        job belonging to an unfinished batch must stay reachable. Queue
+        entries need no such protection: each one records its own outcome
+        and never looks a finished job up again.
+        """
+        finished = [j for j in self.jobs.values()
+                    if j.status.stage in ("done", "failed", "cancelled")]
+        if len(finished) <= KEEP_FINISHED_JOBS:
+            return
+        from app.services.batch import batch_manager
+
+        spoken_for = {
+            jid
+            for batch in batch_manager.batches.values()
+            for jid in batch.job_ids
+            if any(self.jobs[j].status.stage not in ("done", "failed", "cancelled")
+                   for j in batch.job_ids if j in self.jobs)
+        }
+        droppable = [j for j in finished if j.id not in spoken_for]
+        for job in droppable[: len(finished) - KEEP_FINISHED_JOBS]:
+            self.jobs.pop(job.id, None)
+
+    def create(self, request: JobRequest,
+               settings: Optional[AppSettings] = None) -> Job:
         video = Path(request.video_path)
         if not video.is_file():
             raise FileNotFoundError(f"片源文件不存在: {video}")
@@ -159,7 +224,8 @@ class JobManager:
                     f"本机无法使用编码器 {request.embed.video_codec}。"
                     f"可用的有：{'、'.join(sorted(usable)) or '（无）'}"
                 )
-        job = Job(request, audio_only=audio_only)
+        job = Job(request, audio_only=audio_only, settings=settings)
+        self._evict_old()
         self.jobs[job.id] = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job
@@ -186,7 +252,16 @@ class JobManager:
         req = job.request
         workdir = job_dir(job.id)
         job.publish("pending", 0, message="排队中…")
-        with _run_slot:
+        # Acquired with a timeout rather than `with _run_slot:` so that a job
+        # waiting its turn can still be cancelled. Blocking outright put the
+        # cancel check on the far side of the wait, so cancelling a queued
+        # job did nothing observable until it reached the front of the line —
+        # which, behind a two-hour film, is not cancelling.
+        while not _run_slot.acquire(timeout=0.2):
+            if job.cancel_event.is_set():
+                job.publish("cancelled", job.status.progress, message="任务已取消")
+                return
+        try:
             try:
                 if job.cancel_event.is_set():  # cancelled while queued
                     raise InterruptedError
@@ -199,6 +274,8 @@ class JobManager:
                 print(tb)
                 job.publish("failed", job.status.progress,
                             message=f"失败: {exc}", log=tb)
+        finally:
+            _run_slot.release()
 
     def _download_model_with_progress(self, job: Job, settings, check_cancel) -> float:
         """Download the whisper model, mapping progress into 10–20%.
@@ -338,7 +415,7 @@ class JobManager:
     def _execute_frame_only(self, job: Job, req: JobRequest, workdir: Path) -> None:
         """Supplement mode: translate frames and merge into the existing
         same-stem subtitle file (.ass preferred over .srt) in place."""
-        settings = config.load_settings()
+        settings = _settings_for(job)
         video = Path(req.video_path)
         # 纯原文的产物带语言后缀（片名.ja.srt），两个精确候选认不出来——所以
         # 在它们之后再兜一层 glob，否则「先跑纯原文、之后补画面翻译」是死路
@@ -402,7 +479,7 @@ class JobManager:
         job.logfile.section("进度", [])
 
     def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
-        settings = config.load_settings()
+        settings = _settings_for(job)
         self._write_diagnostics(job, req, settings)
         if job.audio_only and req.embed_subtitle:
             # said now, not at 95%: someone waiting for a video should not

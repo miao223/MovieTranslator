@@ -143,7 +143,7 @@ def test_batch_passes_audio_language_to_each_job(tmp_path, monkeypatch):
     fakes = {}
 
     class FakeJob:
-        def __init__(self, req):
+        def __init__(self, req, settings=None):
             seen.append(req)
             self.id = f"job{len(seen)}"
             self.status = JobStatus(id=self.id)
@@ -168,7 +168,7 @@ def _fake_batch(tmp_path, monkeypatch, **kwargs):
     fakes = {}
 
     class FakeJob:
-        def __init__(self, req):
+        def __init__(self, req, settings=None):
             seen.append(req)
             self.id = f"job{len(seen)}"
             self.status = JobStatus(id=self.id)

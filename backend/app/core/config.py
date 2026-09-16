@@ -6,6 +6,7 @@ Unlike the cache, settings (including the LLM API key) survive restarts.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -56,6 +57,16 @@ def save_settings(settings: AppSettings) -> None:
 
     with _lock:
         _cache = None
-        settings_path().write_text(
-            settings.model_dump_json(indent=2), encoding="utf-8"
-        )
+        # Written through a temp file and renamed, never in place. A crash
+        # mid-write used to leave a truncated settings.json, and
+        # load_settings answers a corrupt file with AppSettings() — every
+        # default silently back, API keys included. Survivable when someone
+        # is watching; not when a queue is running unattended.
+        path = settings_path()
+        part = path.with_name(path.name + ".part")
+        try:
+            part.write_text(settings.model_dump_json(indent=2), encoding="utf-8")
+            os.replace(part, path)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise

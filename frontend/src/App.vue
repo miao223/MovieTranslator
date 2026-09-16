@@ -4,6 +4,7 @@ import { api } from './api'
 import HomeView from './views/HomeView.vue'
 import SettingsView from './views/SettingsView.vue'
 import PromptView from './views/PromptView.vue'
+import QueueView from './views/QueueView.vue'
 
 const activeTab = ref('home')
 // the app ships as a zip and is updated by replacing files, so seeing which
@@ -29,7 +30,13 @@ onMounted(async () => {
     <el-main>
       <el-tabs v-model="activeTab">
         <el-tab-pane label="翻译任务" name="home">
-          <HomeView />
+          <HomeView @goto="activeTab = $event" />
+        </el-tab-pane>
+        <!-- lazy defers the first mount; QueueView also takes :active
+             because Element Plus keeps a pane mounted once visited, and
+             its poll must stop when you switch away -->
+        <el-tab-pane label="列队" name="queue" lazy>
+          <QueueView :active="activeTab === 'queue'" @goto="activeTab = $event" />
         </el-tab-pane>
         <el-tab-pane label="设置" name="settings">
           <SettingsView />

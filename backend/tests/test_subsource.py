@@ -443,7 +443,7 @@ def test_the_batch_sets_that_fallback_and_a_single_job_does_not(tmp_path):
     made: list[JobRequest] = []
 
     class Recorder:
-        def create(self, req):
+        def create(self, req, settings=None):
             made.append(req)
             raise RuntimeError("stop here")  # no need to actually run one
 

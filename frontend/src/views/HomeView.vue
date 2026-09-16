@@ -3,6 +3,9 @@ import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 
+// lets the 前往列队 link switch tabs; App.vue owns activeTab
+const emit = defineEmits(['goto'])
+
 const SOURCE_LANGS = [
   { value: 'auto', label: '自动检测' },
   { value: 'en', label: '英语' },
@@ -351,36 +354,73 @@ const embedExample = computed(() => `${stemExample.value}.${langSuffix.value}.${
 // 译文字幕一直与片源同名；纯原文带后缀，才不会覆盖同目录已有的那一份
 const sidecarExample = computed(() => `${stemExample.value}.${langSuffix.value}.srt`)
 
-async function start(frameOnly = false) {
+// Built once and used by both buttons. Keeping it in one place is the
+// point: the subtitle-track resolution, the audio-source suppression of
+// frame tasks and every validation below would otherwise drift apart
+// between 开始翻译 and 加入列队.
+function buildJobPayload(frameOnly = false) {
   if (!form.video_path) {
     ElMessage.warning('请先选择视频或音频文件')
-    return
+    return null
   }
   const tasks = isAudioSource.value
     ? []
     : frameTasks.value.filter((t) => t.time.trim())
   if (frameOnly && !tasks.length) {
     ElMessage.warning('补充模式至少需要一条画面翻译时间点')
-    return
+    return null
   }
   // the picker holds one list index; the request wants a stream number or a
   // file path, and only one of them
   const chosen = form.text_source === 'subtitle' ? subs.value[subPick.value] : null
   if (form.text_source === 'subtitle' && !chosen) {
     ElMessage.warning('这个视频没有可用的字幕，请改用语音识别')
-    return
+    return null
   }
+  return {
+    ...form,
+    subtitle_track: chosen && !chosen.path ? chosen.index : null,
+    subtitle_file: chosen ? chosen.path : '',
+    frame_tasks: tasks,
+    frame_only: frameOnly,
+  }
+}
+
+async function start(frameOnly = false) {
+  const payload = buildJobPayload(frameOnly)
+  if (!payload) return
   try {
-    const status = await api.createJob({
-      ...form,
-      subtitle_track: chosen && !chosen.path ? chosen.index : null,
-      subtitle_file: chosen ? chosen.path : '',
-      frame_tasks: tasks,
-      frame_only: frameOnly,
-    })
+    const status = await api.createJob(payload)
     job.value = { ...status }
     logs.value = []
     listen(status.id)
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+// The form is deliberately left filled: the usual next move is to tweak
+// one field and queue another.
+const enqueued = ref([])
+
+async function enqueue() {
+  const payload = buildJobPayload(false)
+  if (!payload) return
+  try {
+    const r = await api.enqueueJob(payload)
+    enqueued.value.push(r.entry.title.split(/[\\/]/).pop())
+    ElMessage.success(`已加入列队（第 ${r.position} 位）`)
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+async function enqueueBatch() {
+  try {
+    const r = await api.enqueueBatch({ ...batchForm, ...sharedBatchFields() })
+    confirmVisible.value = false
+    ElMessage.success(`已把 ${r.count} 个文件加入列队`)
+    enqueued.value.push(`${r.count} 个文件`)
   } catch (e) {
     ElMessage.error(e.message)
   }
@@ -481,19 +521,24 @@ async function startBatchScan() {
   }
 }
 
+// The fields a batch borrows from the single-file form. Shared so that
+// 开始批量翻译 and 加入列队 send the same thing.
+function sharedBatchFields() {
+  return {
+    text_source: form.text_source,
+    source_language: form.source_language,
+    target_language: form.target_language,
+    synopsis: form.synopsis,
+    output_mode: form.output_mode,
+    embed_subtitle: form.embed_subtitle,
+    embed: form.embed,
+  }
+}
+
 async function startBatch() {
   confirmVisible.value = false
   try {
-    batch.value = await api.createBatch({
-      ...batchForm,
-      text_source: form.text_source,
-      source_language: form.source_language,
-      target_language: form.target_language,
-      synopsis: form.synopsis,
-      output_mode: form.output_mode,
-      embed_subtitle: form.embed_subtitle,
-      embed: form.embed,
-    })
+    batch.value = await api.createBatch({ ...batchForm, ...sharedBatchFields() })
     job.value = null
     logs.value = []
     currentSseJob = ''
@@ -828,8 +873,21 @@ onBeforeUnmount(() => {
         >
           开始翻译
         </el-button>
+        <!-- deliberately not disabled while something runs: queueing
+             during a long job is the whole point of the queue -->
+        <el-button @click="mode === 'single' ? enqueue() : startBatchScan()">
+          ＋ 加入列队
+        </el-button>
         <el-button v-if="running()" type="danger" plain @click="cancel">取消任务</el-button>
         <el-button v-if="batchRunning()" type="danger" plain @click="cancelBatch">取消批量</el-button>
+        <div class="hint" style="display: block; margin-top: 4px">
+          加入列队的任务会记住<strong>此刻已保存的设置</strong>（在「设置」页改了要先保存），
+          之后改设置只影响后面加入的任务。列队里同时只跑一个。
+          <template v-if="enqueued.length">
+            <br />本次已加入：{{ enqueued.join('、') }} ·
+            <el-link type="primary" @click="emit('goto', 'queue')">前往列队</el-link>
+          </template>
+        </div>
       </el-form-item>
     </el-form>
   </el-card>
@@ -992,6 +1050,7 @@ onBeforeUnmount(() => {
     />
     <template #footer>
       <el-button @click="confirmVisible = false">取消</el-button>
+      <el-button @click="enqueueBatch">＋ 加入列队</el-button>
       <el-button type="primary" @click="startBatch">开始批量翻译</el-button>
     </template>
   </el-dialog>
