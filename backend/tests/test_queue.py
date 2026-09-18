@@ -771,6 +771,39 @@ def test_without_a_target_language_any_subtitle_still_counts_as_done(tmp_path):
     assert [p.name for p in skipped] == ["a.mkv"] and not todo and not with_source
 
 
+def test_both_halves_of_a_split_job_together_mean_the_film_is_done(tmp_path):
+    """One finished subtitle settles it, whichever sibling turns up first.
+
+    双文件模式 leaves film.en.srt and film.zh.srt side by side, and the glob
+    is alphabetical — so the original is read first and it is not the target
+    language. Answering from it called a finished film untranslated, and the
+    batch re-ran it every single scan.
+    """
+    from app.core.media import scan_media
+
+    (tmp_path / "pair.mkv").write_bytes(b"x")
+    (tmp_path / "pair.en.srt").write_text(SRT_EN, encoding="utf-8")
+    (tmp_path / "pair.zh.srt").write_text(SRT_ZH, encoding="utf-8")
+
+    todo, skipped, _, with_source = scan_media(tmp_path, target_language="简体中文")
+    assert [p.name for p in skipped] == ["pair.mkv"]
+    assert not todo and not with_source
+
+
+def test_an_original_on_its_own_is_still_only_material(tmp_path):
+    """The guard against over-correcting: looking at every sibling must not
+    turn "no translation here" into "done"."""
+    from app.core.media import scan_media
+
+    (tmp_path / "half.mkv").write_bytes(b"x")
+    (tmp_path / "half.en.srt").write_text(SRT_EN, encoding="utf-8")
+    (tmp_path / "half.ja.srt").write_text(SRT_JA, encoding="utf-8")
+
+    todo, skipped, _, with_source = scan_media(tmp_path, target_language="简体中文")
+    assert [p.name for p in todo] == ["half.mkv"] and not skipped
+    assert [p.name for p in with_source] == ["half.mkv"]
+
+
 def test_a_subtitle_that_is_not_ours_by_name_is_left_alone(tmp_path):
     """film.backup.srt is nobody's language tag, so it is not consulted."""
     from app.core.media import scan_media

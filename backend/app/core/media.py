@@ -135,12 +135,20 @@ def subtitle_state(video: Path, target_language: str = "") -> tuple[str, str]:
     Unsure always means ``done``. An unreadable subtitle, or a target
     language this build has no code for, leaves no way to compare, and
     re-translating a whole season is the more expensive mistake of the two.
+
+    One file in the target language settles it, but ``source`` is only the
+    answer once **every** sibling has been looked at. A film can have two
+    subtitles beside it — the 双文件 mode leaves film.en.srt and
+    film.zh.srt together — and the glob is alphabetical, so the original is
+    what turns up first. Stopping there called a finished film untranslated
+    and translated it again, every scan, forever.
     """
     from app.services import mux, subsource
 
     want = mux.language_of(target_language)[0] if target_language else ""
     if want == mux.FALLBACK[0]:
         want = ""                       # no code for this target language
+    state, found = "none", ""
     for path in subtitles_beside(video):
         tag = path.name[len(video.stem) + 1: -len(path.suffix)]
         language = ""
@@ -149,8 +157,9 @@ def subtitle_state(video: Path, target_language: str = "") -> tuple[str, str]:
         language = language or _language_of_file(path)
         if not language or not want or language == want:
             return "done", language
-        return "source", language
-    return "none", ""
+        if state == "none":
+            state, found = "source", language   # 记下，但继续找 done
+    return state, found
 
 
 def _language_of_file(path: Path) -> str:
