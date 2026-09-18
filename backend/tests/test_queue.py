@@ -812,12 +812,28 @@ def test_a_bilingual_subtitle_counts_as_done_for_either_of_its_languages(tmp_pat
     """
     from app.core.media import subtitle_state
 
-    video = tmp_path / "pair.mkv"
     (tmp_path / "pair.en-zh.srt").write_text(SRT_ZH, encoding="utf-8")
-    assert subtitle_state(video, "简体中文")[0] == "done"
-    assert subtitle_state(video, "English")[0] == "done"
+    assert subtitle_state(tmp_path, "pair", "简体中文")[0] == "done"
+    assert subtitle_state(tmp_path, "pair", "English")[0] == "done"
     # 两种语言都不是目标：那它就是材料，不是成品
-    assert subtitle_state(video, "Français")[0] == "source"
+    assert subtitle_state(tmp_path, "pair", "Français")[0] == "source"
+
+
+def test_a_dotted_release_name_is_asked_about_correctly(tmp_path):
+    """按 (目录, 主干) 提问，而不是按一个 Path。
+
+    Path("/x/Movie.2019.1080p").with_suffix(".srt") 得到的是 Movie.2019.srt
+    ——发行版片名里全是点，一旦调用方手里只有主干（字幕文件那条路就是如此），
+    按 Path 提问就会去看隔壁那部片的字幕。
+    """
+    from app.core.media import base_stem, split_language_tag, subtitle_state
+
+    stem = "Movie.2019.1080p"
+    (tmp_path / f"{stem}.zh.srt").write_text(SRT_ZH, encoding="utf-8")
+    assert subtitle_state(tmp_path, stem, "简体中文")[0] == "done"
+    # 而语言后缀是从最后一段剥的，1080p 不是语言
+    assert split_language_tag(f"{stem}.en.srt") == (stem, "en")
+    assert base_stem(f"{stem}.srt") == stem
 
 
 def test_a_copy_that_stepped_aside_is_not_mistaken_for_a_result(tmp_path):
@@ -828,9 +844,8 @@ def test_a_copy_that_stepped_aside_is_not_mistaken_for_a_result(tmp_path):
     """
     from app.core.media import subtitle_state
 
-    video = tmp_path / "again.mkv"
     (tmp_path / "again.zh.2.srt").write_text(SRT_ZH, encoding="utf-8")
-    assert subtitle_state(video, "简体中文")[0] == "none"
+    assert subtitle_state(tmp_path, "again", "简体中文")[0] == "none"
 
 
 def test_a_subtitle_that_is_not_ours_by_name_is_left_alone(tmp_path):

@@ -89,7 +89,7 @@ def scan_media(
 
     to_translate, skipped, with_source = [], [], []
     for f in files:
-        state, _lang = subtitle_state(f, target_language)
+        state, _lang = subtitle_state(f.parent, f.stem, target_language)
         if state == "done" and skip_existing_srt:
             skipped.append(f)
             continue
@@ -113,12 +113,33 @@ _LANG_SUFFIX = re.compile(r"^(?:[a-z]{2,3}|orig)(?:-(?:[a-z]{2,3}|orig))?$")
 _NOT_A_LANGUAGE = ("orig", "und", "sub")
 
 
-def subtitles_beside(video: Path) -> List[Path]:
-    """Every subtitle file sitting next to this one, ours or anyone else's."""
-    stem = video.stem
-    found = [p for p in (video.with_suffix(".srt"), video.with_suffix(".ass"))
+def split_language_tag(path: str | Path) -> tuple[str, str]:
+    """('film', 'en') for film.en.srt; ('film', '') for film.srt.
+
+    只看最后一段，且只认 _LANG_SUFFIX 那条窄规则——发行版片名里全是点
+    （Movie.2019.1080p.srt 的 1080p 不是语言），剥错一段就会把产物写到
+    别人的名字上。
+    """
+    stem = Path(path).stem
+    head, sep, tail = stem.rpartition(".")
+    return (head, tail) if sep and _LANG_SUFFIX.match(tail.lower()) else (stem, "")
+
+
+def base_stem(path: str | Path) -> str:
+    """一份字幕说的是哪部片：film.en.srt 与 film.mkv 都是 film。"""
+    return split_language_tag(path)[0]
+
+
+def subtitles_beside(folder: Path, stem: str) -> List[Path]:
+    """Every subtitle file sitting beside *stem*, ours or anyone else's.
+
+    收的是 (目录, 片名主干) 而不是一个 Path：调用方常常只有一个主干，而
+    Path("/x/Movie.2019.1080p").with_suffix(".srt") 会得到 Movie.2019.srt
+    ——发行版片名里全是点，这个坑一碰就是系统性的。
+    """
+    found = [p for p in (folder / f"{stem}.srt", folder / f"{stem}.ass")
              if p.is_file()]
-    for sibling in sorted(video.parent.glob(f"{glob.escape(stem)}.*")):
+    for sibling in sorted(folder.glob(f"{glob.escape(stem)}.*")):
         if sibling.suffix.lower() not in (".srt", ".ass") or not sibling.is_file():
             continue
         middle = sibling.name[len(stem) + 1: -len(sibling.suffix)]
@@ -127,7 +148,8 @@ def subtitles_beside(video: Path) -> List[Path]:
     return found
 
 
-def subtitle_state(video: Path, target_language: str = "") -> tuple[str, str]:
+def subtitle_state(folder: Path, stem: str,
+                   target_language: str = "") -> tuple[str, str]:
     """What the subtitle next to *video* means: (state, its language).
 
     ``done``   already in the target language — this film is translated.
@@ -158,8 +180,8 @@ def subtitle_state(video: Path, target_language: str = "") -> tuple[str, str]:
     if want == mux.FALLBACK[0]:
         want = ""                       # no code for this target language
     state, found = "none", ""
-    for path in subtitles_beside(video):
-        tag = path.name[len(video.stem) + 1: -len(path.suffix)].lower()
+    for path in subtitles_beside(folder, stem):
+        tag = path.name[len(stem) + 1: -len(path.suffix)].lower()
         languages: tuple[str, ...] = ()
         if _LANG_SUFFIX.match(tag):
             languages = tuple(
