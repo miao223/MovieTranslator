@@ -1173,14 +1173,16 @@ class JobManager:
         written: List[Path] = []
         in_place = True
         for product, text in zip(products, texts):
-            target, moved = output_target(
-                video, product.sidecar, ext, req.target_language,
-                job.source_subtitle)
-            if moved:
+            target, taken = output_target(video, product.sidecar, ext)
+            if taken is not None:
+                whose = ("正是本次读取的原文"
+                         if job.source_subtitle
+                         and Path(job.source_subtitle) == taken
+                         else "已经存在")
                 job.publish(
                     "composing", 95,
-                    log=f"⚠ 原文就是 {Path(job.source_subtitle).name}，"
-                        f"{product.label}改写到 {target.name}，不覆盖它")
+                    log=f"{taken.name} {whose}，{product.label}改写到 "
+                        f"{target.name}，没有覆盖它")
             try:
                 target.write_text(text, encoding="utf-8")
             except OSError as exc:
@@ -1371,31 +1373,19 @@ def _preprocess_usage(vet_usage: dict, lyrics_usage: dict, refine_usage: dict) -
     )
 
 
-def output_target(video: Path, sidecar: str, ext: str, target_language: str,
-                  source_subtitle: str = "") -> tuple[Path, bool]:
-    """Where the subtitle goes, and whether it had to step aside.
+def output_target(video: Path, sidecar: str, ext: str) -> tuple[Path, Optional[Path]]:
+    """Where the subtitle goes, and the name it had to give up (None if free).
 
-    A translation is named film.srt by design and that must not change.
-    But when the text was read from a sidecar of exactly that name — a
-    downloaded film.srt holding English, translated into Chinese — writing
-    there puts the result on top of the original, silently, with nothing to
-    recover it from. The original is not ours to destroy, so in that one
-    case the translation takes a language suffix instead.
+    本程序**绝不覆盖片源目录里任何已经存在的文件**——不是它自己读进来的那份
+    原文，不是上一次跑出来的成品，也不是用户从别处下载的同名字幕。名字被占
+    就按编号让路，与 mux.output_path 一直以来不往用户片库上写的做法同一条
+    规矩。
 
-    A product that already carries a language suffix cannot step aside that
-    way. 片名.ja.srt 让给 片名.zh.srt 是把日语原文写进译文的名字里 —— 一份
-    没人能发现的错内容，而且下次真的译出中文时两者还要再撞一次；而译文那半
-    边（片名.zh.srt）让给 片名.zh.srt 根本没有让。Those take a number
-    instead, the same way mux.output_path already keeps 片名.zh.2.mkv from
-    landing on someone's video.
+    让路是常态而不是异常：重跑同一部片必然撞上上一次的产物。调用方据此措辞。
     """
-    target = video.parent / f"{video.stem}{sidecar}{ext}"
-    if not source_subtitle or Path(source_subtitle) != target:
-        return target, False
-    if not sidecar:
-        lang = mux.language_of(target_language)[0]
-        return video.parent / f"{video.stem}.{lang}{ext}", True
-    return video.parent / f"{video.stem}{sidecar}.2{ext}", True
+    wanted = video.parent / f"{video.stem}{sidecar}{ext}"
+    free = mux.free_path(wanted)
+    return free, None if free == wanted else wanted
 
 
 def _naming(req: JobRequest, detected: str) -> tuple[str, str, str, str]:

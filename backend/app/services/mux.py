@@ -191,6 +191,27 @@ def start_offset(container, video_path: Path) -> float:
     return min(_start_time(container), _first_dts(video_path))
 
 
+def free_path(candidate: Path) -> Path:
+    """*candidate*, or the first free 片名.zh.2.ext / .3 / … beside it.
+
+    本程序**绝不覆盖任何已经存在的文件**。一个名字撞上了，让路的永远是新写的
+    那一份：用户目录里的东西——他自己下载的字幕、上一次跑出来的成品、同名的
+    别的什么——都不是本程序的，而一次静默覆盖是没有下一次机会的。
+
+    编号插在扩展名之前，所以语言后缀留在名字上（film.zh.srt → film.zh.2.srt）。
+    只对**写进片源目录的成品**用它：工作目录里的副本、.part/.tmp 这些自己的
+    中间文件，本来就该被重写。
+    """
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        numbered = candidate.with_name(f"{candidate.stem}.{n}{candidate.suffix}")
+        if not numbered.exists():
+            return numbered
+        n += 1
+
+
 def output_path(video: Path, target_language: str, container: str = "mkv",
                 suffix: str = "") -> Path:
     """Where the muxed film goes: film.mkv -> film.zh.mkv, same folder.
@@ -204,12 +225,7 @@ def output_path(video: Path, target_language: str, container: str = "mkv",
     """
     suffix = suffix.strip() or language_of(target_language)[0]
     ext = container if container in CONTAINERS else "mkv"
-    candidate = video.parent / f"{video.stem}.{suffix}.{ext}"
-    n = 2
-    while candidate.exists():
-        candidate = video.parent / f"{video.stem}.{suffix}.{n}.{ext}"
-        n += 1
-    return candidate
+    return free_path(video.parent / f"{video.stem}.{suffix}.{ext}")
 
 
 # ------------------------------------------------------------- encoders

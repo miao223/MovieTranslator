@@ -89,6 +89,24 @@ def test_the_new_file_sits_beside_the_old_one_under_a_language_suffix(tmp_path):
     assert mux.output_path(tmp_path / "film.mkv", "Esperanto").name == "film.sub.mkv"
 
 
+def test_a_free_path_steps_aside_by_number_and_keeps_the_suffix(tmp_path):
+    """让路的编号插在扩展名之前，语言后缀留在名字上；每次从原名重新算起。"""
+    wanted = tmp_path / "film.zh.srt"
+    assert mux.free_path(wanted) == wanted            # 空着就用它
+
+    wanted.write_text("first", encoding="utf-8")
+    assert mux.free_path(wanted).name == "film.zh.2.srt"
+    (tmp_path / "film.zh.2.srt").write_text("second", encoding="utf-8")
+    # .2.2 是错的：编号每次从原名算起
+    assert mux.free_path(wanted).name == "film.zh.3.srt"
+    # 发行版那种一堆点的片名也不会被 stem 切坏
+    long = tmp_path / "Movie.2019.1080p.zh.srt"
+    long.write_text("x", encoding="utf-8")
+    assert mux.free_path(long).name == "Movie.2019.1080p.zh.2.srt"
+    # 先来的那份一个字节都没动
+    assert wanted.read_text(encoding="utf-8") == "first"
+
+
 def test_an_existing_file_is_never_overwritten(tmp_path):
     """The output lands in the user's video library; a name collision must
     not cost them a file."""

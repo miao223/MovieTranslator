@@ -981,43 +981,41 @@ def test_the_size_cap_drops_the_oldest_first(settings_file, tmp_path):
     assert (root / "newest").exists()
 
 
-def test_a_translation_never_overwrites_the_subtitle_it_was_read_from(tmp_path):
-    """film.srt holding English, translated to Chinese, must not land on it.
+def test_nothing_in_the_users_folder_is_ever_written_over(tmp_path):
+    """名字被占就让路，无一例外。
 
-    The output name for a translation is film.srt by design, and when the
-    source text came from a sidecar of that same name the write went
-    straight over the original — silently, and with nothing to recover it
-    from. The translation steps aside instead.
+    这条规则以前只管一种情况——产物正好和它自己读进来的那份旁挂字幕同名。
+    用户下载的同名字幕、上一次跑出来的成品，照写不误。现在片源目录里任何
+    已经存在的文件都不会被覆盖：让路的永远是新写的那一份。
     """
-    from app.models.schemas import JobRequest
-    from app.services.pipeline import _naming, output_target
+    from app.services.pipeline import output_target
 
     film = tmp_path / "film.mkv"
-    film.write_bytes(b"x")
-    source = tmp_path / "film.srt"
-    source.write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
 
-    req = JobRequest(video_path=str(film), text_source="subtitle",
-                     subtitle_file=str(source), target_language="简体中文")
-    sidecar = _naming(req, "en")[0]
-    # the naming rule on its own lands exactly on the source
-    assert film.parent / f"{film.stem}{sidecar}.srt" == source
+    # 名字空着就用它，什么都没让
+    target, taken = output_target(film, ".zh", ".srt")
+    assert target == tmp_path / "film.zh.srt" and taken is None
 
-    target, moved = output_target(film, sidecar, ".srt", "简体中文", str(source))
-    assert moved and target != source
-    assert target.name == "film.zh.srt"
+    # 上一次的成品在那儿：让路，并说出让给了谁
+    body = "1\n00:00:01,000 --> 00:00:02,000\n上一次的译文\n"
+    (tmp_path / "film.zh.srt").write_text(body, encoding="utf-8")
+    target, taken = output_target(film, ".zh", ".srt")
+    assert target.name == "film.zh.2.srt" and taken == tmp_path / "film.zh.srt"
 
-    # and a normal job — no sidecar source — is untouched by any of this
-    plain, moved2 = output_target(film, sidecar, ".srt", "简体中文", "")
-    assert plain == source and moved2 is False
+    # 再来一次就 .3，编号从原名重新算起，不会变成 .2.2
+    (tmp_path / "film.zh.2.srt").write_text(body, encoding="utf-8")
+    assert output_target(film, ".zh", ".srt")[0].name == "film.zh.3.srt"
+
+    # 而那份先来的，一个字节都没动
+    assert (tmp_path / "film.zh.srt").read_text(encoding="utf-8") == body
 
 
-def test_an_original_does_not_step_aside_into_the_translations_name(tmp_path):
-    """纯原文读一份 film.ja.srt，产物也叫 film.ja.srt —— 它同样不许覆盖来源。
+def test_the_subtitle_a_job_read_from_is_just_another_file_it_will_not_touch(tmp_path):
+    """原文读自 film.ja.srt、产物也叫 film.ja.srt —— 老规则里的那个特例。
 
-    但它不能用译文那一招让开：改叫 film.zh.srt 是把日语原文写进中文译文的
-    名字里，没人会发现，而且下次真译出中文时两份还要再撞一次。带语言后缀的
-    产物加编号让开，语言标签留在名字上。
+    现在它不再需要特例：通用规则已经把它包含在内，而且让出来的名字带着自己的
+    语言（film.ja.2.srt），不会像从前那样改叫 film.zh.srt —— 那是把日语原文
+    写进中文译文的名字里，没人会发现。
     """
     from app.services.pipeline import output_target
 
@@ -1025,7 +1023,6 @@ def test_an_original_does_not_step_aside_into_the_translations_name(tmp_path):
     source = tmp_path / "film.ja.srt"
     source.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n", encoding="utf-8")
 
-    target, moved = output_target(film, ".ja", ".srt", "简体中文", str(source))
-    assert moved and target.name == "film.ja.2.srt"
-    # 译文那一侧的名字仍然空着，绝不能被这一份占掉
+    target, taken = output_target(film, ".ja", ".srt")
+    assert target.name == "film.ja.2.srt" and taken == source
     assert target.name != "film.zh.srt"
