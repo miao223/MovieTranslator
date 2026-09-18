@@ -227,7 +227,7 @@ def test_the_other_modes_hand_back_nothing_extra(tmp_path, split):
     job = start(split, video_with_subs(tmp_path, CUES), output_mode="bilingual")
     assert job.status.stage == "done", job.status.error
     assert job.status.original_srt_filename == ""
-    assert Path(job.status.srt_filename).name == "withsubs.srt"
+    assert Path(job.status.srt_filename).name == "withsubs.en-zh.srt"
 
 
 def test_the_two_file_mode_names_the_translation_after_the_target():

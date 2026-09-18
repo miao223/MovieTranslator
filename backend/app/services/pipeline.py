@@ -496,18 +496,34 @@ class JobManager:
         same-stem subtitle file (.ass preferred over .srt) in place."""
         settings = _settings_for(job)
         video = Path(req.video_path)
-        # 纯原文的产物带语言后缀（片名.ja.srt），两个精确候选认不出来——所以
-        # 在它们之后再兜一层 glob，否则「先跑纯原文、之后补画面翻译」是死路。
-        # 双文件模式留下两份，而 glob 按字母序：不先点名译文那一份，画面译文
-        # 就会并进原文里，而 {\an7} 那条 cue 本身就是译文。判据用目标语言而
-        # 不是 output_mode——补充模式的请求通常根本没设 output_mode。
+        # 每一份产物都带语言后缀了，所以先点名**我们自己**可能写出来的名字，
+        # 再考虑别人的。{\an7} 那条 cue 是译文，它必须并进译文那一份——不先
+        # 点名就会按字母序并进原文里（film.en.srt 排在 film.zh.srt 前面）。
+        # 判据用目标语言而不是 output_mode：补充模式的请求通常根本没设它。
         lang = mux.language_of(req.target_language)[0]
         stem = glob.escape(video.stem)
+
+        def paired(suffix: str) -> List[Path]:
+            """双语那一份：一对语言里有一个是目标语言就算，两种排版都认。
+
+            整段比较，所以让路留下的 film.en-zh.2.srt 不会命中——那是防覆盖的
+            副本，而用户的播放器挂着的是没编号的那一份。
+            """
+            out = []
+            for path in sorted(video.parent.glob(f"{stem}.*-*{suffix}")):
+                tag = path.name[len(video.stem) + 1: -len(suffix)].lower()
+                if lang in tag.split("-"):
+                    out.append(path)
+            return out
+
         target = next(
             (p for p in (
-                video.with_suffix(".ass"), video.with_suffix(".srt"),
+                # 我们自己的：纯译文 / 双文件的译文那一份
                 video.parent / f"{video.stem}.{lang}.ass",
                 video.parent / f"{video.stem}.{lang}.srt",
+                *paired(".ass"), *paired(".srt"),        # 我们自己的：双语
+                # 别人的，或 0.25 之前的旧产物
+                video.with_suffix(".ass"), video.with_suffix(".srt"),
                 *sorted(video.parent.glob(f"{stem}.*.ass")),
                 *sorted(video.parent.glob(f"{stem}.*.srt")),
             ) if p.is_file()),
@@ -1131,9 +1147,10 @@ class JobManager:
         styled = settings.subtitle.style_enabled
         ext = ".ass" if styled else ".srt"
         build = subtitle.build_ass if styled else subtitle.build_srt
-        # 译文模式下 products 恒为一份、sidecar 恒为 ""，下面的文件名与改动前
-        # 逐字节相同
-        products = _products(req, detected)
+        # 双语的后缀要知道哪一行在上面，而那是设置而不是请求里的东西——所以
+        # 从这里一路带下去，_embed_subtitle 那一侧也必须收到同一个值
+        layout = settings.subtitle.bilingual_layout
+        products = _products(req, detected, layout)
         job.publish("composing", 95, message=f"生成 {ext[1:].upper()} 字幕…")
         texts = [
             build([l for l in lines if not (p.drop_frames and l.is_frame)],
@@ -1144,7 +1161,7 @@ class JobManager:
         # and the debug artifacts still want it, the video folder does not
         muxed = self._embed_subtitle(
             job, req, workdir, video, ext, texts[0], detected=detected,
-            extra=list(zip(products[1:], texts[1:])),
+            extra=list(zip(products[1:], texts[1:])), layout=layout,
         ) if req.embed_subtitle else None
         if muxed is None:
             self._write_sidecars(job, req, workdir, video, ext, products, texts)
@@ -1205,6 +1222,7 @@ class JobManager:
         self, job: Job, req: JobRequest, workdir: Path,
         video: Path, ext: str, srt_text: str, detected: str = "",
         extra: Sequence[Tuple[Product, str]] = (),
+        layout: str = "translation_bottom",
     ) -> Optional[Path]:
         """Mux the subtitle into a new video. Returns None to fall back.
 
@@ -1229,7 +1247,8 @@ class JobManager:
                 log="⚠ 纯音频片源没有画面，无法合成带字幕的视频，已改为生成字幕文件",
             )
             return None
-        sidecar, suffix, lang, title = _naming(req, detected)
+        # 与 _finish 算的必须是同一个名字，所以 layout 一路跟到这里
+        sidecar, suffix, lang, title = _naming(req, detected, layout)
         # 工作目录里这一份也带后缀：它就是「下载字幕」按钮吐给用户的文件名
         job.srt_path = workdir / f"{video.stem}{sidecar}{ext}"
         job.srt_path.write_text(srt_text, encoding="utf-8")
@@ -1388,25 +1407,44 @@ def output_target(video: Path, sidecar: str, ext: str) -> tuple[Path, Optional[P
     return free, None if free == wanted else wanted
 
 
-def _naming(req: JobRequest, detected: str) -> tuple[str, str, str, str]:
+def _naming(req: JobRequest, detected: str,
+            layout: str = "translation_bottom") -> tuple[str, str, str, str]:
     """这个任务的主产物怎么命名：(字幕文件后缀, 内嵌视频后缀, 轨道标签, 轨道标题)。
 
-    译文模式沿用历史命名——字幕一直是与片源同名的 片名.srt。**那一侧一个字都
-    不能改**，改了所有已经指向它的播放器 / 媒体库全部对不上。
+    **每一份字幕都说得出自己是什么语言**：文件名里的后缀就是文件里的内容。
+    纯译文是目标语言（片名.zh.srt），纯原文是片子自己的语言（片名.en.srt），
+    双语两个都写、**谁在上面谁在前**——默认原文在上，所以是 片名.en-zh.srt；
+    设置成「译文在上」就是 片名.zh-en.srt。双文件两份各按自己那一半命名。
 
-    纯原文两侧都带语言后缀（片名.ja.srt / 片名.ja.mkv）：它的产物极可能和一份
-    译文字幕落在同一个目录里，不加后缀就是互相覆盖。
+    所以 片名.srt 这个名字本程序不再产出。它从前同时是「中文译文」和「双语」
+    两种东西的名字，播放器和媒体库只能猜；而一个目录里并排放着几种产物时，
+    没有后缀就是互相覆盖。
 
-    双文件（bilingual_split）描述的是**译文那一半**，它同样带后缀：另一半就在
-    旁边，两份不能都叫 片名.srt。内嵌视频仍按译文命名（片名.zh.mkv），因为
-    默认打开的那条轨道就是译文。
+    判不出来的那一侧沿用既有兜底，绝不猜：源语言未定给 orig（双语便是
+    片名.orig-zh.srt），目标语言不认识给 sub。
+
+    源语言与目标语言撞成同一个代码时（简体片译成繁體，两边都是 zh），双语
+    照写 片名.zh-zh.srt——**这里没有可撞的第二个文件**，而 zh-zh 至少说出了
+    两边都是中文；双文件那边的 orig 兜底是为了给同一个目录里的另一份让名字，
+    不是为了好看，所以不搬过来。
+
+    内嵌视频那一侧不跟着变，永远按目标语言（片名.zh.mkv，纯原文除外）：它是
+    「这部片的中文版」，不是一份字幕。
+
+    *layout* 来自设置（SubtitleSettings.bilingual_layout），不在请求里——改了
+    它再跑一次，新的那份会以另一个名字落在旁边，谁也没覆盖谁。
     """
     if req.output_mode == "original_only":
         suffix, tag, title = mux.source_language_of(detected)
         return f".{suffix}", suffix, tag, title
     suffix, tag = mux.language_of(req.target_language)
-    sidecar = f".{suffix}" if req.output_mode == "bilingual_split" else ""
-    return sidecar, suffix, tag, f"{req.target_language}字幕"
+    title = f"{req.target_language}字幕"
+    if req.output_mode == "bilingual":
+        source = mux.source_language_of(detected)[0]
+        top, bottom = ((suffix, source) if layout == "translation_top"
+                       else (source, suffix))
+        return f".{top}-{bottom}", suffix, tag, title
+    return f".{suffix}", suffix, tag, title
 
 
 class Product(NamedTuple):
@@ -1420,7 +1458,8 @@ class Product(NamedTuple):
     drop_frames: bool = False   # 画面翻译那些 cue 不进这一份
 
 
-def _products(req: JobRequest, detected: str) -> List[Product]:
+def _products(req: JobRequest, detected: str,
+              layout: str = "translation_bottom") -> List[Product]:
     """这个任务要产出哪几份字幕，第一份是主产物。
 
     三个老模式恒为一份，名字与轨道标签仍旧全部来自 _naming——这里一个字都不
@@ -1433,7 +1472,7 @@ def _products(req: JobRequest, detected: str) -> List[Product]:
     见 _frame_lines），而 bilingual 本来也只显示译文——两份合起来等于双语那
     一份，正是这个模式的定义。
     """
-    sidecar, _suffix, tag, title = _naming(req, detected)
+    sidecar, _suffix, tag, title = _naming(req, detected, layout)
     if req.output_mode != "bilingual_split":
         return [Product(req.output_mode, sidecar, tag, title, "译文")]
     orig_suffix, orig_tag, orig_title = mux.source_language_of(detected)

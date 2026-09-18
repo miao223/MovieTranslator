@@ -99,9 +99,18 @@ def scan_media(
     return to_translate, skipped, shadowed, with_source
 
 
-# A language suffix as original_only writes it: two or three letters, or the
-# "orig"/"und" it falls back to when the language could not be determined.
-_LANG_SUFFIX = re.compile(r"^[a-z]{2,3}$|^orig$|^und$")
+# A language suffix as this program writes it: two or three letters (which
+# covers the "und"/"sub" fallbacks), the longer "orig", or a bilingual pair
+# of those joined by a hyphen — film.en-zh.srt. Region tags like zh-cn come
+# along for free and land right: either half naming the target is enough.
+# Still deliberately narrow — film.backup.srt, film.v2.srt and the
+# film.zh.2.srt a step-aside leaves behind are not results and must not be
+# read as any language.
+_LANG_SUFFIX = re.compile(r"^(?:[a-z]{2,3}|orig)(?:-(?:[a-z]{2,3}|orig))?$")
+
+# 名字里这几个词不是语言，是「说不出是什么语言」。必须在 iso2 之前滤掉：
+# iso2("orig") 会顺着前两个字母给出 "or"（奥里亚语），iso2("sub") 给 "su"。
+_NOT_A_LANGUAGE = ("orig", "und", "sub")
 
 
 def subtitles_beside(video: Path) -> List[Path]:
@@ -150,15 +159,24 @@ def subtitle_state(video: Path, target_language: str = "") -> tuple[str, str]:
         want = ""                       # no code for this target language
     state, found = "none", ""
     for path in subtitles_beside(video):
-        tag = path.name[len(video.stem) + 1: -len(path.suffix)]
-        language = ""
-        if _LANG_SUFFIX.match(tag.lower()):
-            language = subsource.iso2(tag)
-        language = language or _language_of_file(path)
-        if not language or not want or language == want:
-            return "done", language
+        tag = path.name[len(video.stem) + 1: -len(path.suffix)].lower()
+        languages: tuple[str, ...] = ()
+        if _LANG_SUFFIX.match(tag):
+            languages = tuple(
+                code for code in (subsource.iso2(part) for part in tag.split("-")
+                                  if part not in _NOT_A_LANGUAGE)
+                if code
+            )
+        if not languages:
+            one = _language_of_file(path)
+            languages = (one,) if one else ()
+        if not languages or not want or want in languages:
+            return "done", want if want in languages else (
+                languages[0] if languages else "")
         if state == "none":
-            state, found = "source", language   # 记下，但继续找 done
+            # 配对时报第一段：默认排版下那是原文，而 source 说的正是「这里有
+            # 可以拿来译的材料」
+            state, found = "source", languages[0]
     return state, found
 
 
@@ -190,26 +208,3 @@ def _language_of_file(path: Path) -> str:
     lines = [SubtitleLine(index=i, start=0.0, end=0.0, text=t)
              for i, t in enumerate(texts[:400], 1) if t.strip()]
     return subsource.detect_language(lines) if lines else ""
-
-
-def has_subtitle(video: Path) -> bool:
-    """Is there already a subtitle for this file next to it?
-
-    Both shapes count. Translated output is ``film.srt``, but original_only
-    writes ``film.ja.srt`` — and only checking the first meant a season run
-    in that mode was rescanned as untranslated every time, re-running the
-    lot. The language is not knowable at scan time when source_language is
-    auto, so the suffix is matched by shape rather than by value.
-
-    Deliberately narrow: ``film.backup.srt`` and ``film.v2.srt`` are not
-    subtitles this program wrote, and skipping a file because of one would
-    be the worse mistake.
-    """
-    if video.with_suffix(".srt").exists():
-        return True
-    stem = video.stem
-    for sibling in video.parent.glob(f"{glob.escape(stem)}.*.srt"):
-        middle = sibling.name[len(stem) + 1: -len(".srt")]
-        if _LANG_SUFFIX.match(middle.lower()):
-            return True
-    return False

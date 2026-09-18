@@ -125,12 +125,39 @@ def test_the_frame_translation_still_targets_the_target_language(
 # ------------------------------------------------------------- 命名契约
 
 
-def test_the_translated_side_of_the_naming_is_untouched():
-    """译文字幕一直叫 片名.srt（后缀为空）——改了所有指向它的媒体库都对不上。"""
+def test_every_mode_says_what_language_it_is_in():
+    """文件名里的后缀就是文件里的内容——四种模式一次钉完。
+
+    片名.srt 这个名字本程序不再产出：它从前同时是「中文译文」和「双语」两种
+    东西的名字，而一个目录里并排放着几种产物时，没有后缀就是互相覆盖。
+    """
+    from app.services.pipeline import _naming, _products
+
+    def suffixes(mode, detected="ja", layout="translation_bottom", **kw):
+        req = JobRequest(video_path="/v/film.mkv", target_language="简体中文",
+                         output_mode=mode, **kw)
+        return [p.sidecar for p in _products(req, detected, layout)]
+
+    assert suffixes("bilingual") == [".ja-zh"]          # 默认原文在上
+    assert suffixes("bilingual", layout="translation_top") == [".zh-ja"]
+    assert suffixes("translation_only") == [".zh"]
+    assert suffixes("original_only") == [".ja"]
+    assert suffixes("bilingual_split") == [".zh", ".ja"]
+
+    # 轨道标签与内嵌视频那一侧仍然是目标语言：视频是「这部片的中文版」
+    req = JobRequest(video_path="/v/film.mkv", target_language="简体中文")
+    assert _naming(req, "ja") == (".ja-zh", "zh", "chi", "简体中文字幕")
+
+
+def test_a_bilingual_name_says_both_languages_even_when_one_is_unknown():
+    """判不出源语言就写 orig，不拿目标语言冒充，也不退回没有后缀。"""
     from app.services.pipeline import _naming
 
     req = JobRequest(video_path="/v/film.mkv", target_language="简体中文")
-    assert _naming(req, "ja") == ("", "zh", "chi", "简体中文字幕")
+    assert _naming(req, "")[0] == ".orig-zh"
+    # 两边撞成同一个代码时照写：只有一个文件，没有可撞的第二份
+    same = JobRequest(video_path="/v/film.mkv", target_language="繁體中文")
+    assert _naming(same, "zh")[0] == ".zh-zh"
 
 
 def test_an_undetected_language_falls_back_instead_of_guessing():

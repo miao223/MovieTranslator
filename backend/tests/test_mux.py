@@ -356,7 +356,9 @@ def test_the_stage_embeds_and_keeps_the_subtitle_out_of_the_video_folder(
     assert out == video.parent / "film.zh.mkv" and out.is_file()
     assert job.status.video_filename == str(out)
     assert not (video.parent / "film.srt").exists()  # nothing beside the video
-    assert (workdir / "film.srt").is_file() and job.srt_path == workdir / "film.srt"
+    # 工作目录那一份与旁挂那一份同名：双语、源语言未判定，所以是 orig-zh
+    copy = workdir / "film.orig-zh.srt"
+    assert copy.is_file() and job.srt_path == copy
 
 
 def test_the_pure_original_stage_names_everything_after_the_source_language(

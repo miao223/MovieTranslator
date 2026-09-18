@@ -804,6 +804,35 @@ def test_an_original_on_its_own_is_still_only_material(tmp_path):
     assert [p.name for p in with_source] == ["half.mkv"]
 
 
+def test_a_bilingual_subtitle_counts_as_done_for_either_of_its_languages(tmp_path):
+    """片名.en-zh.srt 里有目标语言，这部片就是做完的。
+
+    配对后缀是本程序双语模式的产物，两种排版下前后顺序相反（en-zh / zh-en），
+    第三方的更是毫无规律——所以判据是「哪一半是目标语言」，不是「哪一半在前」。
+    """
+    from app.core.media import subtitle_state
+
+    video = tmp_path / "pair.mkv"
+    (tmp_path / "pair.en-zh.srt").write_text(SRT_ZH, encoding="utf-8")
+    assert subtitle_state(video, "简体中文")[0] == "done"
+    assert subtitle_state(video, "English")[0] == "done"
+    # 两种语言都不是目标：那它就是材料，不是成品
+    assert subtitle_state(video, "Français")[0] == "source"
+
+
+def test_a_copy_that_stepped_aside_is_not_mistaken_for_a_result(tmp_path):
+    """片名.zh.2.srt 是防覆盖留下的副本，不是成品。
+
+    它必须落在语言后缀的判定之外：认它就等于把一份「让路的备份」当成这部片
+    已经翻完的证据。
+    """
+    from app.core.media import subtitle_state
+
+    video = tmp_path / "again.mkv"
+    (tmp_path / "again.zh.2.srt").write_text(SRT_ZH, encoding="utf-8")
+    assert subtitle_state(video, "简体中文")[0] == "none"
+
+
 def test_a_subtitle_that_is_not_ours_by_name_is_left_alone(tmp_path):
     """film.backup.srt is nobody's language tag, so it is not consulted."""
     from app.core.media import scan_media
