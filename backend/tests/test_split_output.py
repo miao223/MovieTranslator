@@ -273,3 +273,35 @@ def test_asking_for_an_original_that_does_not_exist_says_so(tmp_path, split):
         assert client.get(f"/api/jobs/{job.id}/result").status_code == 200
         assert client.get(f"/api/jobs/{job.id}/result",
                           params={"part": "original"}).status_code == 404
+
+
+def test_a_failure_writing_the_second_file_keeps_the_first(
+    tmp_path, split, monkeypatch
+):
+    """两个文件之间没有原子性，所以约定是「谁都不丢」。
+
+    第二份写不下去时，已经写成的第一份**留在原地**——把它删掉只是把「少一
+    个文件」换成「两手空空」。兜底那一份进工作目录，能下载，而 srt_in_place
+    诚实地变成 False：界面那句「视频目录不可写，请下载保存」是这时唯一安全
+    的说法。
+    """
+    video = video_with_subs(tmp_path, CUES)
+    real = Path.write_text
+
+    def refuse(self, *args, **kwargs):
+        if self.name == "withsubs.en.srt" and self.parent == video.parent:
+            raise OSError("Read-only file system")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+    job = start(split, video)
+
+    assert job.status.stage == "done", job.status.error
+    # 译文仍在片源旁边，一个字都没少
+    translation = Path(job.status.srt_filename)
+    assert translation == video.parent / "withsubs.zh.srt" and translation.is_file()
+    # 原文退到了工作目录，仍然能取到
+    original = Path(job.status.original_srt_filename)
+    assert original.parent != video.parent and "Hello there" in original.read_text(
+        encoding="utf-8")
+    assert job.status.srt_in_place is False
