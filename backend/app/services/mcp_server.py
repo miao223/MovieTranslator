@@ -146,15 +146,19 @@ def build() -> Optional["FastMCP"]:
             不支持内嵌合成新视频，也没有画面翻译。
         shadowed: 与同名视频重名而被让位的音频文件（两者会写同一份字幕）。
         """
-        found, skipped, shadowed, _with_source = await anyio.to_thread.run_sync(
+        scan = await anyio.to_thread.run_sync(
             scan_media, directory, recursive, skip_translated
         )
+        found = scan.to_translate
         return {
             "videos": [str(v) for v in found],
-            "skipped": [str(s) for s in skipped],
+            "skipped": [str(s) for s in scan.skipped],
             "total": len(found),
             "audio": [str(f) for f in found if kind_of(f) == "audio"],
-            "shadowed": [str(s) for s in shadowed],
+            "subtitle": [str(f) for f in found if kind_of(f) == "subtitle"],
+            "shadowed": [str(s) for s in scan.shadowed],
+            # 被同名字幕顶替掉的：更快，但不会产出内嵌视频、不会用语音识别
+            "replaced": [str(s) for s in scan.replaced],
         }
 
     @mcp.tool()
@@ -231,7 +235,7 @@ def build() -> Optional["FastMCP"]:
         整个流程需要几分钟到几小时，请随后用 get_job 轮询进度，
         完成后用 get_subtitle 取回字幕。
 
-        video_path: 服务器本机的视频或音频文件绝对路径。
+        video_path: 服务器本机的视频、音频或**字幕文件**绝对路径。字幕文件（.srt/.ass/.vtt/.sub/.sup/.idx）可以单独翻译——没有画面，所以不会产出内嵌视频，也不会用语音识别。
         source_language: 影片原始语言代码（如 ja / en），auto 为自动判断。
         synopsis: 剧情简介，可显著提升人名与代词的翻译准确度。
         output_mode: bilingual 双语，translation_only 只要译文，
@@ -253,7 +257,7 @@ def build() -> Optional["FastMCP"]:
         text_source: asr 走语音识别；subtitle 直接读片源已有的字幕，跳过识别——
             片源自带外文字幕时又快又准，先用 list_subtitle_tracks 看有哪些。
         subtitle_track: 要读取的字幕轨容器序号（text_source="subtitle" 时）。
-            指向图形字幕（PGS/VobSub）会直接失败，因为那里面没有文字。
+            指向图形字幕（PGS/VobSub）会先用 OCR 认成文字，比文字字幕慢得多。
         subtitle_file: 改为读取这个外挂字幕文件（.srt/.ass），优先于 subtitle_track。
         embed_subtitle: 开启后不生成字幕文件，而是在同目录产出一个内嵌软字幕的
             新视频（片名.zh.mkv，纯原文时后缀是源语言；音视频不重编码）。会完整复制一份视频，注意磁盘空间。

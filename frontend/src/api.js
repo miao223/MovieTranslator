@@ -21,10 +21,12 @@ export const api = {
   getJob: (id) => request(`/api/jobs/${id}`),
   // targetLanguage decides what counts as "already translated": a subtitle
   // in that language means done, one in any other language is material
-  batchScan: (path, recursive, skipExisting, targetLanguage = '') =>
+  batchScan: (path, recursive, skipExisting, targetLanguage = '', subtitleLanguage = '') =>
     request(`/api/batch/scan?path=${encodeURIComponent(path)}&recursive=${recursive}`
             + `&skip_existing=${skipExisting}`
-            + `&target_language=${encodeURIComponent(targetLanguage)}`),
+            + `&target_language=${encodeURIComponent(targetLanguage)}`
+            // 同一部片旁边有好几种语言的字幕时，这决定挑哪一份当原文
+            + `&subtitle_language=${encodeURIComponent(subtitleLanguage)}`),
   createBatch: (payload) =>
     request('/api/batch', { method: 'POST', body: JSON.stringify(payload) }),
   getBatch: (id) => request(`/api/batch/${id}`),

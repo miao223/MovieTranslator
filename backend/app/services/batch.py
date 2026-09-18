@@ -43,10 +43,11 @@ class BatchManager:
         while a season is half done used to change the parameters from that
         episode on, while the series glossary assumes all of them match.
         """
-        videos, skipped, _shadowed, _with_source = scan_media(
+        scan = scan_media(
             req.directory, req.recursive, req.skip_existing_srt,
-            req.target_language,
+            req.target_language, req.subtitle_language,
         )
+        videos, skipped = scan.to_translate, scan.skipped
         if not videos:
             raise ValueError("目录中没有需要翻译的视频或音频文件")
         batch = Batch(

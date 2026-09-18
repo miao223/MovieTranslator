@@ -753,12 +753,15 @@ def test_an_existing_subtitle_is_judged_by_its_language_not_its_name(tmp_path):
     (tmp_path / "english.srt").write_text(SRT_EN, encoding="utf-8")
     (tmp_path / "bare.mkv").write_bytes(b"x")
 
-    todo, skipped, _, with_source = scan_media(tmp_path, target_language="简体中文")
+    scan = scan_media(tmp_path, target_language="简体中文")
 
-    assert sorted(p.name for p in skipped) == ["done.mkv"]
-    assert sorted(p.name for p in todo) == ["bare.mkv", "english.mkv", "japanese.mkv"]
-    # the two that can be translated from text instead of from speech
-    assert sorted(p.name for p in with_source) == ["english.mkv", "japanese.mkv"]
+    assert sorted(p.name for p in scan.skipped) == ["done.mkv"]
+    # 那两份外语字幕现在**直接被翻译**，顶替掉它们伺候的片子——更快、不占 GPU，
+    # 代价是这两部拿不到内嵌视频，所以被顶替的要单独说出来
+    assert sorted(p.name for p in scan.to_translate) == [
+        "bare.mkv", "english.srt", "japanese.ja.srt"]
+    assert sorted(p.name for p in scan.replaced) == ["english.mkv", "japanese.mkv"]
+    assert not scan.with_source          # 不再只是「报告」，已经改用它了
 
 
 def test_without_a_target_language_any_subtitle_still_counts_as_done(tmp_path):
@@ -767,8 +770,9 @@ def test_without_a_target_language_any_subtitle_still_counts_as_done(tmp_path):
 
     (tmp_path / "a.mkv").write_bytes(b"x")
     (tmp_path / "a.srt").write_text(SRT_EN, encoding="utf-8")
-    todo, skipped, _, with_source = scan_media(tmp_path)
-    assert [p.name for p in skipped] == ["a.mkv"] and not todo and not with_source
+    scan = scan_media(tmp_path)
+    assert [p.name for p in scan.skipped] == ["a.mkv"]
+    assert not scan.to_translate and not scan.with_source
 
 
 def test_both_halves_of_a_split_job_together_mean_the_film_is_done(tmp_path):
@@ -785,9 +789,9 @@ def test_both_halves_of_a_split_job_together_mean_the_film_is_done(tmp_path):
     (tmp_path / "pair.en.srt").write_text(SRT_EN, encoding="utf-8")
     (tmp_path / "pair.zh.srt").write_text(SRT_ZH, encoding="utf-8")
 
-    todo, skipped, _, with_source = scan_media(tmp_path, target_language="简体中文")
-    assert [p.name for p in skipped] == ["pair.mkv"]
-    assert not todo and not with_source
+    scan = scan_media(tmp_path, target_language="简体中文")
+    assert [p.name for p in scan.skipped] == ["pair.mkv"]
+    assert not scan.to_translate and not scan.with_source
 
 
 def test_an_original_on_its_own_is_still_only_material(tmp_path):
@@ -799,9 +803,12 @@ def test_an_original_on_its_own_is_still_only_material(tmp_path):
     (tmp_path / "half.en.srt").write_text(SRT_EN, encoding="utf-8")
     (tmp_path / "half.ja.srt").write_text(SRT_JA, encoding="utf-8")
 
-    todo, skipped, _, with_source = scan_media(tmp_path, target_language="简体中文")
-    assert [p.name for p in todo] == ["half.mkv"] and not skipped
-    assert [p.name for p in with_source] == ["half.mkv"]
+    scan = scan_media(tmp_path, target_language="简体中文")
+    # 两份都不是目标语言，所以这一组没做完；翻的是字幕（文字优先，同为文字
+    # 时按名字），被顶替的视频进 replaced
+    assert [p.name for p in scan.to_translate] == ["half.en.srt"]
+    assert [p.name for p in scan.replaced] == ["half.mkv"]
+    assert not scan.skipped
 
 
 def test_a_bilingual_subtitle_counts_as_done_for_either_of_its_languages(tmp_path):
@@ -854,8 +861,11 @@ def test_a_subtitle_that_is_not_ours_by_name_is_left_alone(tmp_path):
 
     (tmp_path / "d.mkv").write_bytes(b"x")
     (tmp_path / "d.backup.srt").write_text(SRT_EN, encoding="utf-8")
-    todo, skipped, _, _ = scan_media(tmp_path, target_language="简体中文")
-    assert [p.name for p in todo] == ["d.mkv"] and not skipped
+    scan = scan_media(tmp_path, target_language="简体中文")
+    # d.backup.srt 认领到 d.mkv 这一组，但 backup 不是语言后缀，所以它不能
+    # 当原文——既不让这部片显示为已完成，也不会自己变成一个任务
+    assert [p.name for p in scan.to_translate] == ["d.mkv"] and not scan.skipped
+    assert not scan.replaced
 
 
 def test_a_season_glossary_survives_a_restart(settings_file):

@@ -231,21 +231,35 @@ async function probeSubs() {
 // translate. The answer comes from the server so the page never keeps its own
 // copy of the extension table — /api/fs/resolve already knows.
 const isAudioSource = ref(false)
+// 字幕文件本身也能当翻译对象（.srt/.ass/.sub/.sup/.idx）。它没有音轨可选、
+// 没有「原文来源」可挑，也没有画面。
+const isSubtitleSource = ref(false)
+// 两种源都没有画面，内嵌与画面翻译一视同仁；分开两个标志是因为别的地方
+// 要说不同的话
+const noPicture = computed(() => isAudioSource.value || isSubtitleSource.value)
 
 async function probeKind() {
   try {
     const r = await api.resolvePath(form.video_path)
     isAudioSource.value = r.type === 'file' && !!r.is_audio
+    isSubtitleSource.value = r.type === 'file' && !!r.is_subtitle
   } catch {
     isAudioSource.value = false
+    isSubtitleSource.value = false
   }
 }
 
 // the path can be typed, pasted or picked in the browser — debounce them all
 watch(() => form.video_path, () => {
   clearTimeout(probeTimer)
-  probeTimer = setTimeout(() => {
-    probeKind()
+  probeTimer = setTimeout(async () => {
+    await probeKind()
+    // 字幕文件没有音轨可列，它自己就是那条字幕轨——两个探测都只会白跑
+    if (isSubtitleSource.value) {
+      tracks.value = []
+      subTracks.value = []
+      return
+    }
     probeTracks()
     probeSubs()
   }, 400)
@@ -253,7 +267,7 @@ watch(() => form.video_path, () => {
 
 // otherwise switching a chosen film for an mp3 leaves the embed options open
 // and embedExample naming a .mkv that is never going to exist
-watch(isAudioSource, (on) => {
+watch(noPicture, (on) => {
   if (on) form.embed_subtitle = false
 })
 
@@ -406,7 +420,7 @@ function buildJobPayload(frameOnly = false) {
     ElMessage.warning('请先选择视频或音频文件')
     return null
   }
-  const tasks = isAudioSource.value
+  const tasks = noPicture.value
     ? []
     : frameTasks.value.filter((t) => t.time.trim())
   if (frameOnly && !tasks.length) {
@@ -549,11 +563,11 @@ async function startBatchScan() {
   try {
     const r = await api.batchScan(
       batchForm.directory, batchForm.recursive, batchForm.skip_existing_srt,
-      form.target_language,
+      form.target_language, batchForm.subtitle_language,
     )
     if (!r.total) {
       ElMessage.warning(
-        '目录中没有需要翻译的视频或音频'
+        '目录中没有需要翻译的视频、音频或字幕'
         + (r.skipped.length ? `（${r.skipped.length} 个已有字幕，被跳过）` : ''),
       )
       return
@@ -659,7 +673,7 @@ onBeforeUnmount(() => {
           </template>
         </el-input>
       </el-form-item>
-      <el-form-item label="原文来源">
+      <el-form-item v-if="!isSubtitleSource" label="原文来源">
         <el-radio-group v-model="form.text_source">
           <el-radio value="asr">语音识别</el-radio>
           <el-radio value="subtitle">片源已有的字幕</el-radio>
@@ -670,7 +684,7 @@ onBeforeUnmount(() => {
             <strong>跳过语音识别</strong>——不下模型、不占 GPU，几秒钟就能进入翻译，
             原文准确度取决于片源字幕（通常远好于识别结果）。<br>
             片源自带的字幕轨<strong>不会被改动</strong>；选「合成带字幕的新视频」时也会原样保留。
-            图形字幕（PGS/VobSub，蓝光原盘常见）里只有图片没有文字，读不出来。
+            图形字幕（PGS/VobSub，蓝光原盘常见）里存的是图片，会先用 OCR 认成文字再翻译，比文字字幕慢得多。
           </template>
           <template v-else>
             提取音频后用 Whisper 识别。片源自带外文字幕时，改用「片源已有的字幕」会又快又准。
@@ -836,10 +850,14 @@ onBeforeUnmount(() => {
       <el-form-item label="输出形式">
         <el-radio-group v-model="form.embed_subtitle">
           <el-radio :value="false">独立字幕文件</el-radio>
-          <el-radio :value="true" :disabled="isAudioSource">合成带字幕的新视频</el-radio>
+          <el-radio :value="true" :disabled="noPicture">合成带字幕的新视频</el-radio>
         </el-radio-group>
         <div class="hint" style="margin: 4px 0 0; display: block">
-          <template v-if="isAudioSource">
+          <template v-if="isSubtitleSource">
+            翻译对象是一份字幕文件，没有画面可合成，只能生成独立字幕文件——
+            产物写在它旁边（<code>{{ sidecarExample }}</code>），<strong>源文件不会被改动</strong>。
+          </template>
+          <template v-else-if="isAudioSource">
             纯音频片源没有画面，只能生成独立字幕文件。字幕会写在音频文件所在目录。
           </template>
           <template v-else-if="form.embed_subtitle">
@@ -921,7 +939,7 @@ onBeforeUnmount(() => {
           <span class="hint">保持原编码即可；MP4 装不下 DTS/TrueHD 时会自动转成 AAC</span>
         </el-form-item>
       </template>
-      <el-form-item v-if="mode === 'single' && !isAudioSource" label="画面翻译">
+      <el-form-item v-if="mode === 'single' && !noPicture" label="画面翻译">
         <div style="width: 100%">
           <div v-for="(t, i) in frameTasks" :key="i" class="frame-task-row">
             <el-input v-model="t.time" placeholder="如 8:19" style="width: 110px" />
@@ -1091,7 +1109,8 @@ onBeforeUnmount(() => {
     </p>
     <div v-if="scanResult" class="scan-list">
       <div v-for="v in scanResult.videos" :key="v" class="scan-item">
-        {{ (scanResult.audio || []).includes(v) ? '🎵' : '🎬' }} {{ baseName(v) }}
+        {{ (scanResult.audio || []).includes(v) ? '🎵'
+           : /\.(srt|ass|ssa|vtt|sub|sup|idx)$/i.test(v) ? '💬' : '🎬' }} {{ baseName(v) }}
         <el-tag
           v-if="(scanResult.with_source || []).includes(v)"
           size="small" type="success" style="margin-left: 6px"
@@ -1155,6 +1174,28 @@ onBeforeUnmount(() => {
       style="margin-top: 12px"
       :title="`其中 ${scanResult.audio_count} 个是纯音频文件，没有画面，只会生成字幕文件`"
     />
+    <!-- 字幕顶替视频是这一批最需要说清楚的事：更快了，但用户勾的两个开关
+         都不会生效 -->
+    <el-alert
+      v-if="scanResult && scanResult.replaced_count"
+      type="warning"
+      :closable="false"
+      style="margin-top: 12px"
+      :title="`${scanResult.replaced_count} 个视频旁边有同名字幕，已改为直接翻译那份字幕`"
+    >
+      <div class="hint" style="display: block">
+        十几秒读完、不占 GPU，断句和人名也比语音识别准。代价是这些片子
+        <strong>不会产出内嵌视频，也不会走语音识别</strong>——需要那两样就把同名字幕
+        挪出这个目录。
+      </div>
+    </el-alert>
+    <el-alert
+      v-if="scanResult && scanResult.subtitle_count"
+      type="info"
+      :closable="false"
+      style="margin-top: 12px"
+      :title="`其中 ${scanResult.subtitle_count} 个是字幕文件，直接读取翻译；图形字幕（PGS/VobSub）会先用 OCR 认字，比文字慢得多`"
+    />
     <el-alert
       v-if="scanResult && scanResult.shadowed && scanResult.shadowed.length"
       type="info"
@@ -1211,7 +1252,7 @@ onBeforeUnmount(() => {
         📁 {{ d }}
       </div>
       <div v-for="f in browser.files" :key="'f-' + f.name" class="entry file" @click="pickFile(f.name)">
-        {{ f.kind === 'audio' ? '🎵' : '🎬' }} {{ f.name }} <span class="size">{{ fmtSize(f.size) }}</span>
+        {{ { audio: '🎵', subtitle: '💬' }[f.kind] || '🎬' }} {{ f.name }} <span class="size">{{ fmtSize(f.size) }}</span>
       </div>
       <el-empty v-if="!browser.dirs.length && !browser.files.length" description="此目录没有子目录或视频 / 音频文件" :image-size="60" />
     </div>

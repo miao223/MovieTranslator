@@ -125,11 +125,12 @@ def cancel_job(job_id: str):
 
 @router.get("/batch/scan")
 def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True,
-               target_language: str = ""):
+               target_language: str = "", subtitle_language: str = ""):
     """Preview which videos and audio files a batch would translate."""
     try:
-        found, skipped, shadowed, with_source = scan_media(
-            path, recursive, skip_existing, target_language)
+        scan = scan_media(path, recursive, skip_existing, target_language,
+                          subtitle_language)
+        found, skipped = scan.to_translate, scan.skipped
     except NotADirectoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     audio_files = [str(f) for f in found if kind_of(f) == "audio"]
@@ -141,13 +142,18 @@ def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True,
         # produce a subtitle file, however the output switch is set
         "audio": audio_files,
         "audio_count": len(audio_files),
-        "shadowed": [str(s) for s in shadowed],
+        "shadowed": [str(s) for s in scan.shadowed],
+        # 一份现成的字幕顶替掉的视频/音频：更快，但这一批不会产出内嵌视频、
+        # 也不会用语音识别。与 shadowed 分开，因为要说的话完全不同。
+        "replaced": [str(s) for s in scan.replaced],
+        "replaced_count": len(scan.replaced),
+        "subtitle_count": sum(1 for f in found if kind_of(f) == "subtitle"),
         # files that already carry a subtitle in some OTHER language. Not
         # acted on — reported, so the user can choose to translate from
         # that text instead of from speech, which is faster and more
         # accurate. Which source to use is their call, not ours.
-        "with_source": [str(s) for s in with_source],
-        "with_source_count": len(with_source),
+        "with_source": [str(s) for s in scan.with_source],
+        "with_source_count": len(scan.with_source),
     }
 
 
@@ -940,9 +946,10 @@ def enqueue_batch(req: BatchRequest) -> dict:
     of settings is the problem this feature exists to prevent.
     """
     try:
-        videos, skipped, _shadowed, _with_source = scan_media(
+        scan = scan_media(
             req.directory, req.recursive, req.skip_existing_srt,
-            req.target_language)
+            req.target_language, req.subtitle_language)
+        videos, skipped = scan.to_translate, scan.skipped
     except NotADirectoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not videos:

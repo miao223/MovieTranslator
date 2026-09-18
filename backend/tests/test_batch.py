@@ -30,9 +30,8 @@ def add_audio(root: Path):
 
 def test_scan_recursive_with_skip(tmp_path):
     make_tree(tmp_path)
-    videos, skipped, shadowed, _ = scan_media(
-        tmp_path, recursive=True, skip_existing_srt=True
-    )
+    scan = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
+    videos, skipped, shadowed = scan.to_translate, scan.skipped, scan.shadowed
     names = [v.name for v in videos]
     assert names == ["a.mkv", "c.avi"]  # b skipped (srt), d hidden, txt ignored
     assert [s.name for s in skipped] == ["b.mp4"]
@@ -41,11 +40,11 @@ def test_scan_recursive_with_skip(tmp_path):
 
 def test_scan_non_recursive_no_skip(tmp_path):
     make_tree(tmp_path)
-    videos, skipped, _, _ = scan_media(
-        tmp_path, recursive=False, skip_existing_srt=False
-    )
-    assert [v.name for v in videos] == ["a.mkv", "b.mp4"]
-    assert skipped == []
+    scan = scan_media(tmp_path, recursive=False, skip_existing_srt=False)
+    # 关掉跳过时 b 这一组还在，而组内字幕优先于视频——b.srt 就是那份现成的原文
+    assert [v.name for v in scan.to_translate] == ["a.mkv", "b.srt"]
+    assert scan.skipped == []
+    assert [r.name for r in scan.replaced] == ["b.mp4"]
 
 
 def test_scan_rejects_non_directory(tmp_path):
@@ -58,9 +57,8 @@ def test_audio_files_are_scanned_like_videos(tmp_path):
     feature; the .srt skip has to apply to it the same way."""
     make_tree(tmp_path)
     add_audio(tmp_path)
-    found, skipped, shadowed, _ = scan_media(
-        tmp_path, recursive=True, skip_existing_srt=True
-    )
+    scan = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
+    found, skipped, shadowed = scan.to_translate, scan.skipped, scan.shadowed
     assert [f.name for f in found] == ["a.mkv", "e.mp3", "c.avi", "f.flac"]
     assert [s.name for s in skipped] == ["b.mp4", "g.m4a"]
     assert shadowed == []
@@ -72,7 +70,8 @@ def test_an_audio_twin_of_a_video_steps_aside(tmp_path):
     make_tree(tmp_path)
     (tmp_path / "a.mp3").write_bytes(b"x")
     (tmp_path / "solo.mp3").write_bytes(b"x")
-    found, _, shadowed, _ = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
+    scan = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
+    found, shadowed = scan.to_translate, scan.shadowed
     names = [f.name for f in found]
     assert "a.mkv" in names and "a.mp3" not in names
     assert "solo.mp3" in names  # no video of that name, so it stands
@@ -84,12 +83,87 @@ def test_a_video_already_subtitled_still_shadows_its_audio(tmp_path):
     lets b.mp3 live on and overwrite the subtitle b.mp4 already has."""
     make_tree(tmp_path)
     (tmp_path / "b.mp3").write_bytes(b"x")
-    found, skipped, shadowed, _ = scan_media(
-        tmp_path, recursive=True, skip_existing_srt=True
-    )
+    scan = scan_media(tmp_path, recursive=True, skip_existing_srt=True)
+    found, skipped, shadowed = scan.to_translate, scan.skipped, scan.shadowed
     assert "b.mp3" not in [f.name for f in found]
     assert [s.name for s in shadowed] == ["b.mp3"]
     assert [s.name for s in skipped] == ["b.mp4"]
+
+
+def _srt(path: Path, text: str = "Hello there") -> Path:
+    path.write_text(f"1\n00:00:01,000 --> 00:00:03,000\n{text}\n", encoding="utf-8")
+    return path
+
+
+def test_a_directory_of_subtitles_is_a_batch(tmp_path):
+    """整季字幕一次翻完——目录里一个视频都没有也照样成立。"""
+    for n in ("ep01.en.srt", "ep02.en.srt", "ep03.en.srt"):
+        _srt(tmp_path / n)
+
+    scan = scan_media(tmp_path, target_language="简体中文")
+    assert [f.name for f in scan.to_translate] == [
+        "ep01.en.srt", "ep02.en.srt", "ep03.en.srt"]
+    assert not scan.skipped and not scan.replaced
+
+
+def test_a_subtitle_takes_the_place_of_its_film(tmp_path):
+    """有现成字幕就翻它：十几秒读完、不占 GPU。代价（拿不到内嵌视频、不走
+    语音识别）由 replaced 说出来，调用方必须转达。"""
+    (tmp_path / "film.mkv").write_bytes(b"x")
+    _srt(tmp_path / "film.en.srt")
+
+    scan = scan_media(tmp_path, target_language="简体中文")
+    assert [f.name for f in scan.to_translate] == ["film.en.srt"]
+    assert [f.name for f in scan.replaced] == ["film.mkv"]
+    assert not scan.shadowed          # 它不是「让路」，是被顶替
+
+
+def test_only_one_subtitle_per_film_is_translated(tmp_path):
+    """同一部片旁边好几种语言时只翻一份，且可以用「字幕轨语言」指定哪一份。"""
+    _srt(tmp_path / "film.en.srt")
+    _srt(tmp_path / "film.fr.srt", "Bonjour")
+
+    both = scan_media(tmp_path, target_language="简体中文")
+    assert [f.name for f in both.to_translate] == ["film.en.srt"]   # 按名字
+
+    picked = scan_media(tmp_path, target_language="简体中文", prefer_language="fre")
+    assert [f.name for f in picked.to_translate] == ["film.fr.srt"]
+
+
+def test_a_text_subtitle_beats_a_graphic_one(tmp_path):
+    """OCR 要按分钟计，而文字是免费且精确的——与 pick_track 同一条排序。"""
+    _srt(tmp_path / "film.en.srt")
+    (tmp_path / "film.sup").write_bytes(b"PG")
+
+    scan = scan_media(tmp_path, target_language="简体中文")
+    assert [f.name for f in scan.to_translate] == ["film.en.srt"]
+
+
+def test_a_vobsub_pair_is_one_job_not_two(tmp_path):
+    """.idx + .sub 是一对，两个都算就会有两个任务去写同一份产物。"""
+    (tmp_path / "film.idx").write_text("# VobSub index file\n", encoding="utf-8")
+    (tmp_path / "film.sub").write_bytes(b"\x00" * 16)
+
+    scan = scan_media(tmp_path, target_language="简体中文")
+    assert [f.name for f in scan.to_translate] == ["film.idx"]
+
+
+def test_a_finished_pair_of_subtitles_is_not_translated_again(tmp_path):
+    """翻完之后再扫一次，源和产物都在那儿——这一组已经做完了。"""
+    _srt(tmp_path / "film.en.srt")
+    _srt(tmp_path / "film.zh.srt", "你好啊")
+
+    scan = scan_media(tmp_path, target_language="简体中文")
+    assert not scan.to_translate
+    assert [f.name for f in scan.skipped] == ["film.en.srt"]
+
+
+def test_a_stepped_aside_copy_is_never_picked_as_a_source(tmp_path):
+    """film.zh.2.srt 是防覆盖留下的副本，不是原料也不是成品。"""
+    _srt(tmp_path / "film.zh.2.srt", "你好啊")
+
+    scan = scan_media(tmp_path, target_language="简体中文")
+    assert not scan.to_translate and not scan.skipped
 
 
 def test_batch_endpoints(tmp_path):

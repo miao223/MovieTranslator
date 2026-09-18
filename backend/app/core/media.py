@@ -6,7 +6,7 @@ import glob
 import re
 
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
@@ -81,29 +81,80 @@ def probe_kind(path: str | Path) -> str:
     return "video" if audio.has_picture(path) else "audio"
 
 
+class ScanResult(NamedTuple):
+    """What a directory holds, once每部片只留一个翻译对象。
+
+    *skipped* 已经译成目标语言了（读文件判的，不是看名字）。*shadowed* 是同一
+    部片里让开的其它文件（音频让给视频）。*replaced* 是**被同名字幕顶替掉的
+    视频/音频**——单独列出来是因为它要说的话完全不同：更快了，但这一批不会
+    产出内嵌视频、也不会用语音识别。*with_source* 仍是「有外语字幕可当原料」
+    的那些，只报告不替人做主。
+    """
+
+    to_translate: List[Path]
+    skipped: List[Path]
+    shadowed: List[Path]
+    with_source: List[Path]
+    replaced: List[Path]
+
+
+# 让路留下的副本（film.zh.2.srt）不是成品，也不该被当成下一次的原料
+_STEPPED_ASIDE = re.compile(
+    r"\.(?:[a-z]{2,3}|orig)(?:-(?:[a-z]{2,3}|orig))?\.\d+$", re.IGNORECASE)
+
+# 同一组里挑哪一份字幕当原文：文字快而准，图形要 OCR，按分钟计
+_FORMAT_ORDER = (".ass", ".ssa", ".srt", ".vtt", ".sub", ".sup", ".idx")
+
+
+def _group_key(path: Path, media_stems: set[str]) -> str:
+    """这个文件说的是哪部片。
+
+    字幕要认领到它伺候的那部片上：film.mkv 旁边的 film.backup.srt 属于
+    film，而不是自成一部叫「film.backup」的片子——否则它会被当成一份独立
+    字幕翻译，而它只是别人的备份。
+    """
+    stem = path.stem.lower()
+    if not is_subtitle_ext(path):
+        return stem
+    if stem in media_stems:
+        return stem
+    base = base_stem(path).lower()
+    if base in media_stems:
+        return base
+    owners = [m for m in media_stems if stem.startswith(m + ".")]
+    return max(owners, key=len) if owners else base
+
+
+def _usable_source(path: Path, key: str) -> bool:
+    """这份字幕能不能当这部片的原文。
+
+    名字必须正好是「这部片 + 一个语言后缀」：film.backup.srt 不是（backup
+    不是语言），film.zh.2.srt 更不是（那是防覆盖留下的副本）。
+    """
+    return (base_stem(path).lower() == key
+            and not _STEPPED_ASIDE.search(path.stem))
+
+
 def scan_media(
     directory: str | Path,
     recursive: bool = True,
     skip_existing_srt: bool = True,
     target_language: str = "",
-) -> Tuple[List[Path], List[Path], List[Path], List[Path]]:
-    """Find video and audio files under *directory*.
+    prefer_language: str = "",
+) -> ScanResult:
+    """Find everything under *directory* that can be translated.
 
-    Returns (to_translate, skipped, shadowed, with_source):
+    每个 (目录, 片名主干) 只产出一个翻译对象，组内优先级是
+    **字幕 > 视频 > 音频**：一份现成的字幕十几秒读完、不占 GPU，而且是人对着
+    画面敲的。代价是这一组拿不到内嵌视频、也不会走语音识别——所以被顶替的
+    那些单独装进 `replaced`，调用方必须说出来。
 
-    *skipped* are files already translated into *target_language*, decided
-    by reading the subtitle next to them rather than by its name (see
-    subtitle_state). *with_source* is the subset of to_translate that has a
-    subtitle in some **other** language — those can be translated from that
-    text instead of from speech, which is faster and more accurate. They
-    are reported, never acted on: which source to use is the user's call.
+    音频让给同名视频是这条规则的一个特例（两者会写出同一份字幕，有画面的赢）。
 
-    Without a *target_language* the old rule applies and any subtitle
-    counts as done, because there is nothing to compare against. *shadowed* are audio files dropped because a video
-    of the same stem sits in the same folder — both would write the same .srt,
-    so the one with the picture wins and the audio (usually extracted from it)
-    steps aside. Hidden directories/files (dot-prefixed) are ignored.
+    Hidden directories/files (dot-prefixed) are ignored.
     """
+    from app.services.audio import canon_language
+
     root = Path(directory)
     if not root.is_dir():
         raise NotADirectoryError(f"不是有效目录: {directory}")
@@ -111,7 +162,7 @@ def scan_media(
     files: List[Path] = []
     pattern = "**/*" if recursive else "*"
     for p in root.glob(pattern):
-        if not p.is_file() or p.suffix.lower() not in MEDIA_EXTS:
+        if not p.is_file() or p.suffix.lower() not in SOURCE_EXTS:
             continue
         rel = p.relative_to(root)
         if any(part.startswith(".") for part in rel.parts):
@@ -119,24 +170,60 @@ def scan_media(
         files.append(p)
     files.sort()
 
-    # done before the .srt check: were it after, a video whose subtitle already
-    # exists would be skipped and its audio twin would live on to overwrite it
-    stems = {(p.parent, p.stem.lower()) for p in files if not is_audio_ext(p)}
-    shadowed = [p for p in files if is_audio_ext(p) and (p.parent, p.stem.lower()) in stems]
-    if shadowed:
-        dropped = set(shadowed)
-        files = [p for p in files if p not in dropped]
+    # VobSub 的 .idx + .sub 是一对，只留索引那一半，否则一对会变成两个任务
+    paired = {p.with_suffix(".sub") for p in files if p.suffix.lower() == ".idx"}
+    files = [p for p in files if p not in paired]
 
-    to_translate, skipped, with_source = [], [], []
-    for f in files:
-        state, _lang = subtitle_state(f.parent, f.stem, target_language)
-        if state == "done" and skip_existing_srt:
-            skipped.append(f)
+    groups: Dict[Tuple[Path, str], List[Path]] = {}
+    for parent in {p.parent for p in files}:
+        stems = {p.stem.lower() for p in files
+                 if p.parent == parent and not is_subtitle_ext(p)}
+        for p in (f for f in files if f.parent == parent):
+            groups.setdefault((parent, _group_key(p, stems)), []).append(p)
+
+    to_translate, skipped, shadowed, with_source, replaced = [], [], [], [], []
+    known: Dict[Tuple[Path, str], tuple[str, str]] = {}
+    for (parent, key), members in groups.items():
+        subs = [m for m in members
+                if is_subtitle_ext(m) and _usable_source(m, key)]
+        videos = [m for m in members if kind_of(m) == "video"]
+        audios = [m for m in members if kind_of(m) == "audio"]
+        if not (subs or videos or audios):
+            # 这一组里一个能用的都没有——只有让路留下的副本，或者别人的备份。
+            # 既不是待翻译的，也不是「已完成」的证据，索性当它不存在。
             continue
-        to_translate.append(f)
-        if state == "source":
-            with_source.append(f)
-    return to_translate, skipped, shadowed, with_source
+        if (parent, key) not in known:
+            known[(parent, key)] = subtitle_state(parent, key, target_language)
+        state, _lang = known[(parent, key)]
+
+        wanted = canon_language(prefer_language) if prefer_language else ""
+        subs.sort(key=lambda m: (
+            m.suffix.lower() in SUBTITLE_GRAPHIC_EXTS,
+            bool(wanted) and canon_language(split_language_tag(m)[1]) != wanted,
+            _FORMAT_ORDER.index(m.suffix.lower())
+            if m.suffix.lower() in _FORMAT_ORDER else len(_FORMAT_ORDER),
+            m.name,
+        ))
+        rest = videos + audios
+        if state == "done" and skip_existing_srt:
+            # 报告的代表仍是片子本身：用户认的是片子，不是它旁边那份字幕
+            first = (videos or audios or subs)[0]
+            skipped.append(first)
+            shadowed.extend(m for m in rest if m is not first)
+            continue
+        pick = (subs or videos or audios)[0]
+        to_translate.append(pick)
+        if subs and rest:
+            replaced.extend(rest)          # 被字幕顶替掉的视频/音频
+        else:
+            shadowed.extend(m for m in rest if m is not pick)
+        if state == "source" and not is_subtitle_ext(pick):
+            with_source.append(pick)
+
+    order = {p: n for n, p in enumerate(files)}
+    for group in (to_translate, skipped, shadowed, with_source, replaced):
+        group.sort(key=lambda p: order.get(p, 0))
+    return ScanResult(to_translate, skipped, shadowed, with_source, replaced)
 
 
 # A language suffix as this program writes it: two or three letters (which
