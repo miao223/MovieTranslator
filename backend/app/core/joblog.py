@@ -227,7 +227,7 @@ class JobLogWriter:
         except Exception as exc:  # noqa: BLE001
             self.section("媒体信息", [f"（探测失败: {exc}）"])
 
-    def write_request(self, request, audio_only: bool = False) -> None:
+    def write_request(self, request, source_kind: str = "video") -> None:
         if request.text_source == "subtitle":
             # explains a job that never loads a model or touches the audio
             source = "片源已有的字幕（跳过语音识别）"
@@ -241,15 +241,16 @@ class JobLogWriter:
                 source += "（读不到则改用语音识别）"
         else:
             source = "语音识别"
-        if request.embed_subtitle and audio_only:
-            output = "独立字幕文件（纯音频片源，已忽略「合成新视频」）"
+        no_picture = {"audio": "纯音频片源", "subtitle": "字幕文件"}.get(source_kind, "")
+        if request.embed_subtitle and no_picture:
+            output = f"独立字幕文件（{no_picture}，已忽略「合成新视频」）"
         elif request.embed_subtitle:
             output = _embed_summary(request)
         else:
             output = "独立字幕文件"
         frames = f"{len(request.frame_tasks)} 条"
-        if request.frame_tasks and audio_only:
-            frames += "（纯音频片源，已跳过）"
+        if request.frame_tasks and no_picture:
+            frames += f"（{no_picture}，已跳过）"
         elif request.frame_only:
             frames += "（仅补充模式）"
         self.section("任务参数", [

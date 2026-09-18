@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
-from app.core import config
+from app.core import config, media
 from app.core.cache import (
     checkpoint_dir, checkpoints_enabled, job_dir, prune_checkpoints)
 from app.core.debuglog import DebugLog, open_debug_log
@@ -115,6 +115,11 @@ def checkpoint_key(job: Job, settings: AppSettings) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+# 「这个源没有画面」有两种，降级的动作完全一样，说法必须不一样：用户看到
+# 「纯音频片源」却明明选的是一份 .srt，只会以为程序拿错了文件。
+NO_PICTURE = {"audio": "纯音频片源", "subtitle": "字幕文件"}
+
+
 def _settings_for(job: Job) -> AppSettings:
     """The settings this job runs with: its own snapshot, or the live ones.
 
@@ -133,7 +138,8 @@ def _settings_for(job: Job) -> AppSettings:
 
 class Job:
     def __init__(self, request: JobRequest, audio_only: Optional[bool] = None,
-                 settings: Optional[AppSettings] = None):
+                 settings: Optional[AppSettings] = None,
+                 source_kind: str = ""):
         self.id = uuid.uuid4().hex[:12]
         self.request = request
         # A source with no picture cannot be muxed into a video and has no
@@ -141,9 +147,13 @@ class Job:
         # JobManager.create so that a Job built directly (as the tests do)
         # answers the question correctly too; create passes its own probe in
         # so the container is opened once per job, not twice.
+        # 'video' / 'audio' / 'subtitle' —— 这个任务实际在读什么。create 把
+        # 自己那次探测传进来，好让一个任务只开一次文件。
+        self.source_kind = source_kind or media.probe_kind(request.video_path)
+        # 下面每一处守卫问的其实都是「有没有画面」，字幕文件与纯音频同答
         self.audio_only = (
             audio_only if audio_only is not None
-            else not audio.has_picture(request.video_path)
+            else self.source_kind != "video"
         )
         # Frozen settings, or None for "read them live when you start".
         # A Job field and deliberately not a JobRequest field, for the same
@@ -158,6 +168,14 @@ class Job:
         self.events: List[ProgressEvent] = []
         self.subscribers: List[queue.Queue] = []
         self.lock = threading.Lock()
+        # 产物名的主干：视频/音频是它自己的 stem，字幕文件则剥掉语言后缀
+        # （film.en.srt 的产物是 film.zh.srt，不是 film.en.zh.srt）。与
+        # audio_only 同理在这里算，好让直接构造出来的 Job 也答得对。
+        self.stem = (
+            media.base_stem(request.video_path)
+            if self.source_kind == "subtitle"
+            else Path(request.video_path).stem
+        )
         self.srt_path: Optional[Path] = None
         # 双文件模式的另一半（原文）。其余模式恒为空表，所以结果那一串管道
         # （srt_filename / result_srt / 下载按钮）照旧只认 srt_path。
@@ -242,12 +260,16 @@ class JobManager:
         video = Path(request.video_path)
         if not video.is_file():
             raise FileNotFoundError(f"片源文件不存在: {video}")
-        audio_only = not audio.has_picture(video)
+        kind = media.probe_kind(video)
+        audio_only = kind != "video"
         if request.frame_only and audio_only:
-            # embed_subtitle degrades quietly on an audio source, but frame
-            # translation IS the whole output here — running it would mean
-            # producing nothing at all.
-            raise ValueError("纯音频片源没有画面，无法使用「仅补充画面翻译」")
+            # embed_subtitle degrades quietly on a source with no picture, but
+            # frame translation IS the whole output here — running it would
+            # mean producing nothing at all. On a subtitle source it is worse
+            # than nothing: _execute_frame_only rewrites the same-stem
+            # subtitle in place, and that file is the source itself.
+            raise ValueError(
+                f"{NO_PICTURE[kind]}没有画面，无法使用「仅补充画面翻译」")
         # audio sources never reach the encoder (see _embed_subtitle), so the
         # check below must not reject them before that degradation happens
         if (request.embed_subtitle and not audio_only
@@ -261,7 +283,8 @@ class JobManager:
                     f"本机无法使用编码器 {request.embed.video_codec}。"
                     f"可用的有：{'、'.join(sorted(usable)) or '（无）'}"
                 )
-        job = Job(request, audio_only=audio_only, settings=settings)
+        job = Job(request, audio_only=audio_only, settings=settings,
+                  source_kind=kind)
         self._evict_old()
         self.jobs[job.id] = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
@@ -422,7 +445,8 @@ class JobManager:
         if job.audio_only:
             job.publish(
                 "translating", 94,
-                log=f"⚠ 纯音频片源没有画面，已跳过 {len(req.frame_tasks)} 条画面翻译"
+                log=f"⚠ {NO_PICTURE[job.source_kind]}没有画面，"
+                    f"已跳过 {len(req.frame_tasks)} 条画面翻译"
                     "（不影响字幕生成）",
             )
             return []
@@ -575,7 +599,7 @@ class JobManager:
     def _write_diagnostics(self, job: Job, req: JobRequest, settings) -> None:
         """Header that lets one log file explain a failure on its own."""
         job.logfile.write_environment()
-        job.logfile.write_request(req, audio_only=job.audio_only)
+        job.logfile.write_request(req, source_kind=job.source_kind)
         job.logfile.write_settings(settings)
         job.logfile.write_media(req.video_path)
         job.logfile.section("进度", [])
@@ -588,13 +612,14 @@ class JobManager:
             # learn an hour later that there was never going to be one
             job.publish(
                 "extracting", 0,
-                log="⚠ 纯音频片源没有画面，本次将忽略「合成带字幕的新视频」，"
+                log=f"⚠ {NO_PICTURE[job.source_kind]}没有画面，本次将忽略「合成带字幕的新视频」，"
                     "改为在音频所在目录生成字幕文件",
             )
         if job.audio_only and req.frame_tasks:
             job.publish(
                 "extracting", 0,
-                log=f"⚠ 纯音频片源没有画面，将跳过 {len(req.frame_tasks)} 条画面翻译",
+                log=f"⚠ {NO_PICTURE[job.source_kind]}没有画面，"
+                    f"将跳过 {len(req.frame_tasks)} 条画面翻译",
             )
         if req.frame_only:
             self._execute_frame_only(job, req, workdir)
@@ -608,8 +633,11 @@ class JobManager:
         # deep diagnostics: written next to the subtitle we are about to
         # produce, so the user finds it without hunting for a cache dir
         video = Path(req.video_path)
+        # 这个路径只是 .debug.log 的锚点（debug_path_for 只取 with_suffix），
+        # 不是产物名——但用主干算，否则 film.en.srt 的日志叫 film.en.debug.log，
+        # 而且那个锚点路径正好就是源文件本身
         debug = open_debug_log(
-            video.parent / f"{video.stem}.srt", workdir, settings.debug_mode
+            video.parent / f"{job.stem}.srt", workdir, settings.debug_mode
         )
         if debug.enabled:
             job.publish(
@@ -635,7 +663,15 @@ class JobManager:
         segments = None  # whisper's raw output, for the lyric cross-check
         vet_usage = {"calls": 0, "prompt": 0, "completion": 0, "cached": 0}
         source_kind = "asr"
-        if req.text_source == "subtitle":
+        if job.source_kind == "subtitle" and req.text_source != "subtitle":
+            # 源就是一份字幕文件，没有音频可以识别。不是拒绝而是改道：批量
+            # 目录里字幕优先于同名视频，而「原文来源」是整批共用的一个开关，
+            # 为个别文件停下整批不值得——但必须说出来。
+            job.publish(
+                "importing", 0,
+                log="⚠ 片源是字幕文件，「原文来源＝语音识别」不适用，已改为直接读取它",
+            )
+        if req.text_source == "subtitle" or job.source_kind == "subtitle":
             got = self._import_subtitle(job, req, settings, debug)
             if got is not None:
                 lines, detected, source_kind = got
@@ -737,15 +773,24 @@ class JobManager:
         """
         job.publish("importing", 0, message="读取已有字幕…")
         try:
-            tracks = subsource.all_tracks(req.video_path)
+            if job.source_kind == "subtitle":
+                # 源自己就是那条轨。绝不能走 all_tracks：av.open("film.srt")
+                # 本身就是个只有字幕流的容器，而同名判断又会把这个文件当成
+                # 它自己的旁挂，同一份文件会被列两次。
+                tracks = [subsource.file_track(req.video_path)]
+            else:
+                tracks = subsource.all_tracks(req.video_path)
             if tracks:
                 job.publish(
                     "importing", 0,
                     log=f"检测到 {len(tracks)} 条可用字幕：\n"
                         + "\n".join("  " + subsource.describe_track(t) for t in tracks),
                 )
-            track = subsource.pick_track(
-                tracks, req.subtitle_track, req.subtitle_file, req.subtitle_language
+            track = (
+                tracks[0] if job.source_kind == "subtitle"
+                else subsource.pick_track(
+                    tracks, req.subtitle_track, req.subtitle_file,
+                    req.subtitle_language)
             )
             stats: dict = {}
             # Remembered so the output cannot be written over its own source.
@@ -765,7 +810,10 @@ class JobManager:
         except InterruptedError:
             raise
         except Exception as exc:  # noqa: BLE001 — the message is the point
-            if not req.subtitle_fallback_asr:
+            if not req.subtitle_fallback_asr or job.source_kind == "subtitle":
+                # 退回语音识别的前提是还有音频可听。源就是字幕文件时那条路
+                # 只会在 audio.list_tracks 里死于「视频中没有音频流」，把真正
+                # 的原因（这份字幕读不出来）埋掉。
                 raise
             job.publish(
                 "importing", 0,
@@ -807,8 +855,7 @@ class JobManager:
                 debug.kv("已标记歌词", stats.get("lyric", 0))
                 debug.kv("时间轴位移", f"{stats.get('offset', 0.0):.2f}s")
             debug.line("\n全部字幕轨：")
-            debug.lines("  " + subsource.describe_track(t)
-                        for t in subsource.all_tracks(req.video_path))
+            debug.lines("  " + subsource.describe_track(t) for t in tracks)
             debug.line("\n前 20 条：")
             debug.lines(
                 f"[{l.index:4d}] {l.start:8.2f} → {l.end:8.2f} | {l.text}"
@@ -1190,7 +1237,7 @@ class JobManager:
         written: List[Path] = []
         in_place = True
         for product, text in zip(products, texts):
-            target, taken = output_target(video, product.sidecar, ext)
+            target, taken = output_target(video, product.sidecar, ext, job.stem)
             if taken is not None:
                 whose = ("正是本次读取的原文"
                          if job.source_subtitle
@@ -1205,7 +1252,7 @@ class JobManager:
             except OSError as exc:
                 # video dir not writable (read-only share etc.): keep it in the
                 # work dir and let the UI offer a download instead
-                target = workdir / f"{video.stem}{product.sidecar}{ext}"
+                target = workdir / f"{job.stem}{product.sidecar}{ext}"
                 target.write_text(text, encoding="utf-8")
                 in_place = False
                 job.publish(
@@ -1244,13 +1291,14 @@ class JobManager:
         if job.audio_only:
             job.publish(
                 "composing", 95,
-                log="⚠ 纯音频片源没有画面，无法合成带字幕的视频，已改为生成字幕文件",
+                log=f"⚠ {NO_PICTURE[job.source_kind]}没有画面，"
+                    "无法合成带字幕的视频，已改为生成字幕文件",
             )
             return None
         # 与 _finish 算的必须是同一个名字，所以 layout 一路跟到这里
         sidecar, suffix, lang, title = _naming(req, detected, layout)
         # 工作目录里这一份也带后缀：它就是「下载字幕」按钮吐给用户的文件名
-        job.srt_path = workdir / f"{video.stem}{sidecar}{ext}"
+        job.srt_path = workdir / f"{job.stem}{sidecar}{ext}"
         job.srt_path.write_text(srt_text, encoding="utf-8")
         job.status.srt_in_place = False
         # 这两份不经过 output_target（工作目录里撞不上片源的旁挂字幕），但它们
@@ -1258,7 +1306,7 @@ class JobManager:
         job.extra_srt_paths = []
         tracks: List[Tuple[Path, str, str]] = []
         for product, text in extra:
-            path = workdir / f"{video.stem}{product.sidecar}{ext}"
+            path = workdir / f"{job.stem}{product.sidecar}{ext}"
             path.write_text(text, encoding="utf-8")
             job.extra_srt_paths.append(path)
             tracks.append((path, product.track_title, product.track_language))
@@ -1392,7 +1440,8 @@ def _preprocess_usage(vet_usage: dict, lyrics_usage: dict, refine_usage: dict) -
     )
 
 
-def output_target(video: Path, sidecar: str, ext: str) -> tuple[Path, Optional[Path]]:
+def output_target(video: Path, sidecar: str, ext: str,
+                  stem: str = "") -> tuple[Path, Optional[Path]]:
     """Where the subtitle goes, and the name it had to give up (None if free).
 
     本程序**绝不覆盖片源目录里任何已经存在的文件**——不是它自己读进来的那份
@@ -1402,7 +1451,7 @@ def output_target(video: Path, sidecar: str, ext: str) -> tuple[Path, Optional[P
 
     让路是常态而不是异常：重跑同一部片必然撞上上一次的产物。调用方据此措辞。
     """
-    wanted = video.parent / f"{video.stem}{sidecar}{ext}"
+    wanted = video.parent / f"{stem or video.stem}{sidecar}{ext}"
     free = mux.free_path(wanted)
     return free, None if free == wanted else wanted
 

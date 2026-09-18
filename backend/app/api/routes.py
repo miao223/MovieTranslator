@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.core import config, joblog, server
 from app.core.cache import job_dir
 from app.core.auth import MCP_PREFIX
-from app.core.media import MEDIA_EXTS, kind_of, scan_media
+from app.core.media import SOURCE_EXTS, kind_of, scan_media
 from app.models.schemas import (
     AppSettings,
     AudioTrack,
@@ -776,8 +776,11 @@ def fs_resolve(path: str):
         return {
             "type": "file",
             "path": str(p),
-            "is_media": p.suffix.lower() in MEDIA_EXTS,
+            "is_media": p.suffix.lower() in SOURCE_EXTS,
             "is_audio": kind_of(p) == "audio",
+            # 字幕文件也能当翻译对象。前端据此隐藏音轨/原文来源、置灰内嵌，
+            # 页面不自己抄一份后缀表——它只问这里。
+            "is_subtitle": kind_of(p) == "subtitle",
         }
     return {"type": "missing", "path": raw}
 
@@ -827,7 +830,7 @@ def fs_browse(path: str = ""):
             try:
                 if entry.is_dir():
                     dirs.append(entry.name)
-                elif entry.suffix.lower() in MEDIA_EXTS:
+                elif entry.suffix.lower() in SOURCE_EXTS:
                     files.append({
                         "name": entry.name,
                         "size": entry.stat().st_size,

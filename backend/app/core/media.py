@@ -26,19 +26,59 @@ AUDIO_EXTS = {
 
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 
+# A subtitle can be the job's source all by itself — the film is often
+# somewhere else. The text ones are read directly; the graphic ones hold
+# pictures of words and go through OCR, exactly as a graphic track inside a
+# video does. `.sub` is in both worlds: MicroDVD/SubViewer store text under
+# that name, while VobSub uses it for the binary half of an .idx/.sub pair —
+# which of the two it is cannot be decided here (see subsource.file_track).
+SUBTITLE_TEXT_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
+SUBTITLE_GRAPHIC_EXTS = {".sup", ".idx"}
+SUBTITLE_EXTS = SUBTITLE_TEXT_EXTS | SUBTITLE_GRAPHIC_EXTS
+
+# Everything this program will accept as a source. MEDIA_EXTS keeps meaning
+# "has a soundtrack"; this is the wider table the file picker and the scan ask.
+SOURCE_EXTS = MEDIA_EXTS | SUBTITLE_EXTS
+
 
 def is_audio_ext(path: str | Path) -> bool:
     return Path(path).suffix.lower() in AUDIO_EXTS
 
 
+def is_subtitle_ext(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in SUBTITLE_EXTS
+
+
 def kind_of(path: str | Path) -> str:
-    """'video' / 'audio' / '' — what the file picker labels an entry with."""
+    """'video' / 'audio' / 'subtitle' / '' — what the picker labels an entry."""
     ext = Path(path).suffix.lower()
     if ext in VIDEO_EXTS:
         return "video"
     if ext in AUDIO_EXTS:
         return "audio"
+    if ext in SUBTITLE_EXTS:
+        return "subtitle"
     return ""
+
+
+def probe_kind(path: str | Path) -> str:
+    """What this job is really reading: 'video' / 'audio' / 'subtitle'.
+
+    The suffix decides the subtitle case and deliberately gets the first
+    word, against this project's usual "the suffix lists, PyAV decides"
+    rule. The reason is that the probe cannot be trusted here:
+    audio.has_picture answers `not is_audio_ext(path)` — i.e. True, "this
+    is a film" — for anything it fails to open, and subtitles fail to open
+    routinely. ffmpeg's MicroDVD prober needs three cue lines, so a short
+    .sub is unreadable; so is a .idx whose .sub is missing. Calling those a
+    film would arm the encoder check and let frame_only through, which is
+    the one path that rewrites an existing subtitle in place.
+    """
+    from app.services import audio
+
+    if is_subtitle_ext(path):
+        return "subtitle"
+    return "video" if audio.has_picture(path) else "audio"
 
 
 def scan_media(

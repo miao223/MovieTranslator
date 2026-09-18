@@ -44,6 +44,7 @@ from typing import Callable, List, Optional
 
 import av
 
+from app.core import media
 from app.models.schemas import SubtitleLine
 from app.services import lyrics, mux
 from app.services.asr import has_content
@@ -142,6 +143,65 @@ def sidecar_tracks(video_path: str | Path) -> list[dict]:
             "text": path.suffix.lower() not in GRAPHIC_SUFFIXES,
         })
     return found
+
+
+def vobsub_index(path: Path) -> Optional[Path]:
+    """The .idx that opens this .sub, if there is one.
+
+    VobSub is a pair: the .idx is a text index of timestamps and offsets, the
+    .sub the binary it points into — and ffmpeg registers the demuxer on the
+    **index** (ContainerFormat('vobsub').extensions == {'idx'}). So a user who
+    picks film.sub has to be redirected to film.idx, while a .sub with no such
+    sibling is one of the text formats that share the extension (MicroDVD,
+    SubViewer) and opens as itself.
+    """
+    if path.suffix.lower() != ".sub":
+        return None
+    return next((c for c in (path.with_suffix(".idx"), path.with_suffix(".IDX"))
+                 if c.is_file()), None)
+
+
+def file_track(path: str | Path) -> dict:
+    """A track dict for a subtitle file that IS the source, not a sidecar.
+
+    Deliberately not all_tracks(): given a bare film.srt that answers twice —
+    once as stream 0 of the container av.open() makes of it, once as its own
+    sidecar, because the sibling test matches the file against itself. The
+    two copies disagree about `path`, and that field is what decides whether
+    read_cues subtracts a start offset.
+
+    Text or graphic is settled by the codec, never by the suffix: .sub is
+    both worlds at once, and .sup/.idx are only conventions.
+    """
+    path = Path(path)
+    source = vobsub_index(path) or path
+    try:
+        with av.open(str(source)) as container:
+            streams = container.streams.subtitles
+            if not streams:
+                raise ValueError(f"{path.name} 里没有字幕流")
+            info = _track_info(streams[0])
+    except av.FFmpegError as exc:
+        if path.suffix.lower() == ".sub":
+            raise ValueError(
+                f"{path.name} 读不出来。VobSub 是 .idx + .sub 一对，"
+                f"请把 {path.stem}.idx 放在同一目录（或直接选那个 .idx）"
+            ) from exc
+        raise ValueError(f"{path.name} 读不出来：{exc}") from exc
+
+    # path set => read_cues/bitmap_cues open this file and take its times as
+    # they are, which is what a standalone subtitle's times already are
+    info["path"] = str(source)
+    info["title"] = source.name
+    tag = media.split_language_tag(path)[1]
+    code = canon_language(tag)
+    # `sdh`, `hdr`, `web` all pass the suffix rule; only a tag we can name is
+    # a language. Getting this wrong would label the file's language wrongly,
+    # which decides the output's name.
+    named = bool(tag) and language_name(code) != code
+    info["language"] = code if named else ""
+    info["language_name"] = language_name(code) if named else "未标注语言"
+    return info
 
 
 def all_tracks(video_path: str | Path) -> list[dict]:
