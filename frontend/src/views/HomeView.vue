@@ -371,24 +371,30 @@ const targetSuffix = computed(() => {
   if (LANG_SUFFIX[name]) return LANG_SUFFIX[name]
   return /^[a-zA-Z]{2,3}$/.test(name) ? name.toLowerCase() : 'sub'
 })
-// 纯原文的产物按片子自己的语言命名；选了自动检测就要等识别完才知道，
-// 所以给一个明摆着是占位的写法，而不是拿目标语言冒充
-const langSuffix = computed(() => {
-  if (!isOriginalOnly.value) return targetSuffix.value
-  return form.source_language === 'auto' ? '源语言' : form.source_language
-})
+// 选了自动检测就要等识别完才知道源语言，所以给一个明摆着是占位的写法，
+// 而不是拿目标语言冒充
+const sourceSuffix = computed(() =>
+  form.source_language === 'auto' ? '源语言' : form.source_language)
 const stemExample = computed(() =>
   mode.value === 'single' && form.video_path
     ? baseName(form.video_path).replace(/\.[^.]+$/, '')
     : '片名')
-const embedExample = computed(() => `${stemExample.value}.${langSuffix.value}.${form.embed.container}`)
-// 译文字幕一直与片源同名；纯原文带后缀，才不会覆盖同目录已有的那一份
-const sidecarExample = computed(() => `${stemExample.value}.${langSuffix.value}.srt`)
-// 双语分离的两份：译文按目标语言、原文按源语言。选了自动检测就要等识别完才
-// 知道，所以给一个明摆着是占位的写法，与纯原文一致
+// 内嵌视频永远按目标语言命名（纯原文除外）：它是「这部片的中文版」，不是一份字幕
+const videoSuffix = computed(() =>
+  isOriginalOnly.value ? sourceSuffix.value : targetSuffix.value)
+const embedExample = computed(() => `${stemExample.value}.${videoSuffix.value}.${form.embed.container}`)
+// 字幕的后缀就是文件里的内容：双语两个都写（顺序跟着「译文在上/在下」的设置，
+// 这里按默认的原文在上显示），纯译文写目标语言，纯原文写片子自己的语言
+const subtitleSuffix = computed(() => {
+  if (isOriginalOnly.value) return sourceSuffix.value
+  if (form.output_mode === 'bilingual') return `${sourceSuffix.value}-${targetSuffix.value}`
+  return targetSuffix.value
+})
+const sidecarExample = computed(() => `${stemExample.value}.${subtitleSuffix.value}.srt`)
+// 双语分离的两份：译文按目标语言、原文按源语言
 const splitExample = computed(() => [
   `${stemExample.value}.${targetSuffix.value}.srt`,
-  `${stemExample.value}.${form.source_language === 'auto' ? '源语言' : form.source_language}.srt`,
+  `${stemExample.value}.${sourceSuffix.value}.srt`,
 ])
 
 // Built once and used by both buttons. Keeping it in one place is the
@@ -813,12 +819,18 @@ onBeforeUnmount(() => {
           文件名会带上源语言后缀（<code>{{ sidecarExample }}</code>），
           不会覆盖同目录已有的译文字幕。
         </div>
+        <div v-if="form.output_mode === 'bilingual' || form.output_mode === 'translation_only'"
+             class="hint" style="margin: 4px 0 0; display: block">
+          产物是 <code>{{ sidecarExample }}</code
+          ><template v-if="form.output_mode === 'bilingual'">——双语把两个语言都写进名字，
+          顺序跟着「译文在上/在下」的设置</template>。<strong>每一份字幕都带语言后缀</strong>，
+          所以几种字幕形式的产物可以并排放在同一个目录里，谁也不会盖掉谁。
+        </div>
         <div v-if="isSplit" class="hint" style="margin: 4px 0 0; display: block">
           内容与双语相同，但原文和译文<strong>各写一个文件</strong>
           （<code>{{ splitExample[0] }}</code> 和 <code>{{ splitExample[1] }}</code>），
           播放器/媒体库里显示成两条可选字幕。<br>
-          注意这个模式下<strong>译文那一份也带语言后缀</strong>，不再是与片源同名的
-          <code>.srt</code>——另一半就在旁边，不加后缀两份会互相覆盖。
+          两份都带语言后缀，播放器按后缀认语言。
         </div>
       </el-form-item>
       <el-form-item label="输出形式">
@@ -862,7 +874,9 @@ onBeforeUnmount(() => {
             原视频不动。
           </template>
           <template v-else>
-            在视频所在目录生成同名的 .srt（开启「字幕样式」时为 .ass），原视频不动。
+            在视频所在目录生成 <code>{{ sidecarExample }}</code>（开启「字幕样式」时为 .ass），
+            原视频不动。<template v-if="form.output_mode === 'bilingual'">双语的后缀把两个语言
+            都写出来，<strong>哪一行在上就哪个在前</strong>（在「设置」页改「译文在上/在下」）。</template>
           </template>
         </div>
       </el-form-item>

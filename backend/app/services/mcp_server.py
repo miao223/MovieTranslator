@@ -240,9 +240,14 @@ def build() -> Optional["FastMCP"]:
             （片名.ja.srt，内嵌时 片名.ja.mkv，轨道标为该语言）。此时
             target_language 只作用于画面翻译，对白保持原文。
             bilingual_split 内容与 bilingual 相同，但写成两个单语文件
-            （片名.zh.srt + 片名.ja.srt，**译文这一份也带语言后缀**）；
-            内嵌时是一个视频里两条字幕轨，译文默认打开。原文那一份的路径在
-            get_job 的 original_subtitle_path 里。
+            （片名.zh.srt + 片名.ja.srt）；内嵌时是一个视频里两条字幕轨，
+            译文默认打开。原文那一份的路径在 get_job 的
+            original_subtitle_path 里。
+            **四种模式的字幕都带语言后缀，后缀就是文件里的内容**：双语两个
+            都写、屏幕上哪一行在上哪个就在前（片名.ja-zh.srt），纯译文写目标
+            语言，纯原文写源语言。片名.srt 这个名字不再产出。
+            同名文件已存在时产物带编号让路（片名.zh.2.srt）：本程序绝不覆盖
+            片源目录里任何已经存在的文件。
         audio_track: 音轨的容器序号，留空用默认音轨。
         audio_language: 按语言标签选音轨（如 jpn），仅在 audio_track 留空时生效。
         text_source: asr 走语音识别；subtitle 直接读片源已有的字幕，跳过识别——
@@ -323,7 +328,8 @@ def build() -> Optional["FastMCP"]:
         output_mode：同 translate_video，整批共用。original_only（纯原文）跳过
         AI 翻译，每个文件产出带源语言后缀的原文字幕（片名.ja.srt）；此时剧集模式
         不会积累新的译名表，因为没有译文。bilingual_split（双文件）每个文件产出
-        译文、原文各一份，两份都带语言后缀。
+        译文、原文各一份。四种模式的产物都带语言后缀，且绝不覆盖目录里已经存在
+        的文件——详见 translate_video。
 
         container / video_codec：同 translate_video，整批共用。
         embed_subtitle：同 translate_video——每个视频产出一个内嵌软字幕的新 mkv，

@@ -368,8 +368,10 @@ class JobRequest(BaseModel):
     # 跳过 LLM 翻译，但转写预处理 / 歌词识别 / 二次识别复核 / 图形字幕 OCR
     # 与校对一个都不少。target_language 在这个模式下只作用于画面翻译。
     # bilingual_split 内容与 bilingual 完全相同，只是写成两个单语字幕文件
-    # （片名.zh.srt + 片名.en.srt），播放器里当成两条可选字幕。**只有这一个
-    # 模式下译文也带语言后缀**：另一半就在旁边，不带后缀两份会互相覆盖。
+    # （片名.zh.srt + 片名.en.srt），播放器里当成两条可选字幕。
+    # 四种模式的产物都带语言后缀，后缀就是文件里的内容：双语两个都写、谁在
+    # 上面谁在前（片名.en-zh.srt），纯译文写目标语言，纯原文写片子自己的
+    # 语言。见 pipeline._naming。
     output_mode: Literal[
         "bilingual", "translation_only", "original_only", "bilingual_split"
     ] = "bilingual"
@@ -458,7 +460,8 @@ class JobStatus(BaseModel):
     srt_filename: str = ""  # full path of the generated SRT
     srt_in_place: bool = False  # True when saved next to the video
     # bilingual_split 的另一半（原文那一份）。其余模式恒为空串，所以界面只靠
-    # 这一个字段就能决定要不要显示第二个下载按钮。
+    # 这一个字段就能决定要不要显示第二个下载按钮。片源目录里已有同名文件时，
+    # 产物会带编号让路（片名.zh.2.srt）——本程序绝不覆盖用户的文件。
     original_srt_filename: str = ""
     # embed mode: the new video carrying the subtitle track. Empty otherwise,
     # so the UI can tell the two outcomes apart from this field alone.
