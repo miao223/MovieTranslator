@@ -45,13 +45,36 @@ _LANG_CANON = {
     "vi": "vie",
     "ar": "ara",
     "hi": "hin",
+    # 下面这些只在选音轨 / 认字幕轨标签时用得到，没有对应的识别示范句。
+    # 三字母一律收 639-2/B（chi / fre / ger 那一支），T 码当别名折进来。
+    "nl": "dut", "nld": "dut",
+    "pl": "pol",
+    "tr": "tur",
+    "sv": "swe",
+    "id": "ind",
+    "uk": "ukr",
+    "el": "gre", "ell": "gre",
+    "he": "heb",
+    "cs": "cze", "ces": "cze",
+    "ro": "rum", "ron": "rum",
+    "hu": "hun",
+    "fa": "per", "fas": "per",
+    "da": "dan",
+    "fi": "fin",
+    "no": "nor",
+    "ms": "may", "msa": "may",
 }
 
 _LANG_NAMES = {
     "jpn": "日语", "eng": "英语", "chi": "中文", "kor": "韩语",
     "fre": "法语", "ger": "德语", "spa": "西班牙语", "rus": "俄语",
     "ita": "意大利语", "por": "葡萄牙语", "tha": "泰语", "vie": "越南语",
-    "ara": "阿拉伯语", "hin": "印地语", "und": "未标注语言",
+    "ara": "阿拉伯语", "hin": "印地语",
+    "dut": "荷兰语", "pol": "波兰语", "tur": "土耳其语", "swe": "瑞典语",
+    "ind": "印尼语", "ukr": "乌克兰语", "gre": "希腊语", "heb": "希伯来语",
+    "cze": "捷克语", "rum": "罗马尼亚语", "hun": "匈牙利语", "per": "波斯语",
+    "dan": "丹麦语", "fin": "芬兰语", "nor": "挪威语", "may": "马来语",
+    "und": "未标注语言",
 }
 
 _CHANNEL_NAMES = {1: "单声道", 2: "立体声", 6: "5.1 声道", 8: "7.1 声道"}

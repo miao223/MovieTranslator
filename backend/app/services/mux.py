@@ -55,6 +55,12 @@ LANGUAGES = {
     "한국어": ("ko", "kor"),
     "Français": ("fr", "fre"),
     "Deutsch": ("de", "ger"),
+    "Português": ("pt", "por"),
+    "Italiano": ("it", "ita"),
+    "ไทย": ("th", "tha"),
+    "Tiếng Việt": ("vi", "vie"),
+    "العربية": ("ar", "ara"),
+    "हिन्दी": ("hi", "hin"),
 }
 FALLBACK = ("sub", "und")
 
@@ -116,7 +122,22 @@ _CRF_MAX = 51
 
 
 def language_of(target_language: str) -> tuple[str, str]:
-    return LANGUAGES.get(target_language.strip(), FALLBACK)
+    """(文件名后缀, 轨道 ISO-639-2/B 标签) —— 目标语言那一侧。
+
+    表里没有的语言也接受一个直接写下的语言代码：界面允许用户手输目标语言，
+    而 pt / nl 这种写法既是他想要的语言、也正好是这套后缀的形状。认不出来
+    才落到 FALLBACK —— 猜一个语言比承认不知道更糟，与 source_language_of
+    同一条规矩。
+    """
+    name = target_language.strip()
+    if name in LANGUAGES:
+        return LANGUAGES[name]
+    code = name.lower()
+    if 2 <= len(code) <= 3 and code.isalpha():
+        tag = audio.canon_language(code)
+        if audio.language_name(tag) != tag:     # 认得出名字才算认得这个代码
+            return code, tag
+    return FALLBACK
 
 
 def source_language_of(detected: str) -> tuple[str, str, str]:

@@ -16,9 +16,18 @@ const SOURCE_LANGS = [
   { value: 'es', label: '西班牙语' },
   { value: 'ru', label: '俄语' },
   { value: 'zh', label: '中文' },
+  { value: 'pt', label: '葡萄牙语' },
+  { value: 'it', label: '意大利语' },
+  { value: 'th', label: '泰语' },
+  { value: 'vi', label: '越南语' },
+  { value: 'ar', label: '阿拉伯语' },
+  { value: 'hi', label: '印地语' },
 ]
 
-const TARGET_LANGS = ['简体中文', '繁體中文', 'English', '日本語', '한국어', 'Français', 'Deutsch']
+const TARGET_LANGS = [
+  '简体中文', '繁體中文', 'English', '日本語', '한국어', 'Français', 'Deutsch',
+  'Português', 'Italiano', 'ไทย', 'Tiếng Việt', 'العربية', 'हिन्दी',
+]
 
 // batch mode picks tracks by language tag: stream indices differ per file
 const AUDIO_LANGS = [
@@ -31,6 +40,12 @@ const AUDIO_LANGS = [
   { value: 'ger', label: '德语音轨（ger）' },
   { value: 'spa', label: '西班牙语音轨（spa）' },
   { value: 'rus', label: '俄语音轨（rus）' },
+  { value: 'por', label: '葡萄牙语音轨（por）' },
+  { value: 'ita', label: '意大利语音轨（ita）' },
+  { value: 'tha', label: '泰语音轨（tha）' },
+  { value: 'vie', label: '越南语音轨（vie）' },
+  { value: 'ara', label: '阿拉伯语音轨（ara）' },
+  { value: 'hin', label: '印地语音轨（hin）' },
 ]
 
 const mode = ref('single') // 'single' | 'batch'
@@ -95,6 +110,8 @@ watch(() => form.embed_subtitle, (on) => {
 const LANG_SUFFIX = {
   简体中文: 'zh', 繁體中文: 'zh', English: 'en', 日本語: 'ja',
   한국어: 'ko', 'Français': 'fr', Deutsch: 'de',
+  'Português': 'pt', Italiano: 'it', 'ไทย': 'th',
+  'Tiếng Việt': 'vi', 'العربية': 'ar', 'हिन्दी': 'hi',
 }
 
 const batchForm = reactive({
@@ -117,6 +134,12 @@ const SUB_LANGS = [
   { value: 'ger', label: '德语字幕（ger）' },
   { value: 'spa', label: '西班牙语字幕（spa）' },
   { value: 'rus', label: '俄语字幕（rus）' },
+  { value: 'por', label: '葡萄牙语字幕（por）' },
+  { value: 'ita', label: '意大利语字幕（ita）' },
+  { value: 'tha', label: '泰语字幕（tha）' },
+  { value: 'vie', label: '越南语字幕（vie）' },
+  { value: 'ara', label: '阿拉伯语字幕（ara）' },
+  { value: 'hin', label: '印地语字幕（hin）' },
 ]
 
 // ------------------------------------------------------------ audio tracks
@@ -340,10 +363,17 @@ const running = () =>
 
 const isOriginalOnly = computed(() => form.output_mode === 'original_only')
 
+// mirrors mux.language_of: a language typed by hand is taken as a code when
+// it has that shape, and only then — 猜一个语言比承认不知道更糟
+const targetSuffix = computed(() => {
+  const name = (form.target_language || '').trim()
+  if (LANG_SUFFIX[name]) return LANG_SUFFIX[name]
+  return /^[a-zA-Z]{2,3}$/.test(name) ? name.toLowerCase() : 'sub'
+})
 // 纯原文的产物按片子自己的语言命名；选了自动检测就要等识别完才知道，
 // 所以给一个明摆着是占位的写法，而不是拿目标语言冒充
 const langSuffix = computed(() => {
-  if (!isOriginalOnly.value) return LANG_SUFFIX[form.target_language] || 'sub'
+  if (!isOriginalOnly.value) return targetSuffix.value
   return form.source_language === 'auto' ? '源语言' : form.source_language
 })
 const stemExample = computed(() =>
@@ -727,14 +757,28 @@ onBeforeUnmount(() => {
         </el-form-item>
       </template>
       <el-form-item label="音频语言">
-        <el-select v-model="form.source_language" style="width: 200px">
+        <!-- 名单不可能穷举 99 种语言，所以允许直接输入；值是语言代码，
+             填错的代码由语音识别自己报错（后端从不校验它） -->
+        <el-select
+          v-model="form.source_language"
+          style="width: 200px"
+          filterable
+          allow-create
+          default-first-option
+        >
           <el-option v-for="l in SOURCE_LANGS" :key="l.value" :value="l.value" :label="l.label" />
         </el-select>
-        <span class="hint">语音识别的源语言，不确定就选自动检测<template
-          v-if="isOriginalOnly">；纯原文模式下它还决定文件名的语言后缀（选自动检测则以识别结果为准，判不出来时用 <code>orig</code>）</template></span>
+        <span class="hint">语音识别的源语言，不确定就选自动检测；名单里没有的语种可直接填 ISO 代码（如 <code>nl</code>、<code>pl</code>、<code>tr</code>）<template
+          v-if="isOriginalOnly">。纯原文模式下它还决定文件名的语言后缀（选自动检测则以识别结果为准，判不出来时用 <code>orig</code>）</template></span>
       </el-form-item>
       <el-form-item label="目标语言">
-        <el-select v-model="form.target_language" style="width: 200px">
+        <el-select
+          v-model="form.target_language"
+          style="width: 200px"
+          filterable
+          allow-create
+          default-first-option
+        >
           <el-option v-for="l in TARGET_LANGS" :key="l" :value="l" :label="l" />
         </el-select>
         <span v-if="isOriginalOnly" class="hint">

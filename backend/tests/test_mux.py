@@ -96,14 +96,30 @@ def test_an_existing_file_is_never_overwritten(tmp_path):
     assert mux.output_path(tmp_path / "film.mkv", "简体中文").name == "film.zh.2.mkv"
 
 
+def test_a_target_language_typed_in_by_hand_is_still_understood(tmp_path):
+    """界面上的目标语言可以手输，所以名单外的值不等于「不知道」。
+
+    一个直接写下的语言代码既是他要的语言、又正好是这套后缀的形状，认下来
+    比退回 sub/und 有用得多；认不出的写法照旧退回，绝不猜。
+    """
+    assert mux.language_of("Português") == ("pt", "por")
+    assert mux.language_of("pt") == ("pt", "por")
+    assert mux.language_of("  NL  ") == ("nl", "dut")
+    assert mux.language_of("Esperanto") == mux.FALLBACK
+    assert mux.language_of("") == mux.FALLBACK
+    assert mux.output_path(tmp_path / "film.mkv", "Italiano").name == "film.it.mkv"
+
+
 def test_the_source_language_names_the_track_and_the_file():
     """纯原文的产物是片子自己的语言，那不在 LANGUAGES 那七个目标里。"""
     assert mux.source_language_of("ja") == ("ja", "jpn", "日语字幕")
     assert mux.source_language_of(" JA ") == ("ja", "jpn", "日语字幕")
     # 判不出来就说判不出来：标着 und 的轨道比标着 eng 的日语轨道有用得多
     assert mux.source_language_of("") == ("orig", "und", "原文字幕")
-    # 表外的语言仍然说真话，而不是退回一句「原文」
-    assert mux.source_language_of("sv") == ("sv", "sv", "sv字幕")
+    # 认得的语言给中文名，哪怕它不在「可选目标语言」那张表里
+    assert mux.source_language_of("sv") == ("sv", "swe", "瑞典语字幕")
+    # 彻底表外的语言仍然说真话，而不是退回一句「原文」
+    assert mux.source_language_of("cy") == ("cy", "cy", "cy字幕")
 
 
 def test_a_given_suffix_overrides_the_target_language(tmp_path):
