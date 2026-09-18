@@ -164,6 +164,7 @@ _OUTPUT_MODES = {
     "bilingual": "双语（原文 + 译文）",
     "translation_only": "纯译文",
     "original_only": "纯原文（不翻译对白，跳过 AI 翻译）",
+    "bilingual_split": "双文件（译文、原文各一个文件，都带语言后缀）",
 }
 
 class JobLogWriter:

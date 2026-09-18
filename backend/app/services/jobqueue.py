@@ -107,7 +107,7 @@ def describe(request: Optional[JobRequest]) -> str:
     if request is None:
         return ""
     modes = {"bilingual": "双语", "translation_only": "纯译文",
-             "original_only": "纯原文"}
+             "original_only": "纯原文", "bilingual_split": "双文件"}
     source = "片源字幕" if request.text_source == "subtitle" else "语音识别"
     src = request.source_language or "auto"
     parts = [f"{src} → {request.target_language}",
@@ -492,6 +492,7 @@ class QueueManager:
             entry.status = job.status.stage
             entry.error = job.status.error or ""
             entry.result_srt = job.status.srt_filename or ""
+            entry.result_srt_original = job.status.original_srt_filename or ""
             entry.result_video = job.status.video_filename or ""
             entry.result_in_place = bool(job.status.srt_in_place)
             entry.finished_at = time.time()

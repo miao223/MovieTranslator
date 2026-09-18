@@ -89,16 +89,26 @@ def job_events(job_id: str):
 
 
 @router.get("/jobs/{job_id}/result")
-def job_result(job_id: str):
+def job_result(job_id: str, part: str = "translation"):
+    """这个任务的字幕。part="original" 取双文件模式的原文那一份。
+
+    缺省值就是改动前的行为，所以既有的下载链接一个字都没变。
+    """
     try:
         job = manager.get(job_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status.stage != "done" or not job.srt_path:
         raise HTTPException(status_code=409, detail="任务尚未完成")
-    return FileResponse(
-        job.srt_path, media_type="text/plain", filename=job.srt_path.name
-    )
+    if part == "translation":
+        path = Path(job.srt_path)
+    elif part == "original":
+        path = Path(job.status.original_srt_filename or "")
+        if not path.name:
+            raise HTTPException(status_code=404, detail="这个任务没有单独的原文字幕")
+    else:
+        raise HTTPException(status_code=400, detail="part 只能是 translation 或 original")
+    return FileResponse(path, media_type="text/plain", filename=path.name)
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -873,6 +883,7 @@ def _entry_view(entry, current_hash: str) -> QueueEntryView:
         stage=stage, progress=progress, message=message, job_live=live,
         has_log=bool(entry.job_id) and joblog.find_log(entry.job_id) is not None,
         result_srt=entry.result_srt, result_video=entry.result_video,
+        result_srt_original=entry.result_srt_original,
         result_in_place=entry.result_in_place,
         group_id=entry.group_id, group_title=entry.group_title,
     )
@@ -1034,15 +1045,27 @@ def retry_queue_entry(entry_id: str, body: dict | None = None) -> dict:
 
 
 @router.get("/queue/{entry_id}/result")
-def queue_entry_result(entry_id: str):
+def queue_entry_result(entry_id: str, part: str = "translation"):
     """The subtitle this entry produced.
 
     Served from the path the entry recorded rather than through the job,
     so it still works after the restart that emptied JobManager.jobs.
+
+    part="original" 取双文件模式的原文那一份，它**永远**是字幕文件：内嵌模式
+    下另一个按钮给的是视频，而原文那一份仍然在工作目录里躺着。
     """
     entry = queue_manager.store.get(entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="列队里没有这条任务")
+    if part == "original":
+        original = Path(entry.result_srt_original or "")
+        if not original.name:
+            raise HTTPException(status_code=404, detail="这条任务没有单独的原文字幕")
+        if not original.is_file():
+            raise HTTPException(status_code=404, detail=f"文件已不在原位置：{original}")
+        return FileResponse(str(original), filename=original.name)
+    if part != "translation":
+        raise HTTPException(status_code=400, detail="part 只能是 translation 或 original")
     name = entry.result_video or entry.result_srt
     if not name:
         raise HTTPException(status_code=404, detail="这条任务还没有产物")

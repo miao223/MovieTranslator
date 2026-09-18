@@ -34,9 +34,10 @@ the gaps between cues with empty samples on its own.
 from __future__ import annotations
 
 import os
+from contextlib import ExitStack
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import av
 
@@ -460,6 +461,7 @@ def embed(
     should_cancel: Optional[Callable[[], bool]] = None,
     track_title: str = "",
     track_language: str = "",
+    extra_tracks: Sequence[Tuple[str | Path, str, str]] = (),
 ) -> Path:
     """Write *video_path* to *out_path* with *subtitle_path* as a track.
 
@@ -472,6 +474,11 @@ def embed(
     *track_language* is the ISO-639-2/B tag for the subtitle track, already
     worked out by the caller; it overrides the one derived from
     *target_language*. 纯原文的轨道语言是片子自己的语言，不是翻译目标。
+
+    *extra_tracks* 是额外的字幕文件，每个 (路径, 标题, 语言标签) 变成一条独立
+    轨道，排在主轨之后——双文件模式的原文就是这么进来的。**default 标志只给
+    主轨**：两条 default 等于把「先显示哪一条」交还给播放器，而这个模式的全部
+    意思就是译文先出来。
     """
     opts = opts or EmbedSettings()
     video_path, subtitle_path, out_path = (
@@ -496,16 +503,25 @@ def embed(
                 f"{part.name}")
         part.unlink(missing_ok=True)
     lang = track_language.strip() or language_of(target_language)[1]
+    # 主轨 + 附加轨，一视同仁地往下走。附加轨的语言标签认不出来时给 und 而不是
+    # 目标语言：它按定义就不是译文，挂上译文的标签是 source_language_of 一直在
+    # 防的那种谎。
+    wanted = [(Path(subtitle_path), track_title, lang)] + [
+        (Path(path), title, language.strip() or FALLBACK[1])
+        for path, title, language in extra_tracks
+    ]
     fmt = CONTAINERS.get(opts.container, "matroska")
     mp4 = fmt == "mp4"
 
     try:
-        with av.open(str(video_path)) as source, \
-             av.open(str(subtitle_path)) as subs_in, \
-             av.open(str(part), mode="w", format=fmt) as out:
-            if not subs_in.streams.subtitles:
-                raise ValueError(f"字幕文件无法解析: {subtitle_path.name}")
-            sub_in = subs_in.streams.subtitles[0]
+        with ExitStack() as stack:
+            source = stack.enter_context(av.open(str(video_path)))
+            subs_in = [stack.enter_context(av.open(str(path)))
+                       for path, _, _ in wanted]
+            out = stack.enter_context(av.open(str(part), mode="w", format=fmt))
+            for container, (path, _, _) in zip(subs_in, wanted):
+                if not container.streams.subtitles:
+                    raise ValueError(f"字幕文件无法解析: {path.name}")
 
             out.metadata.update(dict(source.metadata))
             # Releases routinely carry a poster as a second video stream
@@ -588,38 +604,52 @@ def embed(
                 log(f"⚠ mp4 无法容纳片源自带的 {dropped} 条字幕/附件流，已略过"
                     f"（需要保留请改用 mkv）")
 
-            if mp4:
-                # PyAV cannot encode subtitles at all, so the tx3g track is
-                # built by hand: add_mux_stream makes a stream with no codec
-                # context, for packets that are already in their final form.
-                subtitle_stream = out.add_mux_stream("mov_text")
-                subtitle_stream.time_base = MOV_TEXT_TB
-            else:
-                subtitle_stream = out.add_stream_from_template(sub_in)
-            subtitle_stream.metadata["language"] = lang
-            if track_title:
-                subtitle_stream.metadata["title"] = track_title
-            # the point of the whole exercise is that it shows up on its own
-            subtitle_stream.disposition = av.stream.Disposition.default
+            sub_streams = []
+            for container, (_path, title, language) in zip(subs_in, wanted):
+                sub_in = container.streams.subtitles[0]
+                if mp4:
+                    # PyAV cannot encode subtitles at all, so the tx3g track is
+                    # built by hand: add_mux_stream makes a stream with no codec
+                    # context, for packets that are already in their final form.
+                    subtitle_stream = out.add_mux_stream("mov_text")
+                    subtitle_stream.time_base = MOV_TEXT_TB
+                else:
+                    subtitle_stream = out.add_stream_from_template(sub_in)
+                subtitle_stream.metadata["language"] = language
+                if title:
+                    subtitle_stream.metadata["title"] = title
+                # cleared explicitly: add_stream_from_template brings the
+                # template's disposition along, and matroska treats a missing
+                # FlagDefault as set
+                subtitle_stream.disposition &= ~av.stream.Disposition.default
+                sub_streams.append(subtitle_stream)
+            # the point of the whole exercise is that it shows up on its own —
+            # 只给主轨，两条 default 等于把「先显示哪一条」交还给播放器
+            sub_streams[0].disposition = av.stream.Disposition.default
 
             # a film's worth of cues is a few hundred KB; reading them up
-            # front is what lets them be merged into the copy in time order
-            cues: List[Tuple[float, object]] = []
-            if mp4:
-                for start, end, text in _mov_text_cues(subs_in, sub_in):
-                    raw = text.encode("utf-8")
-                    # a tx3g sample is a big-endian uint16 length, then UTF-8
-                    cue = av.Packet(len(raw).to_bytes(2, "big") + raw)
-                    cue.stream = subtitle_stream
-                    cue.time_base = MOV_TEXT_TB
-                    cue.pts = cue.dts = int(round(start * 1000))
-                    cue.duration = max(1, int(round((end - start) * 1000)))
-                    cues.append((start, cue))
-            else:
-                for cue in subs_in.demux(sub_in):
-                    if not cue.size:
-                        continue
-                    cues.append((float(cue.pts * cue.time_base), cue))
+            # front is what lets them be merged into the copy in time order.
+            # 两条轨也是同一张表：每条 cue 自己带着要去哪条轨，所以下面的游标
+            # 仍然只有一个。
+            cues: List[Tuple[float, object, object]] = []
+            for container, subtitle_stream in zip(subs_in, sub_streams):
+                sub_in = container.streams.subtitles[0]
+                if mp4:
+                    for start, end, text in _mov_text_cues(container, sub_in):
+                        raw = text.encode("utf-8")
+                        # a tx3g sample is a big-endian uint16 length, then UTF-8
+                        cue = av.Packet(len(raw).to_bytes(2, "big") + raw)
+                        cue.stream = subtitle_stream
+                        cue.time_base = MOV_TEXT_TB
+                        cue.pts = cue.dts = int(round(start * 1000))
+                        cue.duration = max(1, int(round((end - start) * 1000)))
+                        cues.append((start, cue, subtitle_stream))
+                else:
+                    for cue in container.demux(sub_in):
+                        if not cue.size:
+                            continue
+                        cues.append(
+                            (float(cue.pts * cue.time_base), cue, subtitle_stream))
             cues.sort(key=lambda c: c[0])
 
             duration = (
@@ -664,8 +694,8 @@ def embed(
                         and packet.pts is not None:
                     progress(min(at / duration, 1.0))
                 while next_cue < len(cues) and cues[next_cue][0] <= at:
-                    cue = cues[next_cue][1]
-                    cue.stream = subtitle_stream
+                    _, cue, cue_stream = cues[next_cue]
+                    cue.stream = cue_stream
                     out.mux(cue)
                     next_cue += 1
 
@@ -696,8 +726,8 @@ def embed(
                             out.mux(made)
                 for made in enc.encode(None):
                     out.mux(made)
-            for _, cue in cues[next_cue:]:
-                cue.stream = subtitle_stream
+            for _, cue, cue_stream in cues[next_cue:]:
+                cue.stream = cue_stream
                 out.mux(cue)
 
         os.replace(part, out_path)

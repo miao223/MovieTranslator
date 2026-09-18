@@ -126,6 +126,23 @@ async def test_the_pure_original_mode_reaches_the_job_request(mcp, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_the_two_file_mode_reaches_the_job_request(mcp, monkeypatch):
+    """白名单是手写的，而且两个工具共用一份——加了 Literal 值忘了改它，
+    MCP 客户端就用不上这个模式。"""
+    seen = {}
+
+    def capture(request):
+        seen["mode"] = request.output_mode
+        return FakeJob()
+
+    monkeypatch.setattr(mcp_server.manager, "create", capture)
+    out = await call(mcp, "translate_video", video_path="/v/f.mkv",
+                     output_mode="bilingual_split")
+    assert out["job_id"] == "abc123"
+    assert seen["mode"] == "bilingual_split"
+
+
+@pytest.mark.anyio
 async def test_unknown_ids_report_instead_of_raising(mcp, monkeypatch):
     def missing(job_id):
         raise KeyError(job_id)

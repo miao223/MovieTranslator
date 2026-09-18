@@ -575,10 +575,10 @@ def _frame_pts(path: Path) -> list:
         )
 
 
-def _cue_texts(path: Path) -> list:
+def _cue_texts(path: Path, index: int = 0) -> list:
     """The cues as a player would read them, for either subtitle carrier."""
     with av.open(str(path)) as c:
-        track = c.streams.subtitles[0]
+        track = c.streams.subtitles[index]
         tx3g = track.codec_context.name == "mov_text"
         out = []
         for p in c.demux(track):
@@ -591,6 +591,101 @@ def _cue_texts(path: Path) -> list:
             if body:
                 out.append((round(float(p.pts * p.time_base), 2), body))
     return out
+
+
+# ------------------------------------------------- two tracks in one video
+
+
+def _split_subs(tmp_path) -> tuple:
+    """双文件模式交给 mux 的那两份：一份只有译文，一份只有原文。"""
+    settings = SubtitleSettings()
+    zh = tmp_path / "film.zh.srt"
+    en = tmp_path / "film.en.srt"
+    zh.write_text(subtitle.build_srt(LINES, settings, mode="translation_only"),
+                  encoding="utf-8")
+    en.write_text(subtitle.build_srt(LINES, settings, mode="original_only"),
+                  encoding="utf-8")
+    return zh, en
+
+
+def test_a_second_subtitle_file_becomes_a_second_track(video, tmp_path):
+    """双文件模式内嵌时，两份字幕各成一条轨，文字互不串味。"""
+    zh, en = _split_subs(tmp_path)
+    out = mux.embed(video, zh, tmp_path / "two.mkv", "简体中文",
+                    track_title="简体中文字幕", track_language="chi",
+                    extra_tracks=[(en, "英语字幕", "eng")])
+
+    with av.open(str(out)) as c:
+        subs = [s for s in c.streams if s.type == "subtitle"]
+        tags = [s.metadata.get("language") for s in subs]
+        titles = [s.metadata.get("title") for s in subs]
+    assert tags == ["chi", "eng"] and titles == ["简体中文字幕", "英语字幕"]
+    # 每条轨读回来的就是它自己那个文件的内容
+    assert [t for _, t in _cue_texts(out, 0)] == ["你好", "再见"]
+    assert [t for _, t in _cue_texts(out, 1)] == ["Hello there", "Goodbye"]
+
+
+def test_only_the_translation_is_the_default_track(video, tmp_path):
+    """两条 default 等于把「先显示哪一条」还给播放器，而这个模式的全部意思
+    就是译文先出来。add_stream_from_template 会把模板的 disposition 带过来，
+    matroska 又把「没写 FlagDefault」当成 1，所以附加轨必须显式清掉。"""
+    zh, en = _split_subs(tmp_path)
+    out = mux.embed(video, zh, tmp_path / "two.mkv", "简体中文",
+                    track_language="chi", extra_tracks=[(en, "", "eng")])
+
+    with av.open(str(out)) as c:
+        defaults = [
+            s.metadata.get("language") for s in c.streams
+            if s.type == "subtitle" and s.disposition & av.stream.Disposition.default
+        ]
+    assert defaults == ["chi"]
+
+
+def test_the_two_tracks_interleave_without_losing_a_cue(tmp_path):
+    """一个游标喂两条轨：按时间排好的同一张表，每条 cue 自己记得去哪儿。
+    B 帧素材是必须的——这条循环同时在处理画面包的重排。"""
+    src = make_bframe_video(tmp_path / "src.mkv")
+    zh, en = _split_subs(tmp_path)
+    out = mux.embed(src, zh, tmp_path / "two.mkv", "简体中文",
+                    track_language="chi", extra_tracks=[(en, "", "eng")])
+
+    first = _cue_texts(out, 0)
+    second = _cue_texts(out, 1)
+    assert [t for _, t in first] == ["你好", "再见"]
+    assert [t for _, t in second] == ["Hello there", "Goodbye"]
+    # 时间戳两条轨各自升序，且与源文件一致
+    assert [at for at, _ in first] == [0.5, 1.4]
+    assert [at for at, _ in second] == [0.5, 1.4]
+    assert _frames(out) == _frames(src)
+
+
+def test_an_extra_track_without_a_language_claims_nothing(video, tmp_path):
+    """附加轨的语言认不出来时给 und，绝不借用目标语言的标签——它按定义就
+    不是译文。matroska 把 und 当作「没有信息」并不写进文件，所以读回来是空
+    的：一条什么都不声称的轨道，正是这里要的结果。"""
+    zh, en = _split_subs(tmp_path)
+    out = mux.embed(video, zh, tmp_path / "two.mkv", "简体中文",
+                    track_language="chi", extra_tracks=[(en, "原文字幕", "")])
+
+    with av.open(str(out)) as c:
+        tags = [s.metadata.get("language") for s in c.streams if s.type == "subtitle"]
+    assert tags == ["chi", None]
+
+
+def test_mp4_carries_both_tracks_as_mov_text(video, tmp_path):
+    """mp4 侧的两条轨是各自拼的 tx3g，tx3g「同一时刻只能有一个样本」是每条轨
+    自己的约束，两条轨互不影响。"""
+    zh, en = _split_subs(tmp_path)
+    out = mux.embed(video, zh, tmp_path / "two.mp4", "简体中文",
+                    opts=EmbedSettings(container="mp4"),
+                    track_language="chi", extra_tracks=[(en, "英语字幕", "eng")])
+
+    with av.open(str(out)) as c:
+        subs = [s for s in c.streams if s.type == "subtitle"]
+        assert [s.codec_context.name for s in subs] == ["mov_text", "mov_text"]
+        assert [s.metadata.get("language") for s in subs] == ["chi", "eng"]
+    assert [t for _, t in _cue_texts(out, 0)] == ["你好", "再见"]
+    assert [t for _, t in _cue_texts(out, 1)] == ["Hello there", "Goodbye"]
 
 
 def test_re_encoding_loses_not_a_single_frame(tmp_path):

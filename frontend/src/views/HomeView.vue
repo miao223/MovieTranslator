@@ -362,6 +362,7 @@ const running = () =>
   job.value && !['done', 'failed', 'cancelled'].includes(job.value.stage)
 
 const isOriginalOnly = computed(() => form.output_mode === 'original_only')
+const isSplit = computed(() => form.output_mode === 'bilingual_split')
 
 // mirrors mux.language_of: a language typed by hand is taken as a code when
 // it has that shape, and only then — 猜一个语言比承认不知道更糟
@@ -383,6 +384,12 @@ const stemExample = computed(() =>
 const embedExample = computed(() => `${stemExample.value}.${langSuffix.value}.${form.embed.container}`)
 // 译文字幕一直与片源同名；纯原文带后缀，才不会覆盖同目录已有的那一份
 const sidecarExample = computed(() => `${stemExample.value}.${langSuffix.value}.srt`)
+// 双语分离的两份：译文按目标语言、原文按源语言。选了自动检测就要等识别完才
+// 知道，所以给一个明摆着是占位的写法，与纯原文一致
+const splitExample = computed(() => [
+  `${stemExample.value}.${targetSuffix.value}.srt`,
+  `${stemExample.value}.${form.source_language === 'auto' ? '源语言' : form.source_language}.srt`,
+])
 
 // Built once and used by both buttons. Keeping it in one place is the
 // point: the subtitle-track resolution, the audio-source suppression of
@@ -769,7 +776,7 @@ onBeforeUnmount(() => {
           <el-option v-for="l in SOURCE_LANGS" :key="l.value" :value="l.value" :label="l.label" />
         </el-select>
         <span class="hint">语音识别的源语言，不确定就选自动检测；名单里没有的语种可直接填 ISO 代码（如 <code>nl</code>、<code>pl</code>、<code>tr</code>）<template
-          v-if="isOriginalOnly">。纯原文模式下它还决定文件名的语言后缀（选自动检测则以识别结果为准，判不出来时用 <code>orig</code>）</template></span>
+          v-if="isOriginalOnly || isSplit">。它还决定原文那一份文件名的语言后缀（选自动检测则以识别结果为准，判不出来时用 <code>orig</code>）</template></span>
       </el-form-item>
       <el-form-item label="目标语言">
         <el-select
@@ -798,12 +805,20 @@ onBeforeUnmount(() => {
           <el-radio value="bilingual">双语（原文 + 译文）</el-radio>
           <el-radio value="translation_only">纯译文</el-radio>
           <el-radio value="original_only">纯原文（不翻译）</el-radio>
+          <el-radio value="bilingual_split">双语分离（两个文件）</el-radio>
         </el-radio-group>
         <div v-if="isOriginalOnly" class="hint" style="margin: 4px 0 0; display: block">
           只输出识别/读取到的原文，<strong>不调用 AI 翻译</strong>；转写预处理、歌词识别、
           二次识别复核、图形字幕 OCR 与校对照常执行。<br>
           文件名会带上源语言后缀（<code>{{ sidecarExample }}</code>），
           不会覆盖同目录已有的译文字幕。
+        </div>
+        <div v-if="isSplit" class="hint" style="margin: 4px 0 0; display: block">
+          内容与双语相同，但原文和译文<strong>各写一个文件</strong>
+          （<code>{{ splitExample[0] }}</code> 和 <code>{{ splitExample[1] }}</code>），
+          播放器/媒体库里显示成两条可选字幕。<br>
+          注意这个模式下<strong>译文那一份也带语言后缀</strong>，不再是与片源同名的
+          <code>.srt</code>——另一半就在旁边，不加后缀两份会互相覆盖。
         </div>
       </el-form-item>
       <el-form-item label="输出形式">
@@ -826,6 +841,9 @@ onBeforeUnmount(() => {
             <template v-else>
               画面将<strong>重新编码</strong>，原视频保持不变。
             </template>
+            <template v-if="isSplit">
+              双语分离模式内嵌的是<strong>两条字幕轨</strong>：译文默认打开，原文可切换。<br>
+            </template>
             <template v-if="form.embed.container === 'mkv'">
               「字幕样式」设置照常生效（内嵌为 ASS 轨）。
             </template>
@@ -837,6 +855,11 @@ onBeforeUnmount(() => {
           <template v-else-if="isOriginalOnly">
             在视频所在目录生成 <code>{{ sidecarExample }}</code>（开启「字幕样式」时为 .ass），
             原视频不动；带源语言后缀是为了不覆盖同目录已有的译文字幕。
+          </template>
+          <template v-else-if="isSplit">
+            在视频所在目录生成 <code>{{ splitExample[0] }}</code> 与
+            <code>{{ splitExample[1] }}</code> 两个文件（开启「字幕样式」时为 .ass），
+            原视频不动。
           </template>
           <template v-else>
             在视频所在目录生成同名的 .srt（开启「字幕样式」时为 .ass），原视频不动。
@@ -1015,12 +1038,25 @@ onBeforeUnmount(() => {
       </el-alert>
       <el-alert v-else-if="job.srt_in_place" type="success" :closable="false" style="margin-bottom: 8px">
         字幕已保存到视频所在目录：<code>{{ job.srt_filename }}</code>
+        <template v-if="job.original_srt_filename">
+          <br>原文：<code>{{ job.original_srt_filename }}</code>
+        </template>
       </el-alert>
       <el-alert v-else type="warning" :closable="false" style="margin-bottom: 8px">
         视频目录不可写，字幕暂存在工作目录，请下载保存
       </el-alert>
       <el-button type="success" tag="a" :href="api.resultUrl(job.id)" download>
-        下载 SRT 字幕
+        {{ job.original_srt_filename ? '下载译文字幕' : '下载 SRT 字幕' }}
+      </el-button>
+      <el-button
+        v-if="job.original_srt_filename"
+        type="success"
+        plain
+        tag="a"
+        :href="api.resultUrl(job.id, 'original')"
+        download
+      >
+        下载原文字幕
       </el-button>
     </template>
     <el-alert v-if="job.stage === 'failed'" type="error" :closable="false" style="margin-bottom: 8px">
@@ -1088,6 +1124,13 @@ onBeforeUnmount(() => {
       :closable="false"
       style="margin-top: 12px"
       title="纯原文模式：不调用 AI 翻译，每个视频生成带源语言后缀的原文字幕（如 片名.ja.srt）"
+    />
+    <el-alert
+      v-if="isSplit"
+      type="info"
+      :closable="false"
+      style="margin-top: 12px"
+      title="双语分离模式：每个视频生成译文、原文两个字幕文件，两份都带语言后缀（如 片名.zh.srt 与 片名.ja.srt）"
     />
     <!-- a mixed folder is the common shape here: the audio files can only
          ever produce a subtitle file, whatever the output switch says -->

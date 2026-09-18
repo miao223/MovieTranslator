@@ -7,6 +7,7 @@ and are wiped on the next application startup.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 from app.core import config
 from app.core.cache import (
@@ -158,6 +159,9 @@ class Job:
         self.subscribers: List[queue.Queue] = []
         self.lock = threading.Lock()
         self.srt_path: Optional[Path] = None
+        # 双文件模式的另一半（原文）。其余模式恒为空表，所以结果那一串管道
+        # （srt_filename / result_srt / 下载按钮）照旧只认 srt_path。
+        self.extra_srt_paths: List[Path] = []
         # everything published below is mirrored into a downloadable file
         self.logfile = JobLogWriter(self.id, request.video_path)
 
@@ -493,12 +497,19 @@ class JobManager:
         settings = _settings_for(job)
         video = Path(req.video_path)
         # 纯原文的产物带语言后缀（片名.ja.srt），两个精确候选认不出来——所以
-        # 在它们之后再兜一层 glob，否则「先跑纯原文、之后补画面翻译」是死路
+        # 在它们之后再兜一层 glob，否则「先跑纯原文、之后补画面翻译」是死路。
+        # 双文件模式留下两份，而 glob 按字母序：不先点名译文那一份，画面译文
+        # 就会并进原文里，而 {\an7} 那条 cue 本身就是译文。判据用目标语言而
+        # 不是 output_mode——补充模式的请求通常根本没设 output_mode。
+        lang = mux.language_of(req.target_language)[0]
+        stem = glob.escape(video.stem)
         target = next(
             (p for p in (
                 video.with_suffix(".ass"), video.with_suffix(".srt"),
-                *sorted(video.parent.glob(f"{video.stem}.*.ass")),
-                *sorted(video.parent.glob(f"{video.stem}.*.srt")),
+                video.parent / f"{video.stem}.{lang}.ass",
+                video.parent / f"{video.stem}.{lang}.srt",
+                *sorted(video.parent.glob(f"{stem}.*.ass")),
+                *sorted(video.parent.glob(f"{stem}.*.srt")),
             ) if p.is_file()),
             None,
         )
@@ -1116,54 +1127,82 @@ class JobManager:
             if frame_lines:
                 lines = sorted(lines + frame_lines, key=lambda l: l.start)
 
-        # 4. compose subtitle file -----------------------------------------
+        # 4. compose subtitle file(s) --------------------------------------
         styled = settings.subtitle.style_enabled
         ext = ".ass" if styled else ".srt"
-        # 译文模式下 sidecar 恒为 ""，下面两处文件名与改动前逐字节相同
-        sidecar = _naming(req, detected)[0]
+        build = subtitle.build_ass if styled else subtitle.build_srt
+        # 译文模式下 products 恒为一份、sidecar 恒为 ""，下面的文件名与改动前
+        # 逐字节相同
+        products = _products(req, detected)
         job.publish("composing", 95, message=f"生成 {ext[1:].upper()} 字幕…")
-        if styled:
-            srt_text = subtitle.build_ass(lines, settings.subtitle, mode=req.output_mode)
-        else:
-            srt_text = subtitle.build_srt(lines, settings.subtitle, mode=req.output_mode)
+        texts = [
+            build([l for l in lines if not (p.drop_frames and l.is_frame)],
+                  settings.subtitle, mode=p.mode)
+            for p in products
+        ]
         # embed mode keeps the subtitle in the work dir — the download button
         # and the debug artifacts still want it, the video folder does not
-        muxed = self._embed_subtitle(job, req, workdir, video, ext, srt_text,
-                                     detected=detected) \
-            if req.embed_subtitle else None
+        muxed = self._embed_subtitle(
+            job, req, workdir, video, ext, texts[0], detected=detected,
+            extra=list(zip(products[1:], texts[1:])),
+        ) if req.embed_subtitle else None
         if muxed is None:
+            self._write_sidecars(job, req, workdir, video, ext, products, texts)
+        job.status.srt_filename = str(job.srt_path)
+        job.status.original_srt_filename = (
+            str(job.extra_srt_paths[0]) if job.extra_srt_paths else "")
+        self._debug_final(debug, lines, settings)
+        also = (f"（另有原文 {job.extra_srt_paths[0].name}）"
+                if job.extra_srt_paths and not muxed else "")
+        job.publish(
+            "done", 100,
+            message=(f"完成，带字幕的视频已生成: {muxed}" if muxed
+                     else f"完成，字幕已保存: {job.srt_path}{also}"),
+        )
+
+    def _write_sidecars(self, job: Job, req: JobRequest, workdir: Path,
+                        video: Path, ext: str, products: List[Product],
+                        texts: List[str]) -> None:
+        """每份产物写一个文件。第一份（主产物）决定 job.srt_path。
+
+        一份写成了、下一份写不下去时**保留已经写出的那一份**：两个文件之间
+        没有原子性可言，把成功的那一半删掉只是把「少一个文件」换成「两手空
+        空」。兜底永远在（工作目录里那份能下载），所以最坏情况是片源目录里
+        落一个、工作目录里落一个，谁都没丢。
+        """
+        written: List[Path] = []
+        in_place = True
+        for product, text in zip(products, texts):
             target, moved = output_target(
-                video, sidecar, ext, req.target_language, job.source_subtitle)
+                video, product.sidecar, ext, req.target_language,
+                job.source_subtitle)
             if moved:
                 job.publish(
                     "composing", 95,
                     log=f"⚠ 原文就是 {Path(job.source_subtitle).name}，"
-                        f"译文改写到 {target.name}，不覆盖它")
+                        f"{product.label}改写到 {target.name}，不覆盖它")
             try:
-                target.write_text(srt_text, encoding="utf-8")
-                job.srt_path = target
-                job.status.srt_in_place = True
+                target.write_text(text, encoding="utf-8")
             except OSError as exc:
                 # video dir not writable (read-only share etc.): keep it in the
                 # work dir and let the UI offer a download instead
-                job.srt_path = workdir / f"{video.stem}{sidecar}{ext}"
-                job.srt_path.write_text(srt_text, encoding="utf-8")
-                job.status.srt_in_place = False
+                target = workdir / f"{video.stem}{product.sidecar}{ext}"
+                target.write_text(text, encoding="utf-8")
+                in_place = False
                 job.publish(
                     "composing", 99,
-                    log=f"⚠ 无法写入视频所在目录（{exc}），字幕已保存到工作目录，可用下载按钮获取",
+                    log=f"⚠ 无法写入视频所在目录（{exc}），{product.label}"
+                        "已保存到工作目录，可用下载按钮获取",
                 )
-        job.status.srt_filename = str(job.srt_path)
-        self._debug_final(debug, lines, settings)
-        job.publish(
-            "done", 100,
-            message=(f"完成，带字幕的视频已生成: {muxed}" if muxed
-                     else f"完成，字幕已保存: {job.srt_path}"),
-        )
+            written.append(target)
+        job.srt_path = written[0]
+        job.extra_srt_paths = written[1:]
+        job.status.srt_in_place = in_place
 
     def _embed_subtitle(
         self, job: Job, req: JobRequest, workdir: Path,
         video: Path, ext: str, srt_text: str, detected: str = "",
+        extra: Sequence[Tuple[Product, str]] = (),
     ) -> Optional[Path]:
         """Mux the subtitle into a new video. Returns None to fall back.
 
@@ -1178,6 +1217,9 @@ class JobManager:
         There the track is in the film's own language, and the file name, the
         stream tag and the track title all follow it rather than the
         translation target (see _naming).
+
+        *extra* 是主产物之外的那些（双文件模式的原文）：每份写进工作目录，再
+        作为一条独立字幕轨内嵌进同一个视频。默认打开的仍然是主产物那条。
         """
         if job.audio_only:
             job.publish(
@@ -1190,6 +1232,15 @@ class JobManager:
         job.srt_path = workdir / f"{video.stem}{sidecar}{ext}"
         job.srt_path.write_text(srt_text, encoding="utf-8")
         job.status.srt_in_place = False
+        # 这两份不经过 output_target（工作目录里撞不上片源的旁挂字幕），但它们
+        # 之间仍然可能同名——去重在 _products 里已经做过了
+        job.extra_srt_paths = []
+        tracks: List[Tuple[Path, str, str]] = []
+        for product, text in extra:
+            path = workdir / f"{video.stem}{product.sidecar}{ext}"
+            path.write_text(text, encoding="utf-8")
+            job.extra_srt_paths.append(path)
+            tracks.append((path, product.track_title, product.track_language))
         out = mux.output_path(video, req.target_language, req.embed.container,
                               suffix=suffix)
         recoding = req.embed.video_codec != mux.COPY
@@ -1214,6 +1265,7 @@ class JobManager:
                 opts=req.embed,
                 track_title=title,
                 track_language=lang,
+                extra_tracks=tracks,
                 log=lambda msg: job.publish("composing", job.status.progress, log=msg),
                 progress=lambda f: job.publish(
                     "composing", 95 + 5 * min(max(f, 0.0), 1.0),
@@ -1347,19 +1399,65 @@ def output_target(video: Path, sidecar: str, ext: str, target_language: str,
 
 
 def _naming(req: JobRequest, detected: str) -> tuple[str, str, str, str]:
-    """这个任务的产物怎么命名：(字幕文件后缀, 内嵌视频后缀, 轨道标签, 轨道标题)。
+    """这个任务的主产物怎么命名：(字幕文件后缀, 内嵌视频后缀, 轨道标签, 轨道标题)。
 
     译文模式沿用历史命名——字幕一直是与片源同名的 片名.srt。**那一侧一个字都
     不能改**，改了所有已经指向它的播放器 / 媒体库全部对不上。
 
     纯原文两侧都带语言后缀（片名.ja.srt / 片名.ja.mkv）：它的产物极可能和一份
     译文字幕落在同一个目录里，不加后缀就是互相覆盖。
+
+    双文件（bilingual_split）描述的是**译文那一半**，它同样带后缀：另一半就在
+    旁边，两份不能都叫 片名.srt。内嵌视频仍按译文命名（片名.zh.mkv），因为
+    默认打开的那条轨道就是译文。
     """
     if req.output_mode == "original_only":
         suffix, tag, title = mux.source_language_of(detected)
         return f".{suffix}", suffix, tag, title
     suffix, tag = mux.language_of(req.target_language)
-    return "", suffix, tag, f"{req.target_language}字幕"
+    sidecar = f".{suffix}" if req.output_mode == "bilingual_split" else ""
+    return sidecar, suffix, tag, f"{req.target_language}字幕"
+
+
+class Product(NamedTuple):
+    """一份产物：怎么渲染、叫什么名字、内嵌时那条轨道怎么标。"""
+
+    mode: str            # 传给 build_srt / build_ass 的 mode
+    sidecar: str         # 文件名后缀（"" / ".zh" / ".ja"）
+    track_language: str  # 内嵌轨道的 ISO 639-2/B 标签
+    track_title: str     # 内嵌轨道的标题
+    label: str           # 日志里怎么称呼它
+    drop_frames: bool = False   # 画面翻译那些 cue 不进这一份
+
+
+def _products(req: JobRequest, detected: str) -> List[Product]:
+    """这个任务要产出哪几份字幕，第一份是主产物。
+
+    三个老模式恒为一份，名字与轨道标签仍旧全部来自 _naming——这里一个字都不
+    重新推导，所以它们的行为与改动前逐字节相同。
+
+    双文件不给 subtitle.py 增加分支：它拆成现成的 translation_only 与
+    original_only 各渲染一次，"bilingual_split" 这个值根本不会传进 builder。
+
+    画面翻译的 cue 只进译文那一份。它们的 text 是空的（frame 任务只产出译文，
+    见 _frame_lines），而 bilingual 本来也只显示译文——两份合起来等于双语那
+    一份，正是这个模式的定义。
+    """
+    sidecar, _suffix, tag, title = _naming(req, detected)
+    if req.output_mode != "bilingual_split":
+        return [Product(req.output_mode, sidecar, tag, title, "译文")]
+    orig_suffix, orig_tag, orig_title = mux.source_language_of(detected)
+    orig_sidecar = f".{orig_suffix}"
+    if orig_sidecar == sidecar:
+        # 源语言与目标语言判成同一个代码（简繁都是 zh，或者把日语片「译」成
+        # 日语）。让位的必须是原文那一份：译文才是媒体库要认的那个名字。orig
+        # 正是 source_language_of 判不出语言时用的词，media._LANG_SUFFIX 认得。
+        orig_sidecar = ".orig"
+    return [
+        Product("translation_only", sidecar, tag, title, "译文"),
+        Product("original_only", orig_sidecar, orig_tag, orig_title, "原文",
+                drop_frames=True),
+    ]
 
 
 def _usage_line(label: str, usage: dict) -> str:

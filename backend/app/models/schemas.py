@@ -367,7 +367,12 @@ class JobRequest(BaseModel):
     # bilingual 双语；translation_only 只要译文；original_only 只要原文——
     # 跳过 LLM 翻译，但转写预处理 / 歌词识别 / 二次识别复核 / 图形字幕 OCR
     # 与校对一个都不少。target_language 在这个模式下只作用于画面翻译。
-    output_mode: Literal["bilingual", "translation_only", "original_only"] = "bilingual"
+    # bilingual_split 内容与 bilingual 完全相同，只是写成两个单语字幕文件
+    # （片名.zh.srt + 片名.en.srt），播放器里当成两条可选字幕。**只有这一个
+    # 模式下译文也带语言后缀**：另一半就在旁边，不带后缀两份会互相覆盖。
+    output_mode: Literal[
+        "bilingual", "translation_only", "original_only", "bilingual_split"
+    ] = "bilingual"
     # produce one new .mkv carrying the subtitle as a switchable soft track
     # instead of a subtitle file next to the video (services/mux.py). The
     # picture is copied, never re-encoded.
@@ -398,8 +403,11 @@ class BatchRequest(BaseModel):
     source_language: str = "auto"
     target_language: str = "简体中文"
     synopsis: str = ""  # shared synopsis is useful for TV series batches
-    # see JobRequest.output_mode — original_only 跳过翻译，只输出原文
-    output_mode: Literal["bilingual", "translation_only", "original_only"] = "bilingual"
+    # see JobRequest.output_mode — original_only 跳过翻译，只输出原文；
+    # bilingual_split 每个视频产出译文 + 原文两个文件
+    output_mode: Literal[
+        "bilingual", "translation_only", "original_only", "bilingual_split"
+    ] = "bilingual"
     # see JobRequest.embed_subtitle — one muxed .mkv per video instead of a
     # subtitle file. Note it writes a second copy of every film in the batch.
     embed_subtitle: bool = False
@@ -449,6 +457,9 @@ class JobStatus(BaseModel):
     video_path: str = ""
     srt_filename: str = ""  # full path of the generated SRT
     srt_in_place: bool = False  # True when saved next to the video
+    # bilingual_split 的另一半（原文那一份）。其余模式恒为空串，所以界面只靠
+    # 这一个字段就能决定要不要显示第二个下载按钮。
+    original_srt_filename: str = ""
     # embed mode: the new video carrying the subtitle track. Empty otherwise,
     # so the UI can tell the two outcomes apart from this field alone.
     video_filename: str = ""
@@ -516,6 +527,7 @@ class QueueEntry(BaseModel):
     # JobManager.jobs, so without these a finished entry could not say what
     # it produced — and the queue exists to survive restarts.
     result_srt: str = ""
+    result_srt_original: str = ""   # bilingual_split 的原文那一份
     result_video: str = ""
     result_in_place: bool = False
     # Files enqueued from one directory share these, so the UI can collapse
@@ -553,6 +565,7 @@ class QueueEntryView(BaseModel):
     job_live: bool = False
     has_log: bool = False
     result_srt: str = ""
+    result_srt_original: str = ""
     result_video: str = ""
     result_in_place: bool = False
     group_id: str = ""

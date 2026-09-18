@@ -67,7 +67,9 @@ export const api = {
     request('/api/storage/clear-checkpoints', { method: 'POST' }),
   regenerateToken: () =>
     request('/api/server/token/regenerate', { method: 'POST' }),
-  resultUrl: (id) => `/api/jobs/${id}/result`,
+  // part='original' 取双语分离模式的原文那一份；不传时链接与从前逐字节相同
+  resultUrl: (id, part = '') =>
+    `/api/jobs/${id}/result${part ? `?part=${part}` : ''}`,
   jobLogUrl: (id) => `/api/logs/job/${id}`,
   logs: () => request('/api/logs'),
   eventsUrl: (id) => `/api/jobs/${id}/events`,
@@ -90,5 +92,6 @@ export const api = {
   removeQueueEntry: (id) => request(`/api/queue/${id}`, { method: 'DELETE' }),
   // an <a download> href, so it cannot be a fetch: /api/jobs/{id}/result
   // 404s once a restart has emptied the in-memory job table
-  queueResultUrl: (id) => `/api/queue/${id}/result`,
+  queueResultUrl: (id, part = '') =>
+    `/api/queue/${id}/result${part ? `?part=${part}` : ''}`,
 }

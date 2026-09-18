@@ -321,7 +321,12 @@ async function showSettings(entry) {
               <el-button
                 v-if="entry.result_srt || entry.result_video"
                 size="small" text tag="a" :href="api.queueResultUrl(entry.id)" download
-              >下载</el-button>
+              >{{ entry.result_srt_original ? '下载译文' : '下载' }}</el-button>
+              <el-button
+                v-if="entry.result_srt_original"
+                size="small" text tag="a"
+                :href="api.queueResultUrl(entry.id, 'original')" download
+              >下载原文</el-button>
               <el-button
                 v-if="entry.has_log"
                 size="small" text tag="a" :href="api.jobLogUrl(entry.job_id)" download
