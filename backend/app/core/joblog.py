@@ -21,7 +21,7 @@ from typing import Optional
 
 from app.core.cache import _base_dir
 
-APP_VERSION = "0.24.0"
+APP_VERSION = "0.25.0"
 LOG_DIR_NAME = "logs"
 KEEP_LOGS = 20  # newest job logs to retain
 
