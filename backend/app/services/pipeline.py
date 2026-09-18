@@ -1329,12 +1329,21 @@ def output_target(video: Path, sidecar: str, ext: str, target_language: str,
     there puts the result on top of the original, silently, with nothing to
     recover it from. The original is not ours to destroy, so in that one
     case the translation takes a language suffix instead.
+
+    A product that already carries a language suffix cannot step aside that
+    way. 片名.ja.srt 让给 片名.zh.srt 是把日语原文写进译文的名字里 —— 一份
+    没人能发现的错内容，而且下次真的译出中文时两者还要再撞一次；而译文那半
+    边（片名.zh.srt）让给 片名.zh.srt 根本没有让。Those take a number
+    instead, the same way mux.output_path already keeps 片名.zh.2.mkv from
+    landing on someone's video.
     """
     target = video.parent / f"{video.stem}{sidecar}{ext}"
-    if source_subtitle and Path(source_subtitle) == target:
+    if not source_subtitle or Path(source_subtitle) != target:
+        return target, False
+    if not sidecar:
         lang = mux.language_of(target_language)[0]
         return video.parent / f"{video.stem}.{lang}{ext}", True
-    return target, False
+    return video.parent / f"{video.stem}{sidecar}.2{ext}", True
 
 
 def _naming(req: JobRequest, detected: str) -> tuple[str, str, str, str]:

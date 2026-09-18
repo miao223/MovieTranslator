@@ -1010,3 +1010,22 @@ def test_a_translation_never_overwrites_the_subtitle_it_was_read_from(tmp_path):
     # and a normal job — no sidecar source — is untouched by any of this
     plain, moved2 = output_target(film, sidecar, ".srt", "简体中文", "")
     assert plain == source and moved2 is False
+
+
+def test_an_original_does_not_step_aside_into_the_translations_name(tmp_path):
+    """纯原文读一份 film.ja.srt，产物也叫 film.ja.srt —— 它同样不许覆盖来源。
+
+    但它不能用译文那一招让开：改叫 film.zh.srt 是把日语原文写进中文译文的
+    名字里，没人会发现，而且下次真译出中文时两份还要再撞一次。带语言后缀的
+    产物加编号让开，语言标签留在名字上。
+    """
+    from app.services.pipeline import output_target
+
+    film = tmp_path / "film.mkv"
+    source = tmp_path / "film.ja.srt"
+    source.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n", encoding="utf-8")
+
+    target, moved = output_target(film, ".ja", ".srt", "简体中文", str(source))
+    assert moved and target.name == "film.ja.2.srt"
+    # 译文那一侧的名字仍然空着，绝不能被这一份占掉
+    assert target.name != "film.zh.srt"
