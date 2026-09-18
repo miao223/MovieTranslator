@@ -42,3 +42,9 @@ frontend/dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# 用户提供的测试素材（片源内容，永不入库）
+output.idx
+output.sub
+*.idx
+*.sub

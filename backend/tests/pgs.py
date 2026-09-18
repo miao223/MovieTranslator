@@ -73,9 +73,16 @@ def _masks(text: str, size: int, stroke: int) -> tuple[Image.Image, Image.Image]
     return (alpha.resize(small, Image.LANCZOS), luma.resize(small, Image.LANCZOS))
 
 
-def render(text: str, style: str = "outline", size: int = 52) -> Image.Image:
-    """An indexed bitmap of *text*, shaped like the chosen palette style."""
-    alpha, luma = _masks(text, size, stroke=3)
+def render(text: str, style: str = "outline", size: int = 52,
+           stroke: int = 3) -> Image.Image:
+    """An indexed bitmap of *text*, shaped like the chosen palette style.
+
+    *size* and *stroke* together set how thick the outline is relative to
+    the glyph, which is the whole difference between a Blu-ray cue and a
+    DVD one: at 52/3 the fill sits about twice as deep as the outline, at
+    20/1 only about half again as deep.
+    """
+    alpha, luma = _masks(text, size, stroke=stroke)
     w, h = alpha.size
     img = Image.new("P", (w, h), 0)
     px, ap, lp = img.load(), alpha.load(), luma.load()

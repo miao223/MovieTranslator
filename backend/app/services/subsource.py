@@ -199,8 +199,15 @@ def file_track(path: str | Path) -> dict:
     # a language. Getting this wrong would label the file's language wrongly,
     # which decides the output's name.
     named = bool(tag) and language_name(code) != code
-    info["language"] = code if named else ""
-    info["language_name"] = language_name(code) if named else "未标注语言"
+    if named:
+        # 文件名里写着语言就以它为准：那是用户看得见的那一个
+        info["language"] = code
+        info["language_name"] = language_name(code)
+    elif not info["language"]:
+        info["language_name"] = "未标注语言"
+    # 文件名没写、而容器自己知道时（VobSub 的 .idx 里就有一行 `id: fr`），
+    # 保留 _track_info 从流里读到的那个——白扔掉一条真信息，而它决定着
+    # OCR 用哪套模型、产物叫什么名字
     return info
 
 

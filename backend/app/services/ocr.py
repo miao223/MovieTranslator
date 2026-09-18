@@ -18,7 +18,8 @@ out not to matter. The fill and the outline are *different indices*, and the
 outline wraps around the fill, so ranking indices by how far their pixels
 sit from the transparent background separates them by geometry rather than
 by colour: measured on generated discs the fill sits around 6.1 and the
-outline around 3.3, anti-aliased edges included.
+outline around 3.3, anti-aliased edges included — and on a real DVD, whose
+glyphs are a third the size, 3.4 against 2.2.
 """
 
 from __future__ import annotations
@@ -62,10 +63,16 @@ MISSING_DEPENDENCY = (
 # cannot see the difference, so it is asked first.
 OPAQUE_BELOW = 0.02
 # An index this much of the way to the deepest one is part of the glyph.
-# Measured on generated discs, the fill sits around 6.1 and the outline
-# around 3.3 whether or not the edges are anti-aliased, so 0.6 lands in the
-# gap with room on both sides.
-DEPTH_RATIO = 0.6
+# Two measurements set it. On a Blu-ray's big glyphs the fill sits around
+# 6.1 and the outline around 3.3 — a ratio of 0.54. On a real 720x576 DVD
+# the glyphs are small and the outline thin, and the same two numbers come
+# out 3.4 and 2.2 — 0.65. A threshold of 0.6 therefore split Blu-ray
+# correctly and called a DVD's outline part of the letter, which then
+# tripped the "too much ink" inversion below and emptied the mask: 602 of
+# that disc's 1144 subtitles vanished, because bitmap_cues reads an empty
+# mask as a clear event. 0.7 clears both, and the floor below catches
+# whatever a third format does.
+DEPTH_RATIO = 0.7
 # indices thinner than this share of the opaque area are edge blending, and
 # their means are too noisy to rank
 MIN_INDEX_SHARE = 0.01
@@ -184,6 +191,11 @@ def ink_mask(indices: np.ndarray) -> np.ndarray:
         # the "interior" turned out to be a plate sitting on a transparent
         # frame; the letters are the opaque pixels it does not cover
         ink = opaque & ~ink
+    if not ink.any():
+        # 分不出填充与描边时，整个不透明形状交出去——字形带着描边仍然认得出，
+        # 而空掩码会让调用方把这一条当成「清屏事件」整个丢掉。实测一张真 DVD
+        # （720x576 法语 VobSub）上，这两件事一起发生过 602 次，占全片一半。
+        return opaque
     return ink
 
 
@@ -240,6 +252,7 @@ def bitmap_cues(
         offset = 0.0 if track["path"] else mux.start_offset(container, source)
 
         open_cue: Optional[Cue] = None
+        open_timed = False      # 这条 cue 自己说得出时长吗
         for packet in container.demux(stream):
             if should_cancel and should_cancel():
                 raise InterruptedError
@@ -266,14 +279,28 @@ def bitmap_cues(
                 # composition at the moment the words leave the screen. The
                 # packet duration is not to be trusted for this: on a .sup
                 # it comes back as 0xFFFFFFFF, i.e. a cue lasting 49 days.
-                open_cue.end = at
+                #
+                # VobSub has no clear events at all and writes the real
+                # duration in end_display_time instead. When a cue said how
+                # long it lasts, the next one may only **cut it short**:
+                # stretching it to the next cue leaves a line on screen
+                # through every silence — measured on a real DVD, one cue
+                # was told to last 1.4s and would have run 2.8s.
+                open_cue.end = min(open_cue.end, at) if open_timed else at
                 cues.append(open_cue)
                 open_cue = None
             if not rects or not any(m.any() for _x, _y, m in rects):
                 continue  # the clear itself carries no picture
             end = at + DEFAULT_CUE_SECONDS
             span = float((packet.duration or 0) * packet.time_base)
-            if 0 < span <= MAX_CUE_SECONDS:
+            if not 0 < span <= MAX_CUE_SECONDS:
+                # milliseconds relative to pts whatever the time_base says —
+                # the same field subsource.read_cues falls back to. PGS
+                # leaves it at 0xFFFFFFFF, which this range check throws out
+                # exactly as it throws out the packet duration.
+                span = max(subset.end_display_time, 0) / 1000.0
+            open_timed = 0 < span <= MAX_CUE_SECONDS
+            if open_timed:
                 end = at + span
             open_cue = Cue(at, end, _compose(rects, upscale))
         if open_cue is not None:

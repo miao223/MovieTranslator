@@ -199,6 +199,158 @@ def test_the_missing_dependency_says_how_to_install_it(monkeypatch, tmp_path):
     assert "视觉大模型" in str(exc.value)  # the way out that needs no install
 
 
+class _FakeRect:
+    """One bitmap rect, shaped exactly like PyAV hands them over."""
+
+    type = b"bitmap"
+
+    def __init__(self, indices, x=0, y=0):
+        self.width, self.height = indices.shape[1], indices.shape[0]
+        self.x, self.y = x, y
+        self.planes = [memoryview(indices.tobytes())]
+
+
+class _FakeSubset(list):
+    def __init__(self, rects, end_display_time):
+        super().__init__(rects)
+        self.end_display_time = end_display_time
+
+
+class _FakePacket:
+    time_base = 1 / 1000
+
+    def __init__(self, pts_ms, duration=0):
+        self.pts, self.duration, self.size = pts_ms, duration, 1
+
+
+class _FakeStream:
+    index = 0
+
+    def __init__(self, events):
+        self._events = dict(events)
+
+    def decode2(self, packet):
+        return self._events.get(packet.pts)
+
+
+class _FakeContainer:
+    """PyAV's shape for a subtitle container, measured from the real thing.
+
+    Both halves come from running the real decoders: a .sup answers
+    end_display_time=4294967295 and marks the end with a rect-less subset,
+    while a DVD's .idx answers a real millisecond count and never sends one.
+    """
+
+    def __init__(self, stream, packets):
+        self.streams = type("S", (), {"subtitles": [stream]})()
+        self._packets = packets
+
+    def demux(self, _stream):
+        return iter(self._packets)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _glyph():
+    import numpy as np
+
+    from tests import pgs
+
+    return np.array(pgs.render("Hello there", "outline", size=20, stroke=1))
+
+
+def _run_fake(monkeypatch, events, packets):
+    container = _FakeContainer(_FakeStream(events), packets)
+    monkeypatch.setattr(ocr.av, "open", lambda *a, **k: container)
+    track = {"index": 0, "path": "/x/film.idx", "text": False}
+    return ocr.bitmap_cues("/x/film.idx", track)
+
+
+def test_a_cue_that_states_its_own_length_is_not_stretched(monkeypatch):
+    """VobSub 没有清屏事件，它把时长写在 end_display_time 里。
+
+    从前只认 packet.duration（DVD 上恒为 0），于是每条 cue 都被延长到下一条
+    开始——一段静默里字幕就那么挂在屏幕上。实测真碟：一条说自己 1.4 秒的
+    字幕被拉成了 2.8 秒，全片没有一处空档。
+    """
+    glyph = _glyph()
+    packets = [_FakePacket(1000), _FakePacket(5000)]
+    events = {1000: _FakeSubset([_FakeRect(glyph)], 1400),
+              5000: _FakeSubset([_FakeRect(glyph)], 1400)}
+
+    cues = _run_fake(monkeypatch, events, packets)
+
+    assert len(cues) == 2
+    assert cues[0].start == pytest.approx(1.0)
+    assert cues[0].end == pytest.approx(2.4)      # 自己说的 1.4 秒，不是 5.0
+    assert cues[1].end == pytest.approx(6.4)
+
+
+def test_a_clear_event_still_ends_a_cue_that_states_nothing(monkeypatch):
+    """PGS 那一侧一个字不变：它的 end_display_time 是 0xFFFFFFFF（不知道），
+    真正的结束由它自己的清屏事件给出。"""
+    glyph = _glyph()
+    unknown = 0xFFFFFFFF
+    packets = [_FakePacket(1000), _FakePacket(3500)]
+    events = {1000: _FakeSubset([_FakeRect(glyph)], unknown),
+              3500: _FakeSubset([], unknown)}      # 清屏：没有任何 rect
+
+    cues = _run_fake(monkeypatch, events, packets)
+
+    assert len(cues) == 1
+    assert cues[0].end == pytest.approx(3.5)      # 清屏的时刻，不是 4 秒默认值
+
+
+def test_a_dvd_thin_outline_is_still_told_from_the_fill():
+    """真 DVD 的字比蓝光小，描边也细，两者的平均深度只差三分之一。
+
+    实测一张 720x576 的法语 VobSub：填充 3.4、描边 2.2，比值 0.65。阈值原本
+    是 0.6，于是**描边被算进了字**——`e`、`o` 的封闭区被糊死，更糟的是随后
+    「墨水太多」那条反转把整张掩码清空，调用方便把这一条当成清屏事件丢掉。
+    实测那一张碟上，1144 条字幕有 602 条就这样凭空消失。
+    """
+    import numpy as np
+
+    from tests import pgs
+
+    img = pgs.render("Quelques renseignements", "outline", size=20, stroke=1)
+    indices = np.array(img)
+    opaque = indices != 0
+    depth = ocr.depth_map(opaque)
+    fill = depth[indices == 2].mean()
+    outline = depth[indices == 1].mean()
+    # 先把这张图确实落在 DVD 那个区间里钉住，否则测的就不是这件事
+    assert 0.6 < outline / fill < 0.72
+
+    mask = ocr.ink_mask(indices)
+    assert mask.any()                       # 这一条没有凭空消失
+    # 而且描边没有被算成字：它在掩码里的占比必须很低
+    assert mask[indices == 1].mean() < 0.1
+    assert mask[indices == 2].mean() > 0.9  # 填充一个不少
+
+
+def test_a_bitmap_we_cannot_separate_is_handed_over_whole():
+    """分不出填充与描边时，宁可把整个不透明形状交出去。
+
+    空掩码会被 bitmap_cues 当成「清屏事件」，于是一条真字幕整个消失——而带着
+    描边的字形至少还认得出来。丢字比糊字严重得多。
+    """
+    import numpy as np
+
+    # 一大片同一个索引：深度处处相同，怎么排都分不出填充和描边，
+    # 而且不透明部分超过一半，会触发「墨水太多」的反转
+    indices = np.ones((20, 20), dtype=np.uint8)
+    indices[0, :] = 0                       # 留一点透明，走深度那条分支
+    mask = ocr.ink_mask(indices)
+
+    assert mask.any()
+    assert (mask == (indices != 0)).all()   # 整块交出去
+
+
 @pytest.mark.parametrize("code,model", [
     ("ja", "japan"), ("en", "en"), ("zh", "ch"), ("ko", "korean"),
     ("", "en"), ("de", "latin"),
