@@ -42,7 +42,7 @@ from typing import List, Optional, Tuple
 from pydantic import ValidationError
 
 from app.core import config
-from app.models.schemas import AppSettings, JobRequest, QueueEntry
+from app.models.schemas import AppSettings, DiscRequest, JobRequest, QueueEntry
 
 # Terminal states, the same three the rest of the app uses (batch.TERMINAL).
 TERMINAL = {"done", "failed", "cancelled"}
@@ -100,6 +100,33 @@ def settings_hash(settings: Optional[AppSettings]) -> str:
         data.get("llm", {}).pop(key, None)
     blob = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+
+
+def describe_entry(entry: QueueEntry) -> str:
+    """The summary line for any kind of entry."""
+    if entry.kind == "disc":
+        return describe_disc(entry.disc)
+    return describe(entry.request)
+
+
+def describe_disc(request: Optional[DiscRequest]) -> str:
+    """One scannable line: "原盘封装 · 3 个标题 · 分集 · 起始第 5 集"."""
+    if request is None:
+        return ""
+    parts = ["原盘封装",
+             f"{len(request.titles)} 个标题" if request.titles else "按默认勾选"]
+    if request.series is not None:
+        parts.append("分集" if request.series else "整片")
+    # a box set's second volume starts at 7 without anyone having said
+    # "series" — the number is worth showing either way
+    if request.episode_start not in (None, 1):
+        parts.append(f"从第 {request.episode_start} 集起")
+    mode = request.effective_output_mode()
+    if mode == "custom":
+        parts.append(f"输出到 {request.output_dir}")
+    elif mode == "inside":
+        parts.append("放进光盘自己的文件夹")
+    return " · ".join(parts)
 
 
 def describe(request: Optional[JobRequest]) -> str:
@@ -306,6 +333,25 @@ class QueueStore:
             self.save()
             return entry
 
+    def add_disc(self, request: DiscRequest, settings: AppSettings,
+                 group_id: str = "", group_title: str = "") -> QueueEntry:
+        with self.lock:
+            if sum(1 for e in self.entries if e.status == "queued") >= MAX_QUEUED:
+                raise ValueError(f"列队已满（最多 {MAX_QUEUED} 条等待中的任务）")
+            entry = QueueEntry(
+                id=uuid.uuid4().hex[:12],
+                kind="disc",
+                title=request.path,
+                created_at=time.time(),
+                disc=request,
+                settings=settings,
+                group_id=group_id,
+                group_title=group_title,
+            )
+            self.entries.append(entry)
+            self.save()
+            return entry
+
     def remove(self, entry_id: str) -> bool:
         with self.lock:
             entry = self.get(entry_id)
@@ -429,7 +475,10 @@ class QueueManager:
             if self.store.paused:
                 return
             entry = self.store.next_queued()
-            if entry is None or entry.request is None:
+            payload = None
+            if entry is not None:
+                payload = entry.disc if entry.kind == "disc" else entry.request
+            if entry is None or payload is None:
                 if entry is not None:            # unreadable request
                     entry.status = "failed"
                     entry.error = entry.error or "这条任务的参数无法读取"
@@ -444,15 +493,18 @@ class QueueManager:
             # just did. The interrupted count is not, and is left alone.
             entry.note = ""
             self.store.save()
-            entry_id, request, settings = entry.id, entry.request, entry.settings
+            entry_id, kind, settings = entry.id, entry.kind, entry.settings
 
         # The glossary store is memory-only, so a batch that spans a restart
         # starts a fresh one. Same trade as re-running an interrupted job.
-        if request.series_id and series.get(request.series_id) is None:
-            series.create(request.series_id)
+        if kind == "job" and payload.series_id and series.get(payload.series_id) is None:
+            series.create(payload.series_id)
 
         try:
-            job = job_manager.create(request, settings=settings)
+            if kind == "disc":
+                job = job_manager.create_disc(payload, settings=settings)
+            else:
+                job = job_manager.create(payload, settings=settings)
         except Exception as exc:  # noqa: BLE001 — one bad file must not stop the queue
             with self.store.lock:
                 current = self.store.get(entry_id)
@@ -495,6 +547,7 @@ class QueueManager:
             entry.result_srt_original = job.status.original_srt_filename or ""
             entry.result_video = job.status.video_filename or ""
             entry.result_in_place = bool(job.status.srt_in_place)
+            entry.result_files = list(job.status.outputs)
             entry.finished_at = time.time()
             self.store.save()
         self._current = None
@@ -540,16 +593,24 @@ class QueueManager:
                 raise KeyError(entry_id)
             if entry.status not in TERMINAL:
                 raise ValueError("这条任务还没有结束")
-            if entry.request is None:
+            payload = entry.disc if entry.kind == "disc" else entry.request
+            if payload is None:
                 raise ValueError("这条任务的参数无法读取，无法重试")
             # Retry means "run that same thing again", so the snapshot is
             # reused; fresh=True re-reads current settings, and is forced
             # when the stored snapshot could not be loaded.
             settings = snapshot() if (fresh or entry.settings is None) \
                 else entry.settings
-            new = self.store.add(entry.request, settings,
-                                 group_id=entry.group_id,
-                                 group_title=entry.group_title)
+            if entry.kind == "disc":
+                # the same request, so the same checkpoint: titles finished
+                # last time are skipped, not written again as 片名.2.mkv
+                new = self.store.add_disc(payload, settings,
+                                          group_id=entry.group_id,
+                                          group_title=entry.group_title)
+            else:
+                new = self.store.add(payload, settings,
+                                     group_id=entry.group_id,
+                                     group_title=entry.group_title)
         self.nudge()
         return new
 

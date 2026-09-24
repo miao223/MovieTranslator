@@ -43,8 +43,10 @@ export const api = {
     request('/api/settings/test-vision', { method: 'POST', body: JSON.stringify(llm) }),
   testAsrApi: (llm) =>
     request('/api/settings/test-asr-api', { method: 'POST', body: JSON.stringify(llm) }),
-  browse: (path) =>
-    request(`/api/fs/browse?path=${encodeURIComponent(path || '')}`),
+  // mode='disc' lists .iso images and names which folders are discs
+  browse: (path, mode = '') =>
+    request(`/api/fs/browse?path=${encodeURIComponent(path || '')}`
+            + (mode ? `&mode=${mode}` : '')),
   resolvePath: (path) =>
     request(`/api/fs/resolve?path=${encodeURIComponent(path)}`),
   quickAccess: () => request('/api/fs/quick-access'),
@@ -75,6 +77,28 @@ export const api = {
   jobLogUrl: (id) => `/api/logs/job/${id}`,
   logs: () => request('/api/logs'),
   eventsUrl: (id) => `/api/jobs/${id}/events`,
+
+  // ------------------------------------------------------------- 原盘
+  // Asked again whenever a switch on the page changes: it reads only the
+  // disc's metadata, so it answers in milliseconds.
+  // null = let the server decide: 整片/分集 from the disc, the episode
+  // number from the volumes before it, the output place from the settings
+  discScan: ({ path, series = null, episodeStart = null, name = '', outputMode = null,
+               outputDir = '' }) =>
+    request(`/api/disc/scan?path=${encodeURIComponent(path)}`
+            + (series === null ? '' : `&series=${series}`)
+            + (episodeStart === null ? '' : `&episode_start=${episodeStart}`)
+            + `&name=${encodeURIComponent(name)}`
+            + (outputMode === null ? '' : `&output_mode=${outputMode}`)
+            + `&output_dir=${encodeURIComponent(outputDir)}`),
+  enqueueDisc: (payload) =>
+    request('/api/queue/disc', { method: 'POST', body: JSON.stringify(payload) }),
+  // the batch mode: every disc in a folder; asked again with the answers
+  // given so far whenever one changes
+  discBatchScan: (payload) =>
+    request('/api/disc/batch-scan', { method: 'POST', body: JSON.stringify(payload) }),
+  enqueueDiscBatch: (payload) =>
+    request('/api/queue/disc-batch', { method: 'POST', body: JSON.stringify(payload) }),
 
   // ------------------------------------------------------------- 列队
   queue: () => request('/api/queue'),

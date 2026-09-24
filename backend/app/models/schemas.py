@@ -234,6 +234,28 @@ class OcrSettings(BaseModel):
     # with wording aimed at look-alike glyphs instead of homophones.
 
 
+class DiscSettings(BaseModel):
+    """Remuxing Blu-ray / DVD / ISO discs to MKV (services/disc)."""
+
+    # Extras (behind-the-scenes, trailers, creditless openings…) are ticked
+    # by default: the user's call when the feature was designed. Each disc
+    # can still be changed title by title before it is queued.
+    export_extras: bool = True
+    # Titles shorter than this are logos, warnings and menu backgrounds —
+    # listed, never ticked by default.
+    min_title_seconds: int = Field(60, ge=0, le=3600)
+    # Matroska cannot hold a disc's own LPCM formats (pcm_bluray / pcm_dvd),
+    # so those tracks are converted — losslessly either way. FLAC is about
+    # half the size; PCM is for players that cannot decode FLAC.
+    lpcm: Literal["flac", "pcm"] = "flac"
+    # Where the MKVs go unless the 原盘 page says otherwise (DiscOutputMode).
+    # "beside" by the user's choice: Film (1992)/ → Film (1992).mkv next to
+    # it, so a library folder ends up holding films, not disc folders to
+    # open; a box set's volumes then land together in the set's folder.
+    output_mode: Literal["beside", "inside", "custom"] = "beside"
+    output_dir: str = ""             # for "custom"
+
+
 class AppSettings(BaseModel):
     # temp working dir for intermediate files; empty = platform cache dir.
     # only its "jobs" subdirectory is managed (and wiped on startup)
@@ -261,6 +283,7 @@ class AppSettings(BaseModel):
     network: NetworkSettings = NetworkSettings()
     server: ServerSettings = ServerSettings()
     mcp: MCPSettings = MCPSettings()
+    disc: DiscSettings = DiscSettings()
 
 
 # ---------------------------------------------------------------- jobs
@@ -422,8 +445,162 @@ class BatchRequest(BaseModel):
     series_mode: bool = False
 
 
+DiscOutputMode = Literal["beside", "inside", "custom"]
+
+
+class DiscRequest(BaseModel):
+    """Remux titles of one disc to MKV (原盘封装). Queue-only: a disc is
+    added to the queue from its own page, never started directly."""
+
+    path: str                        # disc folder, BDMV/VIDEO_TS, a file inside, or .iso
+    # title ids as GET /api/disc/scan reported them ("00800.mpls", "title03",
+    # "00001.mpls#2"). Empty = whatever the analysis ticks by default.
+    titles: list[str] = []
+    # base name of the outputs; "" = the disc's own, or its box set's
+    name: str = ""
+    # "beside" = in the folder the disc is in (Film/ → Film.mkv next to it);
+    # "inside" = in the disc's own folder (an .iso gets one, named after
+    # it); "custom" = output_dir. None = DiscSettings.output_mode. An entry
+    # queued before the modes existed has none and a non-empty output_dir
+    # only when one was chosen — read as "custom" (pipeline._execute_disc).
+    output_mode: Optional[DiscOutputMode] = None
+    output_dir: str = ""
+    # None = automatic: 1, or — for a volume of a box set — on from the
+    # volumes before it. Resolved when the entry is queued, like `titles`:
+    # the run must not depend on the discs next to this one (VOL01 may be
+    # gone by then).
+    episode_start: Optional[int] = Field(None, ge=0, le=9999)
+    # set when queued, for a volume of a box set: its extras number on from
+    # the other volumes', and what is numbered per disc is named with
+    # own_name (analyze.analyze)
+    extra_start: Optional[int] = Field(None, ge=1, le=9999)
+    own_name: str = ""
+    # the 整片/分集 answer; None = let the disc's structure decide. The same
+    # value must reach the run as reached the scan, or ids like
+    # "00001.mpls#2" would not exist when the work starts.
+    series: Optional[bool] = None
+
+    def effective_output_mode(self) -> str:
+        """output_mode, for an entry queued before the modes too: it had
+        only output_dir — a folder when one was chosen, empty for the
+        default place, which is "beside" now."""
+        return self.output_mode or ("custom" if self.output_dir.strip() else "beside")
+
+
+class DiscAnswer(BaseModel):
+    """What the 原盘 page's batch mode was told about one disc of the folder."""
+
+    path: str                        # DiscReport.path, as the scan gave it
+    series: Optional[bool] = None
+    name: str = ""
+    episode_start: Optional[int] = Field(None, ge=0, le=9999)
+    titles: list[str] = []           # for 加入列队: the ticks; [] = the defaults
+    include: bool = True             # for 加入列队: this disc is wanted at all
+
+
+class DiscBatchRequest(BaseModel):
+    """The batch mode's scan and its 加入列队: every disc in a folder."""
+
+    path: str                        # the folder
+    recursive: bool = True
+    output_mode: Optional[DiscOutputMode] = None
+    output_dir: str = ""
+    # answers given so far, by disc; a disc without one gets the defaults.
+    # 加入列队 queues exactly the discs listed here with include=True — not
+    # whatever the folder holds by then.
+    discs: list[DiscAnswer] = []
+
+
+class DiscStreamInfo(BaseModel):
+    kind: str
+    codec: str
+    language: str = ""
+    language_name: str = ""
+    detail: str = ""
+    forced: bool = False
+    commentary: bool = False
+    carried: bool = True             # False: listed on the disc, not in the MKV
+    note: str = ""
+
+
+class DiscTitleInfo(BaseModel):
+    id: str
+    number: int
+    label: str = ""                  # 正片 / 第 3 集 / 花絮 02 / 重复 …
+    category: str                    # main episode extra variant duplicate short loop still silent
+    selected: bool = False           # the default tick
+    selectable: bool = True
+    reason: str = ""
+    duplicate_of: str = ""
+    output: str = ""                 # file name it would get (before any .2)
+    ordinal: int = 0                 # episode / extra / version number; 0 for the rest
+    duration: float = 0.0
+    chapters: int = 0
+    size: Optional[int] = None       # bytes; None when unknown
+    video: str = ""
+    streams: list[DiscStreamInfo] = []
+    angles: int = 1
+    segments: int = 0
+    reachable: bool = False
+    notes: list[str] = []
+
+
+class DiscVolumeInfo(BaseModel):
+    """This disc as one volume of a box set (services/disc/volumes.py)."""
+
+    id: str                          # the same for every volume of the set
+    name: str                        # the set's shared name
+    index: int                       # 1-based
+    count: int
+    members: list[str] = []          # the volumes' folder / image names, in order
+    # False: a volume that is not a series volume (a bonus disc judged a
+    # film) — it keeps its own name and numbering
+    chained: bool = True
+    note: str = ""
+
+
+class DiscReport(BaseModel):
+    path: str
+    root: str
+    kind: Literal["bd", "dvd"]
+    source: Literal["dir", "iso"]
+    name: str                        # the base name in effect
+    label: str = ""                  # the disc's own title, when it has one
+    output_mode: DiscOutputMode = "beside"
+    output_dir: str                  # resolved; "" = a custom folder not chosen yet
+    mode: Literal["movie", "series"]
+    mode_reason: str = ""
+    series_choice: bool = False      # show the 整片/分集 switch
+    series_default: bool = False     # what the disc's structure alone says
+    series: Optional[bool] = None    # the answer this report was built with
+    episode_start: int = 1           # in effect (automatic or the user's)
+    extra_start: int = 1
+    volume: Optional[DiscVolumeInfo] = None
+    titles: list[DiscTitleInfo] = []
+    analysis_only: bool = False      # metadata only: can be analysed, not remuxed
+    encrypted: bool = False
+    free_bytes: Optional[int] = None
+    warnings: list[str] = []
+
+
+class DiscSkipped(BaseModel):
+    path: str
+    reason: str
+
+
+class DiscBatchReport(BaseModel):
+    path: str
+    recursive: bool = True
+    output_mode: DiscOutputMode = "beside"
+    output_dir: str = ""
+    discs: list[DiscReport] = []
+    skipped: list[DiscSkipped] = []  # found but unreadable, with why
+
+
 JobStage = Literal[
     "pending",
+    # remuxing a disc's titles to MKV (DiscRequest) — a job of its own kind
+    "remuxing",
     "extracting",
     # reading a subtitle the release already carries, in place of
     # extracting + transcribing (text_source="subtitle")
@@ -466,6 +643,8 @@ class JobStatus(BaseModel):
     # embed mode: the new video carrying the subtitle track. Empty otherwise,
     # so the UI can tell the two outcomes apart from this field alone.
     video_filename: str = ""
+    # disc remux: every MKV written, full paths. Empty for every other job.
+    outputs: list[str] = []
 
 
 class ProgressEvent(BaseModel):
@@ -509,7 +688,8 @@ class QueueEntry(BaseModel):
 
     id: str
     kind: str = "job"          # a free string, not a Literal: an entry from a
-                               # newer version should report itself, not fail
+                               # newer version should report itself, not fail.
+                               # "job" = translate (request), "disc" = remux (disc)
     status: Literal["queued", "running", "done", "failed", "cancelled"] = "queued"
     title: str = ""            # survives even when the rest cannot be parsed
     created_at: float = 0.0
@@ -517,6 +697,7 @@ class QueueEntry(BaseModel):
     finished_at: float = 0.0
     job_id: str = ""
     request: Optional[JobRequest] = None
+    disc: Optional[DiscRequest] = None
     settings: Optional[AppSettings] = None
     error: str = ""
     note: str = ""
@@ -533,6 +714,8 @@ class QueueEntry(BaseModel):
     result_srt_original: str = ""   # bilingual_split 的原文那一份
     result_video: str = ""
     result_in_place: bool = False
+    # disc remux: every MKV it wrote (JobStatus.outputs), full paths
+    result_files: list[str] = []
     # Files enqueued from one directory share these, so the UI can collapse
     # them into a single row instead of drowning the list.
     group_id: str = ""
@@ -571,6 +754,7 @@ class QueueEntryView(BaseModel):
     result_srt_original: str = ""
     result_video: str = ""
     result_in_place: bool = False
+    result_files: list[str] = []
     group_id: str = ""
     group_title: str = ""
 

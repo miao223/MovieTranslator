@@ -26,6 +26,7 @@ from app.core.debuglog import DebugLog, open_debug_log
 from app.core.joblog import JobLogWriter, _settings_lines as joblog_settings_lines
 from app.models.schemas import (
     AppSettings,
+    DiscRequest,
     JobRequest,
     JobStatus,
     ProgressEvent,
@@ -101,9 +102,14 @@ def checkpoint_key(job: Job, settings: AppSettings) -> str:
     from app.core.joblog import APP_VERSION
     from app.services.jobqueue import settings_hash
 
-    video = Path(job.request.video_path)
+    video = Path(job.request.video_path) if job.kind == "job" else Path(job.request.path)
+    # A disc is stamped by its index file (or the .iso itself), never by
+    # its folder: the MKVs are written into that folder, and the folder's
+    # mtime changes with the first one — which would make every resumed
+    # attempt look like different work.
+    anchor = _disc_anchor(job.request.path) if job.kind == "disc" else video
     try:
-        stat = video.stat()
+        stat = anchor.stat() if anchor is not None else video.stat()
         stamp = f"{stat.st_mtime_ns}:{stat.st_size}"
     except OSError:
         stamp = "missing"
@@ -113,6 +119,16 @@ def checkpoint_key(job: Job, settings: AppSettings) -> str:
         job.request.model_dump_json(),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _disc_anchor(path: str) -> Optional[Path]:
+    from app.services.disc.binary import DiscError
+    from app.services.disc.fs import locate
+
+    try:
+        return locate(path).fs.anchor()
+    except (DiscError, OSError):
+        return None
 
 
 # 「这个源没有画面」有两种，降级的动作完全一样，说法必须不一样：用户看到
@@ -137,11 +153,16 @@ def _settings_for(job: Job) -> AppSettings:
 
 
 class Job:
-    def __init__(self, request: JobRequest, audio_only: Optional[bool] = None,
+    def __init__(self, request, audio_only: Optional[bool] = None,
                  settings: Optional[AppSettings] = None,
                  source_kind: str = ""):
         self.id = uuid.uuid4().hex[:12]
         self.request = request
+        # "job" translates a file (JobRequest); "disc" remuxes a disc's
+        # titles to MKV (DiscRequest). Everything that follows the job — SSE,
+        # cancel, the log, the queue — is the same for both.
+        self.kind = "disc" if isinstance(request, DiscRequest) else "job"
+        path = request.path if self.kind == "disc" else request.video_path
         # A source with no picture cannot be muxed into a video and has no
         # frames to translate. Worked out here rather than only in
         # JobManager.create so that a Job built directly (as the tests do)
@@ -149,7 +170,8 @@ class Job:
         # so the container is opened once per job, not twice.
         # 'video' / 'audio' / 'subtitle' —— 这个任务实际在读什么。create 把
         # 自己那次探测传进来，好让一个任务只开一次文件。
-        self.source_kind = source_kind or media.probe_kind(request.video_path)
+        self.source_kind = source_kind or (
+            "disc" if self.kind == "disc" else media.probe_kind(request.video_path))
         # 下面每一处守卫问的其实都是「有没有画面」，字幕文件与纯音频同答
         self.audio_only = (
             audio_only if audio_only is not None
@@ -163,7 +185,7 @@ class Job:
         self.settings = settings
         self.checkpoint = ""      # set by _workdir_for when resuming is on
         self.source_subtitle = ""  # the sidecar the text was read from, if any
-        self.status = JobStatus(id=self.id, video_path=request.video_path)
+        self.status = JobStatus(id=self.id, video_path=path)
         self.cancel_event = threading.Event()
         self.events: List[ProgressEvent] = []
         self.subscribers: List[queue.Queue] = []
@@ -174,6 +196,7 @@ class Job:
         self.stem = (
             media.base_stem(request.video_path)
             if self.source_kind == "subtitle"
+            else Path(path).name if self.kind == "disc"
             else Path(request.video_path).stem
         )
         self.srt_path: Optional[Path] = None
@@ -181,7 +204,8 @@ class Job:
         # （srt_filename / result_srt / 下载按钮）照旧只认 srt_path。
         self.extra_srt_paths: List[Path] = []
         # everything published below is mirrored into a downloadable file
-        self.logfile = JobLogWriter(self.id, request.video_path)
+        self.logfile = JobLogWriter(self.id, path,
+                                    "原盘路径" if self.kind == "disc" else "视频文件")
 
     # -------------------------------------------------------- events
 
@@ -285,6 +309,20 @@ class JobManager:
                 )
         job = Job(request, audio_only=audio_only, settings=settings,
                   source_kind=kind)
+        self._evict_old()
+        self.jobs[job.id] = job
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return job
+
+    def create_disc(self, request: DiscRequest,
+                    settings: Optional[AppSettings] = None) -> Job:
+        """A disc remux job. Only the queue starts these (the 原盘 page has
+        just 加入列队), so everything about the disc itself was checked when
+        it was added; here it only has to still be there."""
+        source = Path(request.path.strip().strip('"').strip("'")).expanduser()
+        if not source.exists():
+            raise FileNotFoundError(f"原盘不存在: {source}")
+        job = Job(request, settings=settings)
         self._evict_old()
         self.jobs[job.id] = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
@@ -604,7 +642,181 @@ class JobManager:
         job.logfile.write_media(req.video_path)
         job.logfile.section("进度", [])
 
-    def _execute(self, job: Job, req: JobRequest, workdir: Path) -> None:
+    def _execute_disc(self, job: Job, req: DiscRequest, workdir: Path) -> None:
+        """Remux the chosen titles of one disc, one MKV each.
+
+        The disc is analysed again here, with the answers the page was given
+        (series, episode_start, name), so the names written are the names
+        the list showed. A title that fails does not stop the others — a
+        broken extra must not cost the film — and each finished title is
+        recorded in the checkpoint directory, so a retry after a crash or a
+        failure skips straight to what is still missing instead of writing
+        the film again as 片名.2.mkv.
+        """
+        from app.services.disc import DiscError, open_disc
+        from app.services.disc import report as disc_report
+        from app.services.disc.analyze import analyze, hms
+        from app.services.disc.remux import remux_title
+
+        settings = _settings_for(job)
+        job.logfile.write_environment()
+        job.logfile.write_disc_request(req)
+        job.logfile.write_settings(settings)
+        job.publish("remuxing", 0, message="读取光盘结构…")
+        try:
+            disc = open_disc(req.path)
+        except DiscError as exc:
+            raise RuntimeError(str(exc)) from exc
+        # the naming was settled when the entry was queued (a box set's
+        # volume numbers on from the volumes next to it); the run uses it
+        # as given and never looks at those volumes again
+        episode_start = req.episode_start if req.episode_start is not None else 1
+        analysis = analyze(disc, export_extras=settings.disc.export_extras,
+                           min_seconds=settings.disc.min_title_seconds,
+                           series=req.series, episode_start=episode_start,
+                           name=req.name, extra_start=req.extra_start or 1,
+                           own_name=req.own_name)
+        report = disc_report.build(disc, analysis, name=req.name,
+                                   output_mode=req.effective_output_mode(),
+                                   output_dir=req.output_dir, series=req.series,
+                                   episode_start=episode_start,
+                                   extra_start=req.extra_start or 1)
+        wanted = list(dict.fromkeys(req.titles)) or [t.id for t in report.titles if t.selected]
+        # The ticks in the log are this job's, not the analysis's defaults:
+        # a job that took one episode and two extras must not read, when
+        # the log is opened to find out what happened, as if it wrote six.
+        for info in report.titles:
+            info.selected = info.id in wanted
+        job.logfile.section("光盘结构", disc_report.lines(report))
+        job.logfile.section("进度", [])
+        if disc.encrypted:
+            raise RuntimeError("这张盘仍是加密状态，本程序不做解密，无法封装")
+        if disc.analysis_only:
+            raise RuntimeError("这是只有元数据的副本（没有视频文件），无法封装")
+
+        by_id = {t.id: t for t in analysis.titles}
+        missing = [i for i in wanted if i not in by_id]
+        if missing:
+            raise RuntimeError(
+                f"光盘里找不到这些标题：{'、'.join(missing)}（光盘内容变了？请在「原盘」页重新分析后再加入列队）")
+        refused = [i for i in wanted if not analysis.verdicts[i].selectable]
+        if refused:
+            raise RuntimeError("这些标题无法封装：" + "；".join(
+                f"{i}（{analysis.verdicts[i].reason}）" for i in refused))
+        if not wanted:
+            raise RuntimeError("没有勾选任何标题")
+        titles = [by_id[t.id] for t in report.titles if t.id in wanted]
+        if not report.output_dir:
+            raise RuntimeError("没有输出文件夹：选了「指定的文件夹」却没有给出是哪个")
+        out_dir = Path(report.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        done_path = workdir / "remux_done.json"
+        try:
+            done = json.loads(done_path.read_text(encoding="utf-8")) if job.checkpoint else {}
+        except (OSError, ValueError):
+            done = {}
+
+        def finished(title) -> Optional[Path]:
+            prev = done.get(title.id) or {}
+            path = Path(prev.get("path", ""))
+            try:
+                return path if path.name and path.stat().st_size == prev.get("size") else None
+            except OSError:
+                return None
+
+        todo = [t for t in titles if finished(t) is None]
+        need = sum(t.size or 0 for t in todo)
+        free = disc_report.free_bytes(out_dir)
+        if free is not None and need and free < need + (1 << 30):
+            raise RuntimeError(
+                f"输出目录空间不足：需要约 {need / (1 << 30):.1f} GB（另留 1 GB 余量），"
+                f"只剩 {free / (1 << 30):.1f} GB——{out_dir}")
+
+        weights = [max(t.size or 1, 1) for t in titles]
+        total = float(sum(weights))
+        at = 0.0
+        failures: List[str] = []
+        started = time.monotonic()
+        for n, (title, weight) in enumerate(zip(titles, weights), start=1):
+            verdict = analysis.verdicts[title.id]
+            label = disc_report.label(verdict)
+            prior = finished(title)
+            if prior is not None:
+                job.status.outputs.append(str(prior))
+                at += weight
+                job.publish("remuxing", 100 * at / total,
+                            log=f"↻ {title.id}（{label}）上次已经封装好了：{prior.name}，跳过")
+                continue
+            target = mux.free_path(out_dir / verdict.output)
+            if target.name != verdict.output:
+                job.publish("remuxing", 100 * at / total,
+                            log=f"输出目录里已有 {verdict.output}，这次写成 {target.name}"
+                                "（本程序绝不覆盖已有文件）")
+            head = f"封装 {n}/{len(titles)}：{label}"
+            job.publish("remuxing", 100 * at / total, message=f"{head}…",
+                        log=f"开始封装 {title.id}（{label}，{hms(title.duration)}）→ {target.name}")
+            shown = {"pct": -1, "time": 0.0}
+
+            def progress(f: float, at=at, weight=weight, head=head, shown=shown) -> None:
+                # every 200 packets is thousands of events on a Blu-ray, and
+                # each one also lands in the job log. The queue page polls
+                # every 2 s, so more than one line per 2 s shows nothing; a
+                # stalled read still gets a line every 10 s. (It was "every
+                # 0.5 %": 200 lines per title, 2600 for a season.)
+                pct = int(f * 100)
+                now = time.monotonic()
+                quiet = now - shown["time"]
+                if quiet < 2 or (pct == shown["pct"] and quiet < 10):
+                    return
+                shown["pct"], shown["time"] = pct, now
+                overall = (at + weight * min(max(f, 0.0), 1.0)) / total
+                job.publish("remuxing", 100 * overall,
+                            message=f"{head} {f:.0%}" + _eta(started, overall, True))
+
+            try:
+                result = remux_title(
+                    disc, title, target, lpcm=settings.disc.lpcm,
+                    log=lambda m: job.publish("remuxing", job.status.progress, log=m),
+                    progress=progress, should_cancel=job.cancel_event.is_set)
+            except InterruptedError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — one title must not cost the rest
+                failures.append(f"{title.id}（{label}）：{exc}")
+                job.publish("remuxing", job.status.progress,
+                            log=f"✕ {title.id}（{label}）封装失败：{exc}\n{traceback.format_exc()}")
+                at += weight
+                continue
+            for note in result.notes:
+                job.publish("remuxing", job.status.progress, log=note)
+            fixes = ""
+            if result.adjusted or result.dropped:
+                fixes = f"，接缝处修正 {result.adjusted} 个、丢弃 {result.dropped} 个重叠的数据包"
+            size = (f"{result.bytes / (1 << 30):.2f} GB" if result.bytes >= 1 << 30
+                    else f"{result.bytes / (1 << 20):.1f} MB")
+            job.publish("remuxing", 100 * (at + weight) / total,
+                        log=f"✓ {target.name}：{size}，"
+                            f"{len(result.tracks)} 条轨道，{result.chapters} 章，"
+                            f"用时 {hms(result.seconds)}{fixes}")
+            done[title.id] = {"path": str(target), "size": result.bytes}
+            if job.checkpoint:
+                try:
+                    done_path.write_text(json.dumps(done, ensure_ascii=False), encoding="utf-8")
+                except OSError:
+                    pass
+            job.status.outputs.append(str(target))
+            at += weight
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} 个标题封装失败（其余的已完成；重试会跳过已完成的）："
+                + "；".join(failures))
+        job.publish("done", 100,
+                    message=f"已封装 {len(job.status.outputs)} 个文件到 {out_dir}")
+
+    def _execute(self, job: Job, req, workdir: Path) -> None:
+        if job.kind == "disc":
+            self._execute_disc(job, req, workdir)
+            return
         settings = _settings_for(job)
         self._write_diagnostics(job, req, settings)
         if job.audio_only and req.embed_subtitle:

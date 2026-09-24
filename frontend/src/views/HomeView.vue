@@ -1,7 +1,8 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
+import FileBrowser from '../components/FileBrowser.vue'
 
 // lets the 前往列队 link switch tabs; App.vue owns activeTab
 const emit = defineEmits(['goto'])
@@ -257,7 +258,7 @@ watch(() => form.video_path, () => {
     // 字幕文件没有音轨可列，它自己就是那条字幕轨——两个探测都只会白跑
     if (isSubtitleSource.value) {
       tracks.value = []
-      subTracks.value = []
+      subs.value = []
       return
     }
     probeTracks()
@@ -283,74 +284,20 @@ function removeFrameTask(i) {
 }
 
 // ---------------------------------------------------------- file browser
+// the dialog itself is components/FileBrowser.vue, shared with 原盘
 const browserVisible = ref(false)
-const browser = reactive({ path: '', parent: null, dirs: [], files: [] })
-const addressInput = ref('')
-const quickAccess = ref([])
 const browsePick = ref('file') // 'file' | 'dir' — what the dialog selects
+const fileBrowser = ref(null)
 
-function pickThisDir() {
-  if (!browser.path) return
-  batchForm.directory = browser.path
-  browserVisible.value = false
-}
-
-async function openBrowser(path = '', pick = null) {
+function openBrowser(path = '', pick = null) {
   if (pick) browsePick.value = pick
-  try {
-    const data = await api.browse(path)
-    Object.assign(browser, data)
-    addressInput.value = data.path
-    browserVisible.value = true
-    if (!quickAccess.value.length) {
-      api.quickAccess().then((r) => (quickAccess.value = r.items)).catch(() => {})
-    }
-  } catch (e) {
-    ElMessage.error(e.message)
-  }
+  // the component lists with the mode it has, so let the prop land first
+  nextTick(() => fileBrowser.value?.open(path))
 }
 
-// jump to a pasted Explorer path: a folder opens it, a full media file
-// path selects it directly (quotes from "复制文件地址" are stripped server-side)
-async function jumpToAddress() {
-  const raw = addressInput.value.trim()
-  if (!raw) return
-  try {
-    const r = await api.resolvePath(raw)
-    if (r.type === 'dir') {
-      openBrowser(r.path)
-    } else if (r.type === 'file' && r.is_media && browsePick.value === 'file') {
-      form.video_path = r.path
-      browserVisible.value = false
-      ElMessage.success('已选择: ' + r.path)
-    } else if (r.type === 'file' && browsePick.value === 'dir') {
-      ElMessage.warning('当前在选择目录，请粘贴文件夹路径或点「选择此目录」')
-    } else if (r.type === 'file') {
-      ElMessage.warning('该文件不是支持的视频 / 音频格式')
-    } else {
-      ElMessage.warning('路径不存在: ' + r.path)
-    }
-  } catch (e) {
-    ElMessage.error(e.message)
-  }
-}
-
-function joinPath(dir, name) {
-  if (!dir) return name
-  const sep = dir.includes('\\') ? '\\' : '/'
-  return dir.endsWith(sep) ? dir + name : dir + sep + name
-}
-
-function pickFile(name) {
-  if (browsePick.value === 'dir') return
-  form.video_path = joinPath(browser.path, name)
-  browserVisible.value = false
-}
-
-function fmtSize(bytes) {
-  if (bytes > 1 << 30) return (bytes / (1 << 30)).toFixed(1) + ' GB'
-  if (bytes > 1 << 20) return (bytes / (1 << 20)).toFixed(1) + ' MB'
-  return (bytes / 1024).toFixed(0) + ' KB'
+function onBrowsePick(path) {
+  if (browsePick.value === 'dir') batchForm.directory = path
+  else form.video_path = path
 }
 
 // ---------------------------------------------------------------- job
@@ -361,6 +308,7 @@ let eventSource = null
 
 const STAGE_LABELS = {
   pending: '排队中',
+  remuxing: '原盘封装',
   extracting: '提取音频',
   importing: '读取字幕',
   transcribing: '语音识别',
@@ -568,7 +516,8 @@ async function startBatchScan() {
     if (!r.total) {
       ElMessage.warning(
         '目录中没有需要翻译的视频、音频或字幕'
-        + (r.skipped.length ? `（${r.skipped.length} 个已有字幕，被跳过）` : ''),
+        + (r.skipped.length ? `（${r.skipped.length} 个已有字幕，被跳过）` : '')
+        + (r.disc_count ? `；有 ${r.disc_count} 张原盘，请到「原盘」页封装成 MKV 后再翻译` : ''),
       )
       return
     }
@@ -1189,6 +1138,21 @@ onBeforeUnmount(() => {
         挪出这个目录。
       </div>
     </el-alert>
+    <!-- a disc's stream folder is the film, pieces of the film, menus and
+         trailers side by side: translating them file by file would do the
+         same film several times over -->
+    <el-alert
+      v-if="scanResult && scanResult.disc_count"
+      type="warning"
+      :closable="false"
+      style="margin-top: 12px"
+      :title="`跳过了 ${scanResult.disc_count} 张原盘（BDMV / VIDEO_TS 文件夹或 .iso）`"
+    >
+      <div class="hint" style="display: block">
+        原盘里的视频文件是正片、正片的分段、菜单和预告混在一起的，逐个翻译会把同一部片翻好几遍。
+        请先到<strong>「原盘」</strong>页把它们封装成 MKV（选「批量」可以把这个目录里的原盘一次列出来），再翻译那些 MKV。
+      </div>
+    </el-alert>
     <el-alert
       v-if="scanResult && scanResult.subtitle_count"
       type="info"
@@ -1219,50 +1183,12 @@ onBeforeUnmount(() => {
     </template>
   </el-dialog>
 
-  <el-dialog
+  <FileBrowser
+    ref="fileBrowser"
     v-model="browserVisible"
-    :title="browsePick === 'dir' ? '选择目录' : '选择视频 / 音频文件'"
-    width="680px"
-  >
-    <div class="browser-path">
-      <el-button size="small" :disabled="browser.parent === null" @click="openBrowser(browser.parent)">
-        ↑ 上级
-      </el-button>
-      <el-input
-        v-model="addressInput"
-        size="small"
-        placeholder="粘贴文件夹或视频 / 音频文件的完整路径，回车跳转"
-        @keyup.enter="jumpToAddress"
-      >
-        <template #append>
-          <el-button @click="jumpToAddress">跳转</el-button>
-        </template>
-      </el-input>
-    </div>
-    <div v-if="quickAccess.length" class="quick-access">
-      <el-tag
-        v-for="q in quickAccess" :key="q.path"
-        class="quick-item" effect="plain" @click="openBrowser(q.path)"
-      >
-        {{ q.name }}
-      </el-tag>
-    </div>
-    <div class="browser-list">
-      <div v-for="d in browser.dirs" :key="'d-' + d" class="entry dir" @click="openBrowser(browser.path ? joinPath(browser.path, d) : d)">
-        📁 {{ d }}
-      </div>
-      <div v-for="f in browser.files" :key="'f-' + f.name" class="entry file" @click="pickFile(f.name)">
-        {{ { audio: '🎵', subtitle: '💬' }[f.kind] || '🎬' }} {{ f.name }} <span class="size">{{ fmtSize(f.size) }}</span>
-      </div>
-      <el-empty v-if="!browser.dirs.length && !browser.files.length" description="此目录没有子目录或视频 / 音频文件" :image-size="60" />
-    </div>
-    <template v-if="browsePick === 'dir'" #footer>
-      <el-button @click="browserVisible = false">取消</el-button>
-      <el-button type="primary" :disabled="!browser.path" @click="pickThisDir">
-        ✓ 选择此目录
-      </el-button>
-    </template>
-  </el-dialog>
+    :mode="browsePick"
+    @pick="onBrowsePick"
+  />
 </template>
 
 <style scoped>
@@ -1301,15 +1227,6 @@ onBeforeUnmount(() => {
   margin-bottom: 12px;
   white-space: pre-wrap;
   word-break: break-all;
-}
-.browser-path {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-.quick-access {
-  margin-bottom: 8px;
 }
 .batch-files {
   max-height: 220px;
@@ -1365,28 +1282,5 @@ onBeforeUnmount(() => {
   padding: 4px 12px;
   font-size: 13px;
   line-height: 1.9;
-}
-.quick-item {
-  margin: 0 6px 4px 0;
-  cursor: pointer;
-}
-.browser-list {
-  max-height: 380px;
-  overflow-y: auto;
-  border: 1px solid var(--el-border-color-light);
-  border-radius: var(--app-radius);
-}
-.entry {
-  padding: 7px 12px;
-  cursor: pointer;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-}
-.entry:hover {
-  background: var(--el-color-primary-light-9);
-}
-.entry .size {
-  float: right;
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
 }
 </style>

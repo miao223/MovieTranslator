@@ -882,6 +882,58 @@ async function testVision() {
       </div>
     </el-card>
 
+    <el-card v-if="settings.disc" shadow="never" class="section">
+      <template #header>💿 原盘封装</template>
+      <el-form label-width="150px">
+        <el-form-item label="花絮默认导出">
+          <el-switch v-model="settings.disc.export_extras" />
+          <span class="hint">
+            花絮、彩蛋、预告这类非正片内容在「原盘」页是否默认勾选；每张盘仍可逐条改。
+            导出时命名为 片名.花絮01.mkv、片名.花絮02.mkv……
+          </span>
+        </el-form-item>
+        <el-form-item label="最短标题">
+          <el-input-number v-model="settings.disc.min_title_seconds" :min="0" :max="3600" />
+          <span class="hint">秒。短于这个的一般是片头 logo、警告和菜单背景，列出来但默认不勾</span>
+        </el-form-item>
+        <el-form-item label="LPCM 音轨">
+          <el-radio-group v-model="settings.disc.lpcm">
+            <el-radio value="flac">转成 FLAC</el-radio>
+            <el-radio value="pcm">保持 PCM</el-radio>
+          </el-radio-group>
+          <div class="hint" style="margin: 4px 0 0; display: block">
+            MKV 装不下光盘自己的 LPCM 格式，只能转换——两种都是<strong>无损</strong>的。
+            FLAC 小一半左右；只有播放器不支持 FLAC 时才需要选 PCM。
+          </div>
+        </el-form-item>
+        <el-form-item label="默认输出位置">
+          <el-radio-group v-model="settings.disc.output_mode">
+            <el-radio value="beside">放在光盘旁边</el-radio>
+            <el-radio value="inside">放进各自的文件夹</el-radio>
+            <el-radio value="custom">全部放到指定文件夹</el-radio>
+          </el-radio-group>
+          <el-input
+            v-if="settings.disc.output_mode === 'custom'" v-model="settings.disc.output_dir"
+            placeholder="输出文件夹的完整路径" style="margin-top: 6px; max-width: 520px"
+          />
+          <div class="hint" style="margin: 4px 0 0; display: block">
+            「原盘」页打开时的默认选择，每次加入列队前仍可改。放在光盘旁边：
+            <code>…/Film (1992)/</code> → <code>…/Film (1992).mkv</code>；各自的文件夹：
+            放进 BDMV / VIDEO_TS 所在的那一层（.iso 会在旁边建一个同名文件夹）。
+          </div>
+        </el-form-item>
+      </el-form>
+      <div class="model-notes">
+        <p><strong>📌 说明</strong></p>
+        <p>· 只换容器，<strong>不重编码、不解密</strong>：音视频原样拷贝进 MKV，章节、音轨和字幕的语言一并保留。
+          仍是加密状态的原盘会被识别出来并拒绝。</p>
+        <p>· 同一段内容只导出一次：整片和整片的分段、内容完全相同的播放列表、菜单背景循环都会被认出来，
+          列在「原盘」页的折叠区里并写明原因。</p>
+        <p>· 多卷合集（同一个文件夹里的 <code>XXX_VOL01</code>、<code>XXX_VOL02</code>……）会被认成一套：
+          共用片名，集号和花絮编号接着前一卷编。单独选第二卷时也一样。</p>
+      </div>
+    </el-card>
+
     <el-card shadow="never" class="section">
       <template #header>📝 字幕</template>
       <el-form label-width="150px">

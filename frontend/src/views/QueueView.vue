@@ -268,7 +268,7 @@ async function showSettings(entry) {
 
       <el-empty v-if="!entries.length" description="列队是空的">
         <div class="hint" style="display: block; max-width: 460px; margin-bottom: 12px">
-          在「翻译任务」页填好表单后点「加入列队」。每条记录都会记住加入时
+          在「翻译任务」或「原盘」页填好后点「加入列队」。每条记录都会记住加入时
           <strong>已保存</strong>的设置，之后改设置不影响它。
         </div>
         <el-button type="primary" @click="emit('goto', 'home')">去添加</el-button>
@@ -281,7 +281,9 @@ async function showSettings(entry) {
           <el-tag size="small" :type="stageTagType(entry.stage || entry.status)">
             {{ stageLabel(entry.stage || entry.status) }}
           </el-tag>
-          <span class="title" :title="entry.title">{{ baseName(entry.title) }}</span>
+          <span class="title" :title="entry.title">
+            {{ entry.kind === 'disc' ? '💿 ' : '' }}{{ baseName(entry.title) }}
+          </span>
           <span class="summary">{{ entry.summary }}</span>
           <el-tag
             v-if="showGenerations && entry.settings_hash"
@@ -336,6 +338,11 @@ async function showSettings(entry) {
           </span>
           <div v-if="entry.error" class="row-note error">{{ entry.error }}</div>
           <div v-else-if="entry.note" class="row-note">{{ entry.note }}</div>
+          <!-- a disc writes its MKVs beside itself; tens of GB are not a
+               browser download, so the paths are the result -->
+          <div v-if="entry.kind === 'disc' && entry.result_files.length" class="row-note files">
+            <div v-for="f in entry.result_files" :key="f">📦 <code>{{ f }}</code></div>
+          </div>
         </div>
       </div>
     </el-card>
@@ -423,6 +430,10 @@ async function showSettings(entry) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.row-note.files code {
+  font-size: 12px;
+  word-break: break-all;
 }
 .summary {
   color: var(--el-text-color-secondary);

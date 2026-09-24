@@ -9,6 +9,7 @@ import string
 import sys
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -22,6 +23,13 @@ from app.models.schemas import (
     AudioTrack,
     BatchRequest,
     BatchStatus,
+    DiscAnswer,
+    DiscBatchReport,
+    DiscBatchRequest,
+    DiscOutputMode,
+    DiscReport,
+    DiscRequest,
+    DiscSkipped,
     JobRequest,
     JobStatus,
     LLMSettings,
@@ -154,6 +162,10 @@ def batch_scan(path: str, recursive: bool = True, skip_existing: bool = True,
         # accurate. Which source to use is their call, not ours.
         "with_source": [str(s) for s in scan.with_source],
         "with_source_count": len(scan.with_source),
+        # discs are never translated file by file: their stream folders hold
+        # the film, pieces of the film, menus and trailers side by side
+        "discs": [str(d) for d in scan.discs],
+        "disc_count": len(scan.discs),
     }
 
 
@@ -766,6 +778,69 @@ def media_subtitle_tracks(path: str) -> list[SubtitleTrack]:
     return [SubtitleTrack(**t) for t in tracks]
 
 
+# ------------------------------------------------------------------- disc
+
+
+def _disc_answer(answer: Optional[DiscAnswer]):
+    """The batch mode's per-disc answer as the planner takes it."""
+    from app.services.disc.plan import Answer
+
+    if answer is None:
+        return Answer()
+    return Answer(answer.series, answer.name, answer.episode_start)
+
+
+@router.get("/disc/scan", response_model=DiscReport)
+def disc_scan(path: str, series: Optional[bool] = None,
+              episode_start: Optional[int] = None, name: str = "",
+              output_mode: Optional[DiscOutputMode] = None,
+              output_dir: str = "") -> DiscReport:
+    """The 原盘 page's analysis of one disc. Reads only the disc's metadata
+    (playlists, clip info, IFOs) — and, for a volume of a box set, its
+    sibling volumes', whose episodes it numbers on from — so it answers in
+    milliseconds and is simply asked again whenever a switch changes."""
+    from app.services.disc import plan as disc_plan
+
+    settings = config.load_settings()
+    mode, custom = disc_plan.output_choice(output_mode, output_dir, settings)
+    item = disc_plan.plan(
+        [(path, disc_plan.Answer(series, name, episode_start))], settings)[0]
+    if item.disc is None:
+        raise HTTPException(status_code=400, detail=item.error)
+    return disc_plan.report_of(item, settings, mode, custom)
+
+
+@router.post("/disc/batch-scan", response_model=DiscBatchReport)
+def disc_batch_scan(req: DiscBatchRequest) -> DiscBatchReport:
+    """The batch mode: every disc in a folder, analysed as the single scan
+    would analyse it. A disc that cannot be read is listed with why, not
+    dropped — the user is looking at that folder and knows it is there."""
+    from app.services.disc import plan as disc_plan
+    from app.services.disc.binary import DiscError
+    from app.services.disc.fs import find_discs
+
+    settings = config.load_settings()
+    mode, custom = disc_plan.output_choice(req.output_mode, req.output_dir, settings)
+    try:
+        found = find_discs(req.path, req.recursive)
+    except (DiscError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not found:
+        raise HTTPException(status_code=400,
+                            detail="这个文件夹里没有找到原盘（BDMV / VIDEO_TS 文件夹或 .iso 镜像）")
+    answers = {str(Path(a.path)): a for a in req.discs}
+    planned = disc_plan.plan(
+        [(str(p), _disc_answer(answers.get(str(p)))) for p in found], settings)
+    report = DiscBatchReport(path=req.path, recursive=req.recursive,
+                             output_mode=mode, output_dir=custom)
+    for item in planned:
+        if item.disc is None:
+            report.skipped.append(DiscSkipped(path=item.path, reason=item.error))
+        else:
+            report.discs.append(disc_plan.report_of(item, settings, mode, custom))
+    return report
+
+
 # ------------------------------------------------------------ file browse
 
 
@@ -813,8 +888,13 @@ def fs_quick_access():
 
 
 @router.get("/fs/browse")
-def fs_browse(path: str = ""):
-    """List directories, videos and audio files for the file picker."""
+def fs_browse(path: str = "", mode: str = ""):
+    """List directories, videos and audio files for the file picker.
+
+    mode="disc" is the 原盘 page's picker: it lists .iso images instead of
+    media files and names which folders are discs (disc_dirs), so they can
+    be picked rather than opened. The default listing is untouched.
+    """
     if not path:
         if sys.platform == "win32":
             drives = [
@@ -828,7 +908,8 @@ def fs_browse(path: str = ""):
     if not p.is_dir():
         raise HTTPException(status_code=400, detail=f"不是有效目录: {path}")
 
-    dirs, files = [], []
+    disc_mode = mode == "disc"
+    dirs, files, disc_dirs = [], [], []
     try:
         for entry in sorted(p.iterdir(), key=lambda e: e.name.lower()):
             if entry.name.startswith("."):
@@ -836,6 +917,12 @@ def fs_browse(path: str = ""):
             try:
                 if entry.is_dir():
                     dirs.append(entry.name)
+                    if disc_mode and _is_disc_dir(entry):
+                        disc_dirs.append(entry.name)
+                elif disc_mode:
+                    if entry.suffix.lower() == ".iso":
+                        files.append({"name": entry.name, "size": entry.stat().st_size,
+                                      "kind": "disc"})
                 elif entry.suffix.lower() in SOURCE_EXTS:
                     files.append({
                         "name": entry.name,
@@ -854,7 +941,20 @@ def fs_browse(path: str = ""):
         parent = "" if sys.platform == "win32" else None
     else:
         parent = str(p.parent)
-    return {"path": str(p), "parent": parent, "dirs": dirs, "files": files}
+    listing = {"path": str(p), "parent": parent, "dirs": dirs, "files": files}
+    if disc_mode:
+        listing["disc_dirs"] = disc_dirs
+        listing["is_disc"] = _is_disc_dir(p)
+    return listing
+
+
+def _is_disc_dir(folder: Path) -> bool:
+    """A folder the 原盘 page can take as it is."""
+    from app.services.disc.fs import _bd_root, _child, _dvd_dir
+
+    if _bd_root(folder) is not None or _dvd_dir(folder) is not None:
+        return True
+    return folder.name.lower() == "bdmv" and _child(folder, "PLAYLIST") is not None
 
 
 # ------------------------------------------------------------------ queue
@@ -882,7 +982,7 @@ def _entry_view(entry, current_hash: str) -> QueueEntryView:
     fingerprint = jobqueue.settings_hash(entry.settings)
     return QueueEntryView(
         id=entry.id, kind=entry.kind, status=entry.status, title=entry.title,
-        summary=jobqueue.describe(entry.request),
+        summary=jobqueue.describe_entry(entry),
         created_at=entry.created_at, started_at=entry.started_at,
         finished_at=entry.finished_at, job_id=entry.job_id,
         error=entry.error, note=entry.note,
@@ -894,6 +994,7 @@ def _entry_view(entry, current_hash: str) -> QueueEntryView:
         result_srt=entry.result_srt, result_video=entry.result_video,
         result_srt_original=entry.result_srt_original,
         result_in_place=entry.result_in_place,
+        result_files=list(entry.result_files),
         group_id=entry.group_id, group_title=entry.group_title,
     )
 
@@ -985,6 +1086,116 @@ def enqueue_batch(req: BatchRequest) -> dict:
     current = jobqueue.settings_hash(settings)
     return {"entries": [_entry_view(e, current) for e in added],
             "count": len(added), "skipped": [str(p) for p in skipped]}
+
+
+def _freeze_discs(items, output_mode, output_dir, settings, named: bool) -> list:
+    """The DiscRequests to queue for *items* — (path, Answer, titles) — with
+    everything the page showed resolved into them: the ticks (an empty
+    selection becomes the analysis's defaults), the name, the episode and
+    extra numbers, the output folder. The run analyses the disc again with
+    exactly these, so it writes what the list showed even if the volume
+    next to it is gone by then.
+
+    Everything that can be refused is refused now, not in an hour when the
+    entry's turn comes; one disc refused refuses the whole call, so a batch
+    is never half queued."""
+    from app.services.disc import plan as disc_plan
+
+    mode, custom = disc_plan.output_choice(output_mode, output_dir, settings)
+    if mode == "custom" and not custom:
+        raise HTTPException(status_code=400, detail="选了「指定的文件夹」，但还没有选是哪个文件夹")
+    planned = disc_plan.plan([(path, answer) for path, answer, _ in items], settings)
+    frozen, problems = [], []
+    for item, (_, answer, titles) in zip(planned, items):
+        who = f"{Path(item.path).name}：" if named else ""
+        if item.disc is None:
+            problems.append(who + item.error)
+            continue
+        report = disc_plan.report_of(item, settings, mode, custom)
+        if report.encrypted:
+            problems.append(who + "这张盘仍是加密状态，本程序不做解密，无法封装")
+            continue
+        if report.analysis_only:
+            problems.append(who + "这是只有元数据的副本（没有视频文件），只能分析，不能封装")
+            continue
+        known = {t.id: t for t in report.titles}
+        chosen = list(dict.fromkeys(titles)) or [t.id for t in report.titles if t.selected]
+        unknown = [i for i in chosen if i not in known]
+        if unknown:
+            problems.append(who + f"光盘里没有这些标题：{'、'.join(unknown)}，请重新分析")
+            continue
+        refused = [i for i in chosen if not known[i].selectable]
+        if refused:
+            problems.append(who + "这些标题无法封装：" + "；".join(
+                f"{i}（{known[i].reason}）" for i in refused))
+            continue
+        if not chosen:
+            problems.append(who + "没有勾选任何标题")
+            continue
+        frozen.append(DiscRequest(
+            path=report.path, titles=chosen, name=item.name, output_mode=mode,
+            output_dir=custom, episode_start=item.episode_start,
+            extra_start=item.extra_start, own_name=item.own_name,
+            series=answer.series))
+    if problems:
+        raise HTTPException(status_code=400, detail="；".join(problems))
+    return frozen
+
+
+def _queue_room(n: int) -> None:
+    waiting = sum(1 for e in queue_manager.store.entries if e.status == "queued")
+    if waiting + n > jobqueue.MAX_QUEUED:
+        raise HTTPException(status_code=400,
+                            detail=f"列队已满（最多 {jobqueue.MAX_QUEUED} 条等待中的任务）")
+
+
+@router.post("/queue/disc")
+def enqueue_disc(req: DiscRequest) -> dict:
+    """Add one disc's remux to the queue — the 原盘 page's only button."""
+    from app.services.disc.plan import Answer
+
+    settings = jobqueue.snapshot()
+    frozen = _freeze_discs(
+        [(req.path, Answer(req.series, req.name, req.episode_start), req.titles)],
+        req.output_mode, req.output_dir, settings, named=False)[0]
+    try:
+        entry = queue_manager.store.add_disc(frozen, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    queue_manager.nudge()
+    waiting = [e for e in queue_manager.store.entries if e.status == "queued"]
+    position = next((i + 1 for i, e in enumerate(waiting) if e.id == entry.id), 0)
+    return {"entry": _entry_view(entry, jobqueue.settings_hash(settings)),
+            "position": position}
+
+
+@router.post("/queue/disc-batch")
+def enqueue_disc_batch(req: DiscBatchRequest) -> dict:
+    """The batch mode's 加入列队: one entry per disc, grouped, sharing one
+    settings snapshot — like a translation batch, so one disc failing costs
+    no other and each can be retried or dropped on its own."""
+    wanted = [a for a in req.discs if a.include]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="没有勾选任何光盘")
+    settings = jobqueue.snapshot()
+    frozen = _freeze_discs(
+        [(a.path, _disc_answer(a), a.titles) for a in wanted],
+        req.output_mode, req.output_dir, settings, named=True)
+    _queue_room(len(frozen))
+    group_id = uuid.uuid4().hex[:12]
+    added = []
+    try:
+        for request in frozen:
+            added.append(queue_manager.store.add_disc(
+                request, settings, group_id=group_id, group_title=req.path))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    queue_manager.nudge()
+    current = jobqueue.settings_hash(settings)
+    waiting = [e for e in queue_manager.store.entries if e.status == "queued"]
+    position = next((i + 1 for i, e in enumerate(waiting) if e.id == added[0].id), 0)
+    return {"entries": [_entry_view(e, current) for e in added],
+            "count": len(added), "position": position}
 
 
 @router.post("/queue/pause")

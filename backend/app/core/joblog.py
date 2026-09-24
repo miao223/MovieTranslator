@@ -138,6 +138,11 @@ def _settings_lines(settings) -> list[str]:
            if asr.windowed_first_pass else "关"),
         f"歌词识别      : {'开（歌词标为 ♪ … ♪）' if settings.prompts.mark_lyrics else '关'}",
         f"调试模式      : {'开（字幕同目录生成 .debug.log）' if settings.debug_mode else '关'}",
+        f"原盘封装      : 默认导出花絮={'是' if settings.disc.export_extras else '否'} "
+        f"最短标题={settings.disc.min_title_seconds}s "
+        f"LPCM→{'FLAC' if settings.disc.lpcm == 'flac' else 'PCM'} "
+        f"默认输出={_disc_output(settings.disc.output_mode)}"
+        + (f" {settings.disc.output_dir}" if settings.disc.output_mode == "custom" else ""),
         f"字幕          : 每行{sub.max_chars_per_line}字 单条≤{sub.max_duration}s "
         f"{'样式(.ass)' if sub.style_enabled else '标准(.srt)'} {sub.bilingual_layout}",
         f"代理          : {net.proxy_url or '（未设置）'} "
@@ -167,10 +172,16 @@ _OUTPUT_MODES = {
     "bilingual_split": "双文件（译文、原文各一个文件，都带语言后缀）",
 }
 
+def _disc_output(mode: str) -> str:
+    from app.services.disc.report import OUTPUT_MODES
+
+    return OUTPUT_MODES.get(mode, mode)
+
+
 class JobLogWriter:
     """Appends every published progress line to a file, with a header."""
 
-    def __init__(self, job_id: str, video_path: str):
+    def __init__(self, job_id: str, video_path: str, source_label: str = "视频文件"):
         self.path: Optional[Path] = None
         self._lock = threading.Lock()
         try:
@@ -180,7 +191,7 @@ class JobLogWriter:
             self._raw(f"=== MovieTranslator {APP_VERSION} 任务日志 ===")
             self._raw(f"任务 ID       : {job_id}")
             self._raw(f"开始时间      : {datetime.now():%Y-%m-%d %H:%M:%S}")
-            self._raw(f"视频文件      : {video_path}")
+            self._raw(f"{source_label}      : {video_path}")
         except OSError:
             self.path = None  # logging must never break a job
 
@@ -226,6 +237,28 @@ class JobLogWriter:
             self.section("媒体信息", describe_media(video_path))
         except Exception as exc:  # noqa: BLE001
             self.section("媒体信息", [f"（探测失败: {exc}）"])
+
+    def write_disc_request(self, request) -> None:
+        """任务参数 for a disc remux (DiscRequest)."""
+        series = {None: "自动（按光盘结构判断）", True: "分集导出", False: "整片导出"}
+        mode = request.effective_output_mode()
+        where = _disc_output(mode) + (
+            f" {request.output_dir}" if mode == "custom" else "")
+        start = request.episode_start if request.episode_start is not None else 1
+        numbering = f"{start}"
+        if request.extra_start and request.extra_start > 1:
+            numbering += f"（花絮从 {request.extra_start:02d} 编起，接着同一套的前几卷）"
+        lines = [
+            "任务类型      : 原盘封装（只换容器，不重编码、不解密）",
+            f"勾选的标题    : {'、'.join(request.titles) if request.titles else '（按分析结果的默认勾选）'}",
+            f"片名          : {request.name or '（用光盘文件夹的名字）'}",
+            f"输出位置      : {where}",
+            f"整片/分集     : {series.get(request.series, request.series)}",
+            f"起始集号      : {numbering}",
+        ]
+        if request.own_name:
+            lines.append(f"本卷名称      : {request.own_name}（多卷合集里按盘编号的文件用它命名）")
+        self.section("任务参数", lines)
 
     def write_request(self, request, source_kind: str = "video") -> None:
         if request.text_source == "subtitle":

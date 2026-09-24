@@ -96,6 +96,10 @@ class ScanResult(NamedTuple):
     shadowed: List[Path]
     with_source: List[Path]
     replaced: List[Path]
+    # 原盘（BDMV / VIDEO_TS 文件夹、.iso）：不当片子翻译。一张蓝光的 STREAM/
+    # 里是几十个 m2ts——正片、正片的分段、菜单、预告——逐个翻译就是把同一部
+    # 片翻好几遍。它们该去「原盘」页先封装成 MKV。
+    discs: List[Path] = []
 
 
 # 让路留下的副本（film.zh.2.srt）不是成品，也不该被当成下一次的原料
@@ -160,12 +164,19 @@ def scan_media(
         raise NotADirectoryError(f"不是有效目录: {directory}")
 
     files: List[Path] = []
+    discs: Dict[Path, None] = {}
     pattern = "**/*" if recursive else "*"
     for p in root.glob(pattern):
-        if not p.is_file() or p.suffix.lower() not in SOURCE_EXTS:
+        if not p.is_file():
             continue
         rel = p.relative_to(root)
         if any(part.startswith(".") for part in rel.parts):
+            continue
+        disc = disc_root_of(p)
+        if disc is not None:
+            discs.setdefault(disc, None)
+            continue
+        if p.suffix.lower() not in SOURCE_EXTS:
             continue
         files.append(p)
     files.sort()
@@ -223,7 +234,29 @@ def scan_media(
     order = {p: n for n, p in enumerate(files)}
     for group in (to_translate, skipped, shadowed, with_source, replaced):
         group.sort(key=lambda p: order.get(p, 0))
-    return ScanResult(to_translate, skipped, shadowed, with_source, replaced)
+    return ScanResult(to_translate, skipped, shadowed, with_source, replaced,
+                      sorted(discs))
+
+
+def disc_root_of(path: Path) -> "Path | None":
+    """The disc *path* belongs to, if it is part of one.
+
+    Judged by the disc's own structure, not by suffix alone: a file under a
+    BDMV folder, a DVD's IFO/VOB/BUP files, or an .iso image. The disc root
+    is the folder holding BDMV/ or VIDEO_TS/ (for an .iso, the image).
+    """
+    if path.suffix.lower() == ".iso":
+        return path
+    parts = path.parts
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i].lower() == "bdmv":
+            return Path(*parts[:i]) if i else Path(parts[0])
+    name = path.name.upper()
+    if name.endswith((".IFO", ".VOB", ".BUP")) and (
+            name.startswith("VIDEO_TS") or name.startswith("VTS_")):
+        folder = path.parent
+        return folder.parent if folder.name.upper() == "VIDEO_TS" else folder
+    return None
 
 
 # A language suffix as this program writes it: two or three letters (which
