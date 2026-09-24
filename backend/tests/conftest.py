@@ -25,19 +25,31 @@ def _contained_cache(tmp_path_factory):
     into the real cache every run. The environment variable holds for the
     whole session, threads included.
 
+    The config dir gets the same treatment. Tests that skip the
+    settings_file fixture still reach config.settings_path(), and everything
+    derived from it (glossaries.json, queue.json) landed in the real
+    ~/.config/MovieTranslator — next to the settings, queue and series
+    glossaries of an installation someone actually uses.
+
     Session-scoped and autouse: the rule is about every test, not the ones
     that remember to ask.
     """
     import os
 
     base = tmp_path_factory.mktemp("appcache")
-    old = os.environ.get("XDG_CACHE_HOME")
-    os.environ["XDG_CACHE_HOME"] = str(base)
+    confined = {
+        "XDG_CACHE_HOME": base,
+        "XDG_CONFIG_HOME": tmp_path_factory.mktemp("appconfig"),
+    }
+    old = {name: os.environ.get(name) for name in confined}
+    for name, path in confined.items():
+        os.environ[name] = str(path)
     yield base
-    if old is None:
-        os.environ.pop("XDG_CACHE_HOME", None)
-    else:
-        os.environ["XDG_CACHE_HOME"] = old
+    for name, value in old.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def local_client(app, **kwargs):
