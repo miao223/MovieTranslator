@@ -25,10 +25,11 @@ class FakeJob:
     """Stands in for pipeline.Job: an id, a status, nothing running."""
 
     def __init__(self, request, settings=None):
-        self.id = f"job-{request.video_path}"
+        source = getattr(request, "video_path", None) or request.path   # a DiscRequest has .path
+        self.id = f"job-{source}"
         self.request = request
         self.settings = settings
-        self.status = JobStatus(id=self.id, video_path=request.video_path)
+        self.status = JobStatus(id=self.id, video_path=source)
         self.cancelled = False
 
 
@@ -48,6 +49,12 @@ class FakeManager:
         self.created.append(job)
         return job
 
+    def create_disc(self, request, settings=None):
+        job = FakeJob(request, settings)
+        self.jobs[job.id] = job
+        self.created.append(job)
+        return job
+
     def get(self, job_id):
         return self.jobs[job_id]
 
@@ -55,10 +62,11 @@ class FakeManager:
         self.jobs[job_id].cancelled = True
         self.jobs[job_id].status.stage = "cancelled"
 
-    def finish(self, index=-1, stage="done", srt="out.srt"):
+    def finish(self, index=-1, stage="done", srt="out.srt", outputs=()):
         job = self.created[index]
         job.status.stage = stage
         job.status.srt_filename = srt
+        job.status.outputs = [str(o) for o in outputs]
 
 
 @pytest.fixture
@@ -723,6 +731,129 @@ def test_a_live_batch_keeps_its_members_reachable(settings_file, monkeypatch, tm
         manager.create(req(str(film))).status.stage = "done"
 
     assert member.id in manager.jobs
+
+
+# --------------------------------------------- 原盘：加入列队并做字幕
+
+
+def _disc_with_subtitles(manager, tmp_path, name="Film", **template):
+    """A disc entry queued with 加入列队并做字幕, under the current settings."""
+    from app.models.schemas import DiscRequest
+
+    then = JobRequest(video_path="", series_id="disc-abc", subtitle_fallback_asr=True,
+                      **({"target_language": "English", "output_mode": "translation_only"}
+                         | template))
+    return manager.store.add_disc(DiscRequest(path=str(tmp_path / name)),
+                                  jobqueue.snapshot(), then=then)
+
+
+def _mkvs(tmp_path, *names):
+    paths = []
+    for name in names:
+        (tmp_path / name).write_bytes(b"x")
+        paths.append(tmp_path / name)
+    return paths
+
+
+def test_a_finished_disc_queues_a_translation_of_every_mkv_at_the_end(runner, tmp_path):
+    """加入列队并做字幕: what the remux wrote goes into the queue for
+    translation, behind everything already waiting (the user's choice:
+    all the remuxing first, then the subtitles), with the request and the
+    settings frozen when the button was pressed."""
+    manager, fake = runner
+    film, extra = _mkvs(tmp_path, "Film.mkv", "Film.花絮01.mkv")
+    disc = _disc_with_subtitles(manager, tmp_path)
+    other = manager.store.add(req("/other.mkv"), jobqueue.snapshot())
+    manager.step()                                   # the disc starts
+    fake.finish(outputs=[film, extra])
+    manager.step()                                   # …and ends
+    entries = manager.store.entries
+    assert [e.id for e in entries[:2]] == [disc.id, other.id]
+    queued = entries[2:]
+    assert [e.request.video_path for e in queued] == [str(film), str(extra)]
+    for e in queued:
+        assert (e.kind, e.status, e.origin) == ("job", "queued", disc.id)
+        assert (e.request.target_language, e.request.output_mode,
+                e.request.series_id) == ("English", "translation_only", "disc-abc")
+        assert jobqueue.settings_hash(e.settings) == jobqueue.settings_hash(disc.settings)
+    assert "已自动加入 2 条字幕任务" in disc.note
+    assert jobqueue.describe_entry(disc).endswith("完成后做字幕：auto → English · 纯译文 · 语音识别")
+    assert jobqueue.describe_entry(queued[0]).endswith("原盘封装后自动加入")
+    # a restart keeps both halves: the follow-up request and where they came from
+    again = QueueStore()
+    again.load()
+    assert again.get(disc.id).then.target_language == "English"
+    assert again.get(queued[0].id).origin == disc.id
+
+
+def test_a_cancelled_disc_queues_nothing_and_a_failed_one_what_it_wrote(runner, tmp_path):
+    manager, fake = runner
+    (written,) = _mkvs(tmp_path, "Show.E01.mkv")
+    cancelled = _disc_with_subtitles(manager, tmp_path, "A")
+    failed = _disc_with_subtitles(manager, tmp_path, "B")
+    manager.step()
+    fake.finish(stage="cancelled", outputs=[written])
+    manager.step()
+    assert len(manager.store.entries) == 2 and not cancelled.note
+    manager.step()
+    # one title broke; the one before it was written and gets its subtitles
+    fake.finish(stage="failed", outputs=[written])
+    manager.step()
+    assert [e.request.video_path for e in manager.store.entries[2:]] == [str(written)]
+    assert failed.status == "failed" and "已自动加入 1 条" in failed.note
+
+
+def test_a_retried_disc_never_queues_the_same_file_twice(runner, tmp_path):
+    """A retry reports the titles it skipped as written again, so the hook
+    sees the same files twice; and a subtitle already in the target
+    language means that one is done."""
+    manager, fake = runner
+    first, second, third = _mkvs(tmp_path, "S.E01.mkv", "S.E02.mkv", "S.E03.mkv")
+    (tmp_path / "S.E03.en.srt").write_text(SRT_EN, encoding="utf-8")
+    disc = _disc_with_subtitles(manager, tmp_path)
+    manager.step()
+    fake.finish(stage="failed", outputs=[first])
+    manager.step()
+    assert len(manager.store.entries) == 2
+    retried = manager.retry(disc.id)
+    assert retried.then == disc.then
+    # E01's translation was queued before the retry: run it first
+    manager.step()
+    fake.finish(stage="done")
+    manager.step()
+    manager.step()                                    # now the retried disc
+    assert manager.store.get(retried.id).status == "running"
+    fake.finish(outputs=[first, second, third])
+    manager.step()
+    videos = [e.request.video_path for e in manager.store.entries
+              if e.kind == "job" and e.origin]
+    assert videos == [str(first), str(second)]
+    assert "2 个已有字幕或已在列队里，跳过" in manager.store.get(retried.id).note
+
+
+def test_a_full_queue_takes_what_fits_and_says_so(runner, tmp_path, monkeypatch):
+    manager, fake = runner
+    monkeypatch.setattr(jobqueue, "MAX_QUEUED", 2)
+    mkvs = _mkvs(tmp_path, "a.mkv", "b.mkv", "c.mkv")
+    disc = _disc_with_subtitles(manager, tmp_path)
+    manager.step()
+    fake.finish(outputs=mkvs)
+    manager.step()
+    assert len([e for e in manager.store.entries if e.origin]) == 2
+    assert "列队已满，另有 1 个没有加入" in disc.note
+
+
+def test_a_disc_without_the_follow_up_queues_nothing(runner, tmp_path):
+    from app.models.schemas import DiscRequest
+
+    manager, fake = runner
+    (mkv,) = _mkvs(tmp_path, "Film.mkv")
+    disc = manager.store.add_disc(DiscRequest(path=str(tmp_path / "Film")), jobqueue.snapshot())
+    manager.step()
+    fake.finish(outputs=[mkv])
+    manager.step()
+    assert len(manager.store.entries) == 1 and disc.then is None and not disc.note
+    assert "完成后做字幕" not in jobqueue.describe_entry(disc)
 
 
 # ------------------------------------------------------- the three gaps

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import re
@@ -28,8 +29,10 @@ from app.models.schemas import (
     DiscBatchRequest,
     DiscOutputMode,
     DiscReport,
+    DiscEnqueueRequest,
     DiscRequest,
     DiscSkipped,
+    DiscSubtitles,
     JobRequest,
     JobStatus,
     LLMSettings,
@@ -1088,13 +1091,43 @@ def enqueue_batch(req: BatchRequest) -> dict:
             "count": len(added), "skipped": [str(p) for p in skipped]}
 
 
-def _freeze_discs(items, output_mode, output_dir, settings, named: bool) -> list:
+def _subtitle_template(subtitles: DiscSubtitles, item) -> JobRequest:
+    """The translation request every MKV of this disc will be queued with
+    (QueueEntry.then), video_path filled in per file when the remux ends.
+
+    Built like a translation batch's entries (enqueue_batch): a file whose
+    subtitle cannot be read falls back to speech recognition rather than
+    failing. The series table is the disc's own — or the box set's, shared
+    by its volumes — never the batch's: one batch of unrelated films would
+    otherwise share one table of names, the first film's winning."""
+    series_id = ""
+    if subtitles.series_mode:
+        key = item.volume.id if item.chained and item.volume is not None \
+            else str(Path(item.disc.root))
+        series_id = "disc-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    return JobRequest(
+        video_path="",
+        text_source=subtitles.text_source,
+        audio_language=subtitles.audio_language,
+        subtitle_language=subtitles.subtitle_language,
+        subtitle_fallback_asr=True,
+        source_language=subtitles.source_language,
+        target_language=subtitles.target_language.strip(),
+        output_mode=subtitles.output_mode,
+        embed_subtitle=subtitles.embed_subtitle,
+        series_id=series_id,
+    )
+
+
+def _freeze_discs(items, output_mode, output_dir, settings, named: bool,
+                  subtitles: Optional[DiscSubtitles] = None) -> list:
     """The DiscRequests to queue for *items* — (path, Answer, titles) — with
     everything the page showed resolved into them: the ticks (an empty
     selection becomes the analysis's defaults), the name, the episode and
     extra numbers, the output folder. The run analyses the disc again with
     exactly these, so it writes what the list showed even if the volume
-    next to it is gone by then.
+    next to it is gone by then. Each comes paired with the translation to
+    queue for its MKVs afterwards (None without *subtitles*).
 
     Everything that can be refused is refused now, not in an hour when the
     entry's turn comes; one disc refused refuses the whole call, so a batch
@@ -1104,6 +1137,8 @@ def _freeze_discs(items, output_mode, output_dir, settings, named: bool) -> list
     mode, custom = disc_plan.output_choice(output_mode, output_dir, settings)
     if mode == "custom" and not custom:
         raise HTTPException(status_code=400, detail="选了「指定的文件夹」，但还没有选是哪个文件夹")
+    if subtitles is not None and not subtitles.target_language.strip():
+        raise HTTPException(status_code=400, detail="做字幕的目标语言是空的")
     planned = disc_plan.plan([(path, answer) for path, answer, _ in items], settings)
     frozen, problems = [], []
     for item, (_, answer, titles) in zip(planned, items):
@@ -1132,11 +1167,12 @@ def _freeze_discs(items, output_mode, output_dir, settings, named: bool) -> list
         if not chosen:
             problems.append(who + "没有勾选任何标题")
             continue
-        frozen.append(DiscRequest(
+        frozen.append((DiscRequest(
             path=report.path, titles=chosen, name=item.name, output_mode=mode,
             output_dir=custom, episode_start=item.episode_start,
             extra_start=item.extra_start, own_name=item.own_name,
-            series=answer.series))
+            series=answer.series),
+            _subtitle_template(subtitles, item) if subtitles is not None else None))
     if problems:
         raise HTTPException(status_code=400, detail="；".join(problems))
     return frozen
@@ -1150,16 +1186,19 @@ def _queue_room(n: int) -> None:
 
 
 @router.post("/queue/disc")
-def enqueue_disc(req: DiscRequest) -> dict:
-    """Add one disc's remux to the queue — the 原盘 page's only button."""
+def enqueue_disc(req: DiscEnqueueRequest) -> dict:
+    """Add one disc's remux to the queue — 加入列队, or with `subtitles`
+    加入列队并做字幕: its MKVs then go into the queue for translation as
+    soon as they are written (jobqueue.QueueManager._queue_subtitles)."""
     from app.services.disc.plan import Answer
 
     settings = jobqueue.snapshot()
-    frozen = _freeze_discs(
+    frozen, then = _freeze_discs(
         [(req.path, Answer(req.series, req.name, req.episode_start), req.titles)],
-        req.output_mode, req.output_dir, settings, named=False)[0]
+        req.output_mode, req.output_dir, settings, named=False,
+        subtitles=req.subtitles)[0]
     try:
-        entry = queue_manager.store.add_disc(frozen, settings)
+        entry = queue_manager.store.add_disc(frozen, settings, then=then)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     queue_manager.nudge()
@@ -1180,14 +1219,15 @@ def enqueue_disc_batch(req: DiscBatchRequest) -> dict:
     settings = jobqueue.snapshot()
     frozen = _freeze_discs(
         [(a.path, _disc_answer(a), a.titles) for a in wanted],
-        req.output_mode, req.output_dir, settings, named=True)
+        req.output_mode, req.output_dir, settings, named=True,
+        subtitles=req.subtitles)
     _queue_room(len(frozen))
     group_id = uuid.uuid4().hex[:12]
     added = []
     try:
-        for request in frozen:
+        for request, then in frozen:
             added.append(queue_manager.store.add_disc(
-                request, settings, group_id=group_id, group_title=req.path))
+                request, settings, group_id=group_id, group_title=req.path, then=then))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     queue_manager.nudge()

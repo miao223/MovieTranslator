@@ -445,6 +445,27 @@ class BatchRequest(BaseModel):
     series_mode: bool = False
 
 
+class DiscSubtitles(BaseModel):
+    """原盘页「加入列队并做字幕」: what every MKV of a remux is translated
+    with, as confirmed in the button's dialog. The fields a translation
+    batch shares (BatchRequest) minus the folder, with the same defaults —
+    the app keeps no saved defaults of its own for these, on purpose."""
+
+    text_source: Literal["asr", "subtitle"] = "asr"
+    audio_language: str = ""         # "" = each file's default track
+    subtitle_language: str = ""      # "" = each file's best track
+    source_language: str = "auto"
+    target_language: str = "简体中文"
+    output_mode: Literal[
+        "bilingual", "translation_only", "original_only", "bilingual_split"
+    ] = "bilingual"
+    # a muxed MKV is a second copy of every file: the page says so
+    embed_subtitle: bool = False
+    # one 原文 → 译名 table per disc, or per box set (services/series.py) —
+    # never per batch, where unrelated films would share their names
+    series_mode: bool = True
+
+
 DiscOutputMode = Literal["beside", "inside", "custom"]
 
 
@@ -487,6 +508,15 @@ class DiscRequest(BaseModel):
         return self.output_mode or ("custom" if self.output_dir.strip() else "beside")
 
 
+class DiscEnqueueRequest(DiscRequest):
+    """POST /api/queue/disc: a DiscRequest, and optionally what to translate
+    its MKVs with once they are written. Kept off DiscRequest itself: that
+    is the remux job's own payload (its JSON is in the checkpoint key), and
+    the subtitles are the queue's business, not the remux's."""
+
+    subtitles: Optional[DiscSubtitles] = None
+
+
 class DiscAnswer(BaseModel):
     """What the 原盘 page's batch mode was told about one disc of the folder."""
 
@@ -509,6 +539,8 @@ class DiscBatchRequest(BaseModel):
     # 加入列队 queues exactly the discs listed here with include=True — not
     # whatever the folder holds by then.
     discs: list[DiscAnswer] = []
+    # 加入列队并做字幕 (ignored by the scan): see DiscEnqueueRequest
+    subtitles: Optional[DiscSubtitles] = None
 
 
 class DiscStreamInfo(BaseModel):
@@ -720,6 +752,13 @@ class QueueEntry(BaseModel):
     # them into a single row instead of drowning the list.
     group_id: str = ""
     group_title: str = ""
+    # A disc entry queued with 加入列队并做字幕: once it ends, every MKV it
+    # wrote is queued for translation with this request (video_path filled
+    # in per file), under this entry's settings snapshot — frozen when the
+    # button was pressed, like everything else in the queue.
+    then: Optional[JobRequest] = None
+    # the disc entry a translation entry was queued by (see `then`)
+    origin: str = ""
 
 
 class QueueEntryView(BaseModel):

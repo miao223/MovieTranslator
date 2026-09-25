@@ -105,8 +105,14 @@ def settings_hash(settings: Optional[AppSettings]) -> str:
 def describe_entry(entry: QueueEntry) -> str:
     """The summary line for any kind of entry."""
     if entry.kind == "disc":
-        return describe_disc(entry.disc)
-    return describe(entry.request)
+        line = describe_disc(entry.disc)
+        if entry.then is not None:
+            line += f" · 完成后做字幕：{describe(entry.then)}"
+        return line
+    line = describe(entry.request)
+    if entry.origin:
+        line += " · 原盘封装后自动加入"
+    return line
 
 
 def describe_disc(request: Optional[DiscRequest]) -> str:
@@ -334,7 +340,8 @@ class QueueStore:
             return entry
 
     def add_disc(self, request: DiscRequest, settings: AppSettings,
-                 group_id: str = "", group_title: str = "") -> QueueEntry:
+                 group_id: str = "", group_title: str = "",
+                 then: Optional[JobRequest] = None) -> QueueEntry:
         with self.lock:
             if sum(1 for e in self.entries if e.status == "queued") >= MAX_QUEUED:
                 raise ValueError(f"列队已满（最多 {MAX_QUEUED} 条等待中的任务）")
@@ -347,6 +354,7 @@ class QueueStore:
                 settings=settings,
                 group_id=group_id,
                 group_title=group_title,
+                then=then,
             )
             self.entries.append(entry)
             self.save()
@@ -521,6 +529,59 @@ class QueueManager:
                 self.store.save()
         self._current = entry_id
 
+    def _queue_subtitles(self, entry: QueueEntry) -> None:
+        """加入列队并做字幕: queue a translation of every MKV *entry* wrote,
+        at the end of the queue, with the request frozen when its button
+        was pressed (entry.then) and the same settings snapshot.
+
+        A failed remux still hands over what it did write — one broken
+        title must not cost the others their subtitles, the same rule the
+        remux itself follows. Idempotent, because it runs again for the
+        same files: a retried remux reports the titles it skipped as
+        already written, and a crash before the queue is saved runs this
+        again. So a file is skipped when a translation of it is already
+        queued, running or done, or a subtitle in the target language is
+        already beside it (the check a translation batch makes).
+        Caller holds store.lock and saves."""
+        from app.core.media import subtitle_state
+
+        try:
+            template = entry.then
+            taken = {e.request.video_path for e in self.store.entries
+                     if e.kind == "job" and e.request is not None
+                     and e.status in ("queued", "running", "done")}
+            wanted, skipped = [], 0
+            for name in entry.result_files:
+                path = Path(name)
+                if name in taken or not path.is_file() or subtitle_state(
+                        path.parent, path.stem,
+                        template.target_language)[0] == "done":
+                    skipped += 1
+                    continue
+                wanted.append(name)
+            room = MAX_QUEUED - sum(1 for e in self.store.entries if e.status == "queued")
+            left_out = wanted[max(room, 0):]
+            now = time.time()
+            for name in wanted[:max(room, 0)]:
+                self.store.entries.append(QueueEntry(
+                    id=uuid.uuid4().hex[:12],
+                    title=name,
+                    created_at=now,
+                    request=template.model_copy(update={"video_path": name}),
+                    settings=entry.settings,
+                    group_id=entry.group_id or entry.id,
+                    group_title=entry.group_title or entry.title,
+                    origin=entry.id,
+                ))
+            note = f"已自动加入 {len(wanted) - len(left_out)} 条字幕任务（排在列队最后）"
+            if skipped:
+                note += f"，{skipped} 个已有字幕或已在列队里，跳过"
+            if left_out:
+                note += f"；列队已满，另有 {len(left_out)} 个没有加入"
+            entry.note = note
+        except Exception as exc:  # noqa: BLE001 — the queue must go on
+            entry.note = f"自动加入字幕任务失败：{exc}"
+
     def _poll_current(self) -> None:
         from app.services.pipeline import manager as job_manager
 
@@ -549,6 +610,12 @@ class QueueManager:
             entry.result_in_place = bool(job.status.srt_in_place)
             entry.result_files = list(job.status.outputs)
             entry.finished_at = time.time()
+            if entry.kind == "disc" and entry.then is not None \
+                    and entry.status in ("done", "failed") and entry.result_files:
+                self._queue_subtitles(entry)
+            # one write for the entry's end and the entries it queued: two
+            # writes, and a crash between them would lose the follow-ups for
+            # good — a finished entry is never polled again
             self.store.save()
         self._current = None
         # Swept after every entry, not only at startup: a queue left
@@ -604,9 +671,12 @@ class QueueManager:
             if entry.kind == "disc":
                 # the same request, so the same checkpoint: titles finished
                 # last time are skipped, not written again as 片名.2.mkv
+                # …and the same follow-up: _queue_subtitles skips the MKVs
+                # whose translation is already queued or done
                 new = self.store.add_disc(payload, settings,
                                           group_id=entry.group_id,
-                                          group_title=entry.group_title)
+                                          group_title=entry.group_title,
+                                          then=entry.then)
             else:
                 new = self.store.add(payload, settings,
                                      group_id=entry.group_id,

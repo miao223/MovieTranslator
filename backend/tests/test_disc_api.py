@@ -134,6 +134,7 @@ def test_an_empty_selection_is_frozen_into_the_defaults(api, tmp_path):
     # everything the list showed is settled into the entry, not left to the run
     assert (entry.disc.name, entry.disc.output_mode, entry.disc.episode_start,
             entry.disc.extra_start) == ("Film (2001)", "beside", 1, 1)
+    assert entry.then is None                 # plain 加入列队: no subtitles after
     assert r.json()["entry"]["summary"].startswith("原盘封装 · 2 个标题")
 
 
@@ -318,6 +319,57 @@ def test_a_batch_with_a_disc_that_cannot_be_queued_queues_nothing(api, tmp_path)
     discs[1]["include"] = False           # left out, the rest goes ahead
     r = client.post("/api/queue/disc-batch", json={"path": str(lib), "discs": discs})
     assert r.status_code == 200 and r.json()["count"] == 1
+
+
+# ---------------------------------------------------- 加入列队并做字幕
+
+def test_the_mkvs_a_remux_wrote_are_queued_for_subtitles(api, tmp_path):
+    client, manager = api
+    root, _ = film_disc(tmp_path)
+    r = client.post("/api/queue/disc", json={
+        "path": str(root), "subtitles": {"target_language": "English",
+                                         "output_mode": "translation_only"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["entry"]["summary"].endswith("完成后做字幕：auto → English · 纯译文 · 语音识别")
+    then = manager.store.entries[0].then
+    assert (then.video_path, then.target_language, then.subtitle_fallback_asr) == ("", "English", True)
+    assert then.series_id.startswith("disc-")
+    disc, job = _run(manager)
+    assert disc.status == "done", job.status.error
+    # the translations wait in the queue behind it — not run here
+    follow = manager.store.entries[1:]
+    assert [e.request.video_path for e in follow] == disc.result_files
+    assert all(e.status == "queued" and e.origin == disc.id for e in follow)
+    assert "已自动加入 2 条字幕任务" in disc.note
+    views = client.get("/api/queue").json()["entries"]
+    assert views[1]["summary"].endswith("原盘封装后自动加入")
+    r = client.post("/api/queue/disc", json={"path": str(root), "subtitles": {"target_language": " "}})
+    assert r.status_code == 400 and "目标语言" in r.json()["detail"]
+
+
+def test_one_names_table_per_disc_or_box_set_never_per_batch(api, tmp_path, short_episodes):
+    """A batch of unrelated films must not share one table of names — the
+    first film's would win in all the others — while the volumes of one
+    box set must."""
+    client, manager = api
+    lib = tmp_path / "lib"
+    series_volume(lib / "Show [BD]" / "SHOW_VOL01", tmp_path)
+    series_volume(lib / "Show [BD]" / "SHOW_VOL02", tmp_path)
+    film_disc(lib)
+    film_disc(lib, name="Other Film (1999)")
+    scan = client.post("/api/disc/batch-scan", json={"path": str(lib)}).json()
+    names = [Path(d["root"]).name for d in scan["discs"]]
+    r = client.post("/api/queue/disc-batch", json={
+        "path": str(lib), "discs": [{"path": d["path"]} for d in scan["discs"]],
+        "subtitles": {}})
+    assert r.status_code == 200, r.text
+    series = dict(zip(names, (e.then.series_id for e in manager.store.entries)))
+    assert series["SHOW_VOL01"] == series["SHOW_VOL02"]
+    assert len({series["SHOW_VOL01"], series["Film (2001)"], series["Other Film (1999)"]}) == 3
+    # …and none at all when the dialog's switch is off
+    r = client.post("/api/queue/disc", json={"path": scan["discs"][0]["path"],
+                                              "subtitles": {"series_mode": False}})
+    assert manager.store.entries[-1].then.series_id == ""
 
 
 # ------------------------------------------------- the rest of the program

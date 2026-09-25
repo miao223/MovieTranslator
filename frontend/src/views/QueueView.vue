@@ -337,7 +337,9 @@ async function showSettings(entry) {
             </template>
           </span>
           <div v-if="entry.error" class="row-note error">{{ entry.error }}</div>
-          <div v-else-if="entry.note" class="row-note">{{ entry.note }}</div>
+          <!-- not v-else: a disc that failed on one title still queued
+               subtitles for the rest, and says so here -->
+          <div v-if="entry.note" class="row-note">{{ entry.note }}</div>
           <!-- a disc writes its MKVs beside itself; tens of GB are not a
                browser download, so the paths are the result -->
           <div v-if="entry.kind === 'disc' && entry.result_files.length" class="row-note files">

@@ -13,6 +13,7 @@ import { ElMessage } from 'element-plus'
 import { api } from '../api'
 import FileBrowser from '../components/FileBrowser.vue'
 import DiscTitles from '../components/DiscTitles.vue'
+import SubtitleDialog from '../components/SubtitleDialog.vue'
 
 const emit = defineEmits(['goto'])
 
@@ -116,7 +117,8 @@ const canQueue = computed(() => {
     && chosen.value.length > 0 && !busy.value
 })
 
-async function enqueue() {
+// subtitles: the 「加入列队并做字幕」 dialog's answer, null for plain 加入列队
+async function enqueue(subtitles = null) {
   const r = report.value
   if (!r) return
   busy.value = true
@@ -128,8 +130,10 @@ async function enqueue() {
       ...outputParams(),
       episode_start: episodeStart.value,
       series: series.value,
+      subtitles,
     })
-    enqueued.value = { position: resp.position, count: chosen.value.length }
+    enqueued.value = { position: resp.position, count: chosen.value.length, subtitles: !!subtitles }
+    subDialog.value = false
     ElMessage.success(`已加入列队（第 ${resp.position} 位）`)
   } catch (e) {
     ElMessage.error(e.message)
@@ -276,7 +280,7 @@ const batchTooBig = computed(() => {
 const canQueueBatch = computed(() =>
   wanted.value.length > 0 && !busy.value && wanted.value.every((d) => d.output_dir))
 
-async function enqueueBatch() {
+async function enqueueBatch(subtitles = null) {
   const b = batch.value
   if (!b) return
   busy.value = true
@@ -287,15 +291,40 @@ async function enqueueBatch() {
                include: !!include[d.path] && titles.length > 0 }
     })
     const resp = await api.enqueueDiscBatch({
-      path: b.path, recursive: recursive.value, ...outputParams(), discs,
+      path: b.path, recursive: recursive.value, ...outputParams(), discs, subtitles,
     })
-    batchQueued.value = { count: resp.count, position: resp.position }
+    batchQueued.value = { count: resp.count, position: resp.position, subtitles: !!subtitles }
+    subDialog.value = false
     ElMessage.success(`已加入列队：${resp.count} 张盘`)
   } catch (e) {
     ElMessage.error(e.message)
   } finally {
     busy.value = false
   }
+}
+
+// ------------------------------------------ 加入列队并做字幕 (both modes)
+const subDialog = ref(false)
+
+// what the dialog is about: the ticked titles of this disc, or of every
+// wanted disc of the batch — they all get subtitles, extras included
+const subTitles = computed(() => (mode.value === 'single'
+  ? chosen.value
+  : wanted.value.flatMap((d) => chosenOf(d))))
+
+function languagesOf(kind) {
+  const seen = new Set()
+  for (const t of subTitles.value) {
+    for (const s of t.streams) {
+      if (s.kind === kind && s.carried) seen.add(s.language_name || '未标注')
+    }
+  }
+  return [...seen]
+}
+
+function confirmSubtitles(options) {
+  if (mode.value === 'single') enqueue(options)
+  else enqueueBatch(options)
 }
 
 // ------------------------------------------------ both: output, browsing
@@ -494,9 +523,14 @@ function fmtBytes(bytes) {
         </template>
         <el-tag v-if="tooBig" type="danger" size="small" style="margin-left: 6px">空间可能不够</el-tag>
       </div>
-      <el-button type="primary" :disabled="!canQueue" :loading="busy" @click="enqueue">
-        ＋ 加入列队
-      </el-button>
+      <div class="buttons">
+        <el-button type="primary" :disabled="!canQueue" :loading="busy" @click="enqueue()">
+          ＋ 加入列队
+        </el-button>
+        <el-button type="primary" plain :disabled="!canQueue" @click="subDialog = true">
+          ＋ 加入列队并做字幕
+        </el-button>
+      </div>
     </div>
     <el-alert
       v-if="report.analysis_only" type="info" :closable="false" style="margin-top: 10px"
@@ -505,6 +539,7 @@ function fmtBytes(bytes) {
     <el-alert v-if="enqueued" type="success" :closable="false" style="margin-top: 10px">
       <template #title>
         已加入列队（第 {{ enqueued.position }} 位），{{ enqueued.count }} 个标题。
+        <template v-if="enqueued.subtitles">封装完成后，这些 MKV 会自动加入字幕任务（排在列队最后）。</template>
         <el-link type="primary" :underline="false" @click="emit('goto', 'queue')">去列队查看进度 →</el-link>
       </template>
     </el-alert>
@@ -605,19 +640,32 @@ function fmtBytes(bytes) {
         约 <strong>{{ fmtBytes(wantedBytes) }}</strong>
         <el-tag v-if="batchTooBig" type="danger" size="small" style="margin-left: 6px">空间可能不够</el-tag>
       </div>
-      <el-button type="primary" :disabled="!canQueueBatch" :loading="busy" @click="enqueueBatch">
-        ＋ 加入列队（{{ wanted.length }} 张盘）
-      </el-button>
+      <div class="buttons">
+        <el-button type="primary" :disabled="!canQueueBatch" :loading="busy" @click="enqueueBatch()">
+          ＋ 加入列队（{{ wanted.length }} 张盘）
+        </el-button>
+        <el-button type="primary" plain :disabled="!canQueueBatch" @click="subDialog = true">
+          ＋ 加入列队并做字幕
+        </el-button>
+      </div>
     </div>
     <el-alert v-if="batchQueued" type="success" :closable="false" style="margin-top: 10px">
       <template #title>
         已加入列队：{{ batchQueued.count }} 张盘，每张一条任务（从第 {{ batchQueued.position }} 位起）。
+        <template v-if="batchQueued.subtitles">每张盘封装完成后，它的 MKV 会自动加入字幕任务（排在列队最后）。</template>
         <el-link type="primary" :underline="false" @click="emit('goto', 'queue')">去列队查看进度 →</el-link>
       </template>
     </el-alert>
   </el-card>
 
   <FileBrowser ref="fileBrowser" v-model="browserVisible" :mode="browseMode" @pick="onPick" />
+  <SubtitleDialog
+    v-model="subDialog" :busy="busy" :count="subTitles.length"
+    :extras="subTitles.filter((t) => t.category === 'extra').length"
+    :discs="mode === 'single' ? 1 : wanted.length"
+    :audio="languagesOf('audio')" :subtitles="languagesOf('subtitle')"
+    @confirm="confirmSubtitles"
+  />
 </template>
 
 <style scoped>
@@ -715,5 +763,10 @@ function fmtBytes(bytes) {
 .summary {
   font-size: 13px;
   color: var(--el-text-color-regular);
+}
+.buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 </style>
