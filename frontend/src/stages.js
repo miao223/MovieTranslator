@@ -7,6 +7,7 @@ export const STAGE_LABELS = {
   queued: '等待中',
   pending: '排队中',
   remuxing: '原盘封装',
+  encoding: '视频压制',
   extracting: '提取音频',
   importing: '读取字幕',
   transcribing: '语音识别',

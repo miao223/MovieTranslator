@@ -338,7 +338,8 @@ def _disposition(route_kind: str, want: Want, first: bool):
 
 def remux_title(disc: Disc, title: Title, out_path: Path, *, lpcm: str = "flac",
                 log: Optional[LogFn] = None, progress: Optional[ProgressFn] = None,
-                should_cancel: Optional[Callable[[], bool]] = None) -> Result:
+                should_cancel: Optional[Callable[[], bool]] = None,
+                tags: Optional[Dict[str, str]] = None) -> Result:
     log = log or (lambda _m: None)
     should_cancel = should_cancel or (lambda: False)
     pieces, wants = (_bd_plan if disc.kind == "bd" else _dvd_plan)(disc, title)
@@ -357,6 +358,10 @@ def remux_title(disc: Disc, title: Title, out_path: Path, *, lpcm: str = "flac",
 
     try:
         with av.open(str(part), mode="w", format="matroska") as out:
+            # global tags, written with the header: the pipeline's way of
+            # recognising this file as the remux of this title later
+            # (encode.REMUX_TAG)
+            out.metadata.update(tags or {})
             reader, first = _open(pieces[0])
             if _unprobed(first, wants):
                 first.close()

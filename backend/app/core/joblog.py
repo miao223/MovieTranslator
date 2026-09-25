@@ -260,6 +260,37 @@ class JobLogWriter:
             lines.append(f"本卷名称      : {request.own_name}（多卷合集里按盘编号的文件用它命名）")
         self.section("任务参数", lines)
 
+    def write_encode_request(self, request) -> None:
+        """任务参数 for a 压制 job (EncodeRequest)."""
+        from app.services.encode import describe_options
+
+        o = request.options
+        where = ("原文件旁边（文件名加编码标记）" if request.output_mode == "beside"
+                 else f"指定文件夹 {request.output_dir}")
+        rate = (f"平均码率 {o.bitrate_kbps} kbps" if o.rate_control == "bitrate"
+                else f"恒定质量 {o.quality}")
+        audio = ("原样" if o.audio_codec == "copy" else
+                 f"{o.audio_codec}，{'只转无损音轨' if o.audio_scope == 'lossless' else '全部音轨'}，"
+                 f"码率 {o.audio_bitrate_kbps or '自动'}"
+                 + ("，降为立体声" if o.audio_mixdown == "stereo" else ""))
+        subs = {"all": "全部保留", "none": "不保留",
+                "languages": "只保留 " + ("/".join(o.subtitle_languages) or "（无）")}[o.subtitles]
+        lines = [
+            "任务类型      : 视频压制（重编码）",
+            f"概要          : {describe_options(o)}",
+            f"容器          : {o.container}",
+            f"视频          : {o.video_codec}，{rate}，速度 {o.preset}，位深 {o.bit_depth}，"
+            f"分辨率上限 {o.max_height or '不限'}，反交错 {o.deinterlace}"
+            + (f"，tune {o.tune}" if o.tune else ""),
+            f"音频          : {audio}",
+            f"音轨语言      : {'/'.join(o.audio_languages) or '全部'}",
+            f"字幕轨        : {subs}",
+            f"输出位置      : {where}",
+        ]
+        if request.replace_source:
+            lines.append("完成后        : 校验通过就用压制版替换这份无损 MKV（原盘全流程）")
+        self.section("任务参数", lines)
+
     def write_request(self, request, source_kind: str = "video") -> None:
         if request.text_source == "subtitle":
             # explains a job that never loads a model or touches the audio

@@ -256,6 +256,53 @@ class DiscSettings(BaseModel):
     output_dir: str = ""             # for "custom"
 
 
+class EncodeOptions(BaseModel):
+    """What a 压制 (re-encode) job does to a video (services/encode.py).
+
+    One model for three places: the 压制 page, the defaults on the settings
+    page (AppSettings.encode) and the full-pipeline dialog on the 原盘 page.
+    The defaults are the user's choice: H.265 10bit, the lossless audio
+    tracks to E-AC-3, everything else kept as it is.
+    """
+
+    container: Literal["mkv", "mp4"] = "mkv"
+    # encoder id (libx265, hevc_nvenc…), or "copy" to leave the picture
+    # alone. A free string for the reason EmbedSettings.video_codec is one:
+    # which encoders exist depends on the machine, and the server validates
+    # against its own probe (encode.capabilities).
+    video_codec: str = "libx265"
+    rate_control: Literal["quality", "bitrate"] = "quality"
+    # CRF-style, lower is better. The scale is the encoder's own — x26x and
+    # NVENC 0-51, SVT-AV1 / VP9 0-63, AMF's AV1 0-255 — and out-of-range
+    # values are clamped to it (encode.capabilities says which).
+    quality: int = Field(22, ge=0, le=255)
+    bitrate_kbps: int = Field(6000, ge=100, le=200_000)  # rate_control="bitrate"
+    preset: Literal["ultrafast", "fast", "medium", "slow", "veryslow"] = "medium"
+    # content tuning. Only x264 (film/animation/grain) and x265 (animation/
+    # grain — it refuses "film" at open) have it; ignored elsewhere.
+    tune: Literal["", "film", "animation", "grain"] = ""
+    # auto: H.265 / AV1 in 10bit, H.264 / VP9 in 8bit (H.264 High 10 barely
+    # plays on hardware decoders). An HDR source is always 10bit.
+    bit_depth: Literal["auto", "8", "10"] = "auto"
+    # a limit on the shorter side; 0 keeps the size. Never upscales.
+    max_height: Literal[0, 2160, 1440, 1080, 720, 576, 480] = 0
+    # auto: only frames the source flags as interlaced (bwdif); all: every
+    # frame; ivtc: undo 3:2 pulldown (NTSC film on DVD) back to 23.976
+    deinterlace: Literal["auto", "off", "all", "ivtc"] = "auto"
+    audio_codec: Literal["copy", "aac", "libopus", "ac3", "eac3", "flac"] = "eac3"
+    # which tracks audio_codec applies to. "lossless": TrueHD, DTS-HD MA,
+    # PCM, FLAC… only — re-encoding an AC-3 or DTS core into another lossy
+    # format loses quality for little space, so those are copied.
+    audio_scope: Literal["lossless", "all"] = "lossless"
+    audio_bitrate_kbps: int = Field(0, ge=0, le=6144)   # 0 = by channel count
+    audio_mixdown: Literal["keep", "stereo"] = "keep"
+    # ISO 639-2 tags of the audio tracks to keep; empty keeps every one.
+    # Untagged tracks always stay: there is nothing to judge them by.
+    audio_languages: list[str] = []
+    subtitles: Literal["all", "languages", "none"] = "all"
+    subtitle_languages: list[str] = []
+
+
 class AppSettings(BaseModel):
     # temp working dir for intermediate files; empty = platform cache dir.
     # only its "jobs" subdirectory is managed (and wiped on startup)
@@ -284,6 +331,8 @@ class AppSettings(BaseModel):
     server: ServerSettings = ServerSettings()
     mcp: MCPSettings = MCPSettings()
     disc: DiscSettings = DiscSettings()
+    # what the 压制 page and the 原盘 page's full pipeline start from
+    encode: EncodeOptions = EncodeOptions()
 
 
 # ---------------------------------------------------------------- jobs
@@ -515,6 +564,8 @@ class DiscEnqueueRequest(DiscRequest):
     the subtitles are the queue's business, not the remux's."""
 
     subtitles: Optional[DiscSubtitles] = None
+    # 加入列队并压制、做字幕: encode every MKV first (DiscEncode)
+    encode: Optional["DiscEncode"] = None
 
 
 class DiscAnswer(BaseModel):
@@ -541,6 +592,64 @@ class DiscBatchRequest(BaseModel):
     discs: list[DiscAnswer] = []
     # 加入列队并做字幕 (ignored by the scan): see DiscEnqueueRequest
     subtitles: Optional[DiscSubtitles] = None
+    encode: Optional["DiscEncode"] = None
+
+
+class DiscEncode(BaseModel):
+    """原盘页「加入列队并压制、做字幕」: what the disc's MKVs are encoded with
+    once they are remuxed, before their subtitles are made."""
+
+    options: EncodeOptions = EncodeOptions()
+    # The user's default: the lossless MKV goes once its encode has been
+    # verified, and the encode takes its name. The disc itself is never
+    # touched, so the lossless one can always be remuxed again.
+    keep_lossless: bool = False
+
+
+class EncodeRequest(BaseModel):
+    """Re-encode one video (压制). Queue-only, like a disc."""
+
+    source: str
+    options: EncodeOptions = EncodeOptions()
+    # "beside": next to the source, the codec in the name (片名.HEVC.mkv);
+    # "custom": in output_dir under the source's own name
+    output_mode: Literal["beside", "custom"] = "beside"
+    # for "custom": this file's folder — a batch keeps each file's
+    # sub-folder under the chosen one, worked out when it is queued
+    output_dir: str = ""
+    # Swap the source for the encode once it is verified. Set by the queue
+    # alone, from a disc's then_encode: the source is then the lossless MKV
+    # this program remuxed moments before, and it carries the tag that says
+    # so. The queue endpoints refuse it — the 压制 page never deletes or
+    # overwrites anything of the user's.
+    replace_source: bool = False
+
+
+class EncodeEnqueueRequest(BaseModel):
+    """POST /api/queue/encode: one file, and optionally its subtitles after."""
+
+    source: str
+    options: EncodeOptions = EncodeOptions()
+    output_mode: Literal["beside", "custom"] = "beside"
+    output_dir: str = ""
+    subtitles: Optional[DiscSubtitles] = None
+
+
+class EncodeBatchRequest(BaseModel):
+    """POST /api/queue/encode-batch: the files the 压制 page's batch mode
+    ticked, from one scanned folder."""
+
+    path: str                        # the folder the files were found in
+    files: list[str] = []
+    options: EncodeOptions = EncodeOptions()
+    output_mode: Literal["beside", "custom"] = "beside"
+    output_dir: str = ""
+    subtitles: Optional[DiscSubtitles] = None
+
+
+class EncodeScanRequest(BaseModel):
+    path: str
+    recursive: bool = True
 
 
 class DiscStreamInfo(BaseModel):
@@ -633,6 +742,8 @@ JobStage = Literal[
     "pending",
     # remuxing a disc's titles to MKV (DiscRequest) — a job of its own kind
     "remuxing",
+    # re-encoding a video (EncodeRequest) — likewise
+    "encoding",
     "extracting",
     # reading a subtitle the release already carries, in place of
     # extracting + transcribing (text_source="subtitle")
@@ -675,7 +786,8 @@ class JobStatus(BaseModel):
     # embed mode: the new video carrying the subtitle track. Empty otherwise,
     # so the UI can tell the two outcomes apart from this field alone.
     video_filename: str = ""
-    # disc remux: every MKV written, full paths. Empty for every other job.
+    # disc remux: every MKV written; 压制: the encode. Full paths, empty for
+    # every other job.
     outputs: list[str] = []
 
 
@@ -721,7 +833,8 @@ class QueueEntry(BaseModel):
     id: str
     kind: str = "job"          # a free string, not a Literal: an entry from a
                                # newer version should report itself, not fail.
-                               # "job" = translate (request), "disc" = remux (disc)
+                               # "job" = translate (request), "disc" = remux
+                               # (disc), "encode" = re-encode (encode)
     status: Literal["queued", "running", "done", "failed", "cancelled"] = "queued"
     title: str = ""            # survives even when the rest cannot be parsed
     created_at: float = 0.0
@@ -730,6 +843,7 @@ class QueueEntry(BaseModel):
     job_id: str = ""
     request: Optional[JobRequest] = None
     disc: Optional[DiscRequest] = None
+    encode: Optional[EncodeRequest] = None
     settings: Optional[AppSettings] = None
     error: str = ""
     note: str = ""
@@ -746,7 +860,7 @@ class QueueEntry(BaseModel):
     result_srt_original: str = ""   # bilingual_split 的原文那一份
     result_video: str = ""
     result_in_place: bool = False
-    # disc remux: every MKV it wrote (JobStatus.outputs), full paths
+    # disc remux: every MKV it wrote; 压制: the encode (JobStatus.outputs)
     result_files: list[str] = []
     # Files enqueued from one directory share these, so the UI can collapse
     # them into a single row instead of drowning the list.
@@ -757,8 +871,16 @@ class QueueEntry(BaseModel):
     # in per file), under this entry's settings snapshot — frozen when the
     # button was pressed, like everything else in the queue.
     then: Optional[JobRequest] = None
-    # the disc entry a translation entry was queued by (see `then`)
+    # A disc entry queued with 加入列队并压制、做字幕: every MKV it wrote is
+    # queued for re-encoding first, right behind it, with this request
+    # (source filled in per file) — and `then` travels on to those entries,
+    # so each encode, once done, queues its own subtitles.
+    then_encode: Optional[EncodeRequest] = None
+    # the entry this one was queued by (see `then` / `then_encode`), and
+    # what that was: "disc" or "encode". Empty kind on an entry from before
+    # encodes existed means a disc.
     origin: str = ""
+    origin_kind: str = ""
 
 
 class QueueEntryView(BaseModel):
@@ -804,3 +926,7 @@ class QueueView(BaseModel):
     active_id: str = ""        # answers "why is nothing running"
     settings_hash: str = ""    # fingerprint of the CURRENT settings
     entries: list[QueueEntryView] = []
+
+
+DiscEnqueueRequest.model_rebuild()
+DiscBatchRequest.model_rebuild()

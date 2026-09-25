@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import queue
+import shutil
 import threading
 import time
 import traceback
@@ -27,6 +28,7 @@ from app.core.joblog import JobLogWriter, _settings_lines as joblog_settings_lin
 from app.models.schemas import (
     AppSettings,
     DiscRequest,
+    EncodeRequest,
     JobRequest,
     JobStatus,
     ProgressEvent,
@@ -57,6 +59,11 @@ def _hms(seconds: float) -> str:
     if hours:
         return f"{hours} 小时 {minutes} 分"
     return f"{minutes} 分" if minutes else f"{whole} 秒"
+
+
+def _size(size: int) -> str:
+    return (f"{size / (1 << 30):.2f} GB" if size >= 1 << 30
+            else f"{size / (1 << 20):.1f} MB")
 
 
 def _eta(started: float, fraction: float, recoding: bool) -> str:
@@ -102,7 +109,7 @@ def checkpoint_key(job: Job, settings: AppSettings) -> str:
     from app.core.joblog import APP_VERSION
     from app.services.jobqueue import settings_hash
 
-    video = Path(job.request.video_path) if job.kind == "job" else Path(job.request.path)
+    video = Path(job.path)
     # A disc is stamped by its index file (or the .iso itself), never by
     # its folder: the MKVs are written into that folder, and the folder's
     # mtime changes with the first one — which would make every resumed
@@ -159,10 +166,14 @@ class Job:
         self.id = uuid.uuid4().hex[:12]
         self.request = request
         # "job" translates a file (JobRequest); "disc" remuxes a disc's
-        # titles to MKV (DiscRequest). Everything that follows the job — SSE,
-        # cancel, the log, the queue — is the same for both.
-        self.kind = "disc" if isinstance(request, DiscRequest) else "job"
-        path = request.path if self.kind == "disc" else request.video_path
+        # titles to MKV (DiscRequest); "encode" re-encodes a video
+        # (EncodeRequest). Everything that follows the job — SSE, cancel,
+        # the log, the queue — is the same for all three.
+        self.kind = ("disc" if isinstance(request, DiscRequest)
+                     else "encode" if isinstance(request, EncodeRequest) else "job")
+        path = (request.path if self.kind == "disc"
+                else request.source if self.kind == "encode" else request.video_path)
+        self.path = path
         # A source with no picture cannot be muxed into a video and has no
         # frames to translate. Worked out here rather than only in
         # JobManager.create so that a Job built directly (as the tests do)
@@ -171,7 +182,8 @@ class Job:
         # 'video' / 'audio' / 'subtitle' —— 这个任务实际在读什么。create 把
         # 自己那次探测传进来，好让一个任务只开一次文件。
         self.source_kind = source_kind or (
-            "disc" if self.kind == "disc" else media.probe_kind(request.video_path))
+            "disc" if self.kind == "disc"
+            else "video" if self.kind == "encode" else media.probe_kind(request.video_path))
         # 下面每一处守卫问的其实都是「有没有画面」，字幕文件与纯音频同答
         self.audio_only = (
             audio_only if audio_only is not None
@@ -197,7 +209,7 @@ class Job:
             media.base_stem(request.video_path)
             if self.source_kind == "subtitle"
             else Path(path).name if self.kind == "disc"
-            else Path(request.video_path).stem
+            else Path(path).stem
         )
         self.srt_path: Optional[Path] = None
         # 双文件模式的另一半（原文）。其余模式恒为空表，所以结果那一串管道
@@ -328,6 +340,23 @@ class JobManager:
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job
 
+    def create_encode(self, request: EncodeRequest,
+                      settings: Optional[AppSettings] = None) -> Job:
+        """A 压制 job. Queue-only too; the source and the encoder were
+        checked when it was added, and are checked again here — an entry can
+        wait for days, and a GPU driver can go in that time."""
+        from app.services import encode
+
+        source = Path(request.source)
+        if not source.is_file():
+            raise FileNotFoundError(f"片源文件不存在: {source}")
+        encode.check_options(request.options)
+        job = Job(request, audio_only=False, settings=settings, source_kind="video")
+        self._evict_old()
+        self.jobs[job.id] = job
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return job
+
     def get(self, job_id: str) -> Job:
         if job_id not in self.jobs:
             raise KeyError(job_id)
@@ -375,7 +404,9 @@ class JobManager:
         results sitting there. With resuming switched off it is the old
         per-job directory, which the next startup wipes.
         """
-        if not checkpoints_enabled():
+        # an encode has nothing to resume from: an interrupted one starts
+        # over, and a finished one is recognised by its own file's tag
+        if job.kind == "encode" or not checkpoints_enabled():
             return job_dir(job.id)
         job.checkpoint = checkpoint_key(job, _settings_for(job))
         return checkpoint_dir(job.checkpoint)
@@ -653,6 +684,7 @@ class JobManager:
         failure skips straight to what is still missing instead of writing
         the film again as 片名.2.mkv.
         """
+        from app.services import encode
         from app.services.disc import DiscError, open_disc
         from app.services.disc import report as disc_report
         from app.services.disc.analyze import analyze, hms
@@ -717,13 +749,30 @@ class JobManager:
         except (OSError, ValueError):
             done = {}
 
+        disc_id = encode.disc_key(disc.root)
+
         def finished(title) -> Optional[Path]:
             prev = done.get(title.id) or {}
             path = Path(prev.get("path", ""))
             try:
-                return path if path.name and path.stat().st_size == prev.get("size") else None
+                if path.name and path.stat().st_size == prev.get("size"):
+                    return path
             except OSError:
-                return None
+                pass
+            # No record — a retry with other settings has another checkpoint
+            # key, and resuming can be off — or a record whose file has since
+            # been swapped for its encode: either way the file itself says
+            # which title of which disc it is (the tag remux_title writes).
+            # Without this, both cases wrote the title again as 片名.2.mkv.
+            base = out_dir / analysis.verdicts[title.id].output
+            candidate, n = base, 2
+            while candidate.exists() and n < 100:
+                tag = encode.read_tags(candidate)["remux"] or {}
+                if tag.get("disc") == disc_id and tag.get("title") == title.id:
+                    return candidate
+                candidate = base.with_name(f"{base.stem}.{n}{base.suffix}")
+                n += 1
+            return None
 
         todo = [t for t in titles if finished(t) is None]
         need = sum(t.size or 0 for t in todo)
@@ -778,7 +827,8 @@ class JobManager:
                 result = remux_title(
                     disc, title, target, lpcm=settings.disc.lpcm,
                     log=lambda m: job.publish("remuxing", job.status.progress, log=m),
-                    progress=progress, should_cancel=job.cancel_event.is_set)
+                    progress=progress, should_cancel=job.cancel_event.is_set,
+                    tags={encode.REMUX_TAG: encode.remux_tag(disc.root, title.id)})
             except InterruptedError:
                 raise
             except Exception as exc:  # noqa: BLE001 — one title must not cost the rest
@@ -813,9 +863,96 @@ class JobManager:
         job.publish("done", 100,
                     message=f"已封装 {len(job.status.outputs)} 个文件到 {out_dir}")
 
+    def _execute_encode(self, job: Job, req: EncodeRequest, workdir: Path) -> None:
+        """Re-encode one video (压制), verify it, and put it in its place.
+
+        A full pipeline's encode replaces the lossless MKV it was made from
+        (req.replace_source) — atomically, and only once the new file has
+        been reopened and checked (encode.verify). Anything short of that
+        keeps both files and says why.
+        """
+        from app.services import encode
+
+        settings = _settings_for(job)
+        source = Path(req.source)
+        job.logfile.write_environment()
+        job.logfile.write_encode_request(req)
+        job.logfile.write_settings(settings)
+        job.logfile.write_media(str(source))
+        job.publish("encoding", 0, message="读取片源…")
+
+        def note(message: str) -> None:
+            job.publish("encoding", job.status.progress, log=message)
+
+        finished = encode.existing_encode(source, req)
+        if finished is not None:
+            job.status.outputs.append(str(finished))
+            job.publish("done", 100, message=f"已经压制好了：{finished.name}",
+                        log=f"↻ {finished.name} 带着本程序的压制标记：上次已经完成，这次不再重压")
+            return
+        encode.check_options(req.options)
+        target = encode.output_target(source, req)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        part = target.with_name(target.name + ".part")
+        size = source.stat().st_size
+        free = shutil.disk_usage(target.parent).free
+        if free < encode.MIN_FREE_BYTES:
+            raise RuntimeError(f"输出目录只剩 {free / (1 << 30):.2f} GB，放不下压制结果——{target.parent}")
+        if free < size:
+            note(f"⚠ 输出目录剩余 {free / (1 << 30):.1f} GB，比片源（{size / (1 << 30):.1f} GB）小；"
+                 f"按质量压制时体积无法预估，空间不够会在中途停下")
+        before = source.stat()
+        started = time.monotonic()
+        shown = {"pct": -1, "time": 0.0}
+
+        def progress(fraction: float, fps: float, speed: float) -> None:
+            # the disc remux's throttle: at most a line every 2 s, and one
+            # every 10 s while the percentage stands still (the job log gets
+            # every one of them)
+            pct = int(fraction * 100)
+            now = time.monotonic()
+            quiet = now - shown["time"]
+            if quiet < 2 or (pct == shown["pct"] and quiet < 10):
+                return
+            shown["pct"], shown["time"] = pct, now
+            job.publish("encoding", 98 * fraction,
+                        message=f"压制 {fraction:.0%} · {fps:.1f} fps · {speed:.2f} 倍速"
+                                + _eta(started, fraction, True))
+
+        note(f"开始压制 → {target.name}（{encode.describe_options(req.options)}）")
+        result = encode.encode_file(source, part, req, log=note, progress=progress,
+                                    should_cancel=job.cancel_event.is_set)
+        stats = result.stats
+        job.publish("encoding", 98, message="校验压制结果…",
+                    log=f"编码完成：{stats.frames_in} 帧进，{stats.frames_out} 帧出，"
+                        f"用时 {_hms(stats.seconds)}"
+                        + (f"，{sum(stats.bad.values())} 个包解码失败已跳过" if stats.bad else ""))
+        problems = encode.verify(part, result)
+        if problems:
+            os.replace(part, target)
+            kept = "，无损版没有动" if req.replace_source else ""
+            raise RuntimeError(f"压制结果校验不通过：{'；'.join(problems)}。"
+                               f"压制出的文件保留为 {target.name}{kept}")
+        note("✓ 校验通过：帧数、时长、轨道和章节都对得上")
+        final, why = encode.finalize(part, source, target, req, before)
+        if req.replace_source:
+            note(f"⚠ 无损版没有替换：{why}。压制版另存为 {final.name}" if why
+                 else f"✓ 无损版已换成压制版，文件名不变：{final.name}")
+        job.status.outputs.append(str(final))
+        out_size = final.stat().st_size
+        ratio = f"{out_size / size:.0%}" if size else "?"
+        message = (f"已压制：{final.name}（{_size(out_size)}，原 {_size(size)} 的 {ratio}，"
+                   f"用时 {_hms(time.monotonic() - started)}）")
+        if why:
+            message += f"；无损版没有替换：{why}"
+        job.publish("done", 100, message=message)
+
     def _execute(self, job: Job, req, workdir: Path) -> None:
         if job.kind == "disc":
             self._execute_disc(job, req, workdir)
+            return
+        if job.kind == "encode":
+            self._execute_encode(job, req, workdir)
             return
         settings = _settings_for(job)
         self._write_diagnostics(job, req, settings)

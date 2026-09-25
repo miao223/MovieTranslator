@@ -42,7 +42,9 @@ from typing import List, Optional, Tuple
 from pydantic import ValidationError
 
 from app.core import config
-from app.models.schemas import AppSettings, DiscRequest, JobRequest, QueueEntry
+from app.models.schemas import (
+    AppSettings, DiscRequest, EncodeRequest, JobRequest, QueueEntry,
+)
 
 # Terminal states, the same three the rest of the app uses (batch.TERMINAL).
 TERMINAL = {"done", "failed", "cancelled"}
@@ -86,7 +88,9 @@ def snapshot() -> AppSettings:
 # Parts of AppSettings that do not change what comes out of a job. Excluded
 # from the fingerprint so that toggling LAN access or moving the cache does
 # not relabel every later entry as a different generation of settings.
-_NOT_OUTPUT_AFFECTING = ("server", "mcp", "work_dir", "model_cache_dir")
+# `encode` is only what the 压制 forms start from: every encode entry carries
+# its own options, so changing the defaults changes no queued work.
+_NOT_OUTPUT_AFFECTING = ("server", "mcp", "work_dir", "model_cache_dir", "encode")
 
 
 def settings_hash(settings: Optional[AppSettings]) -> str:
@@ -106,13 +110,49 @@ def describe_entry(entry: QueueEntry) -> str:
     """The summary line for any kind of entry."""
     if entry.kind == "disc":
         line = describe_disc(entry.disc)
+        if entry.then_encode is not None:
+            line += f" · 完成后压制：{describe_template(entry.then_encode)}"
+            if entry.then is not None:
+                line += f" · 再做字幕：{describe(entry.then)}"
+        elif entry.then is not None:
+            line += f" · 完成后做字幕：{describe(entry.then)}"
+        return line
+    if entry.kind == "encode":
+        line = describe_encode(entry.encode)
         if entry.then is not None:
             line += f" · 完成后做字幕：{describe(entry.then)}"
+        if entry.origin:
+            line += " · 原盘封装后自动加入"
         return line
     line = describe(entry.request)
     if entry.origin:
-        line += " · 原盘封装后自动加入"
+        line += (" · 压制后自动加入" if entry.origin_kind == "encode"
+                 else " · 原盘封装后自动加入")
     return line
+
+
+def describe_encode(request: Optional[EncodeRequest]) -> str:
+    """"压制 · H.265 10bit（x265） · CRF 22 · medium · 无损音轨→E-AC-3 · …"."""
+    if request is None:
+        return ""
+    from app.services.encode import describe_options
+
+    parts = ["压制", describe_options(request.options)]
+    if request.replace_source:
+        parts.append("完成后替换无损版")
+    elif request.output_mode == "custom":
+        parts.append(f"输出到 {request.output_dir}")
+    else:
+        parts.append("放在原文件旁边")
+    return " · ".join(parts)
+
+
+def describe_template(request: EncodeRequest) -> str:
+    """A disc entry's then_encode, as its summary shows it."""
+    from app.services.encode import describe_options
+
+    kept = "删除无损版" if request.replace_source else "保留无损版"
+    return f"{describe_options(request.options)} · {kept}"
 
 
 def describe_disc(request: Optional[DiscRequest]) -> str:
@@ -218,6 +258,15 @@ def _entry_from_raw(raw: dict) -> QueueEntry:
     entry.settings = settings
     entry.note = note
     return entry
+
+
+def _payload(entry: QueueEntry):
+    """The request an entry runs, whatever its kind."""
+    if entry.kind == "disc":
+        return entry.disc
+    if entry.kind == "encode":
+        return entry.encode
+    return entry.request
 
 
 # --------------------------------------------------------------- the store
@@ -341,7 +390,8 @@ class QueueStore:
 
     def add_disc(self, request: DiscRequest, settings: AppSettings,
                  group_id: str = "", group_title: str = "",
-                 then: Optional[JobRequest] = None) -> QueueEntry:
+                 then: Optional[JobRequest] = None,
+                 then_encode: Optional[EncodeRequest] = None) -> QueueEntry:
         with self.lock:
             if sum(1 for e in self.entries if e.status == "queued") >= MAX_QUEUED:
                 raise ValueError(f"列队已满（最多 {MAX_QUEUED} 条等待中的任务）")
@@ -355,6 +405,31 @@ class QueueStore:
                 group_id=group_id,
                 group_title=group_title,
                 then=then,
+                then_encode=then_encode,
+            )
+            self.entries.append(entry)
+            self.save()
+            return entry
+
+    def add_encode(self, request: EncodeRequest, settings: AppSettings,
+                   group_id: str = "", group_title: str = "",
+                   then: Optional[JobRequest] = None,
+                   origin: str = "", origin_kind: str = "") -> QueueEntry:
+        with self.lock:
+            if sum(1 for e in self.entries if e.status == "queued") >= MAX_QUEUED:
+                raise ValueError(f"列队已满（最多 {MAX_QUEUED} 条等待中的任务）")
+            entry = QueueEntry(
+                id=uuid.uuid4().hex[:12],
+                kind="encode",
+                title=request.source,
+                created_at=time.time(),
+                encode=request,
+                settings=settings,
+                group_id=group_id,
+                group_title=group_title,
+                then=then,
+                origin=origin,
+                origin_kind=origin_kind,
             )
             self.entries.append(entry)
             self.save()
@@ -485,7 +560,7 @@ class QueueManager:
             entry = self.store.next_queued()
             payload = None
             if entry is not None:
-                payload = entry.disc if entry.kind == "disc" else entry.request
+                payload = _payload(entry)
             if entry is None or payload is None:
                 if entry is not None:            # unreadable request
                     entry.status = "failed"
@@ -511,6 +586,8 @@ class QueueManager:
         try:
             if kind == "disc":
                 job = job_manager.create_disc(payload, settings=settings)
+            elif kind == "encode":
+                job = job_manager.create_encode(payload, settings=settings)
             else:
                 job = job_manager.create(payload, settings=settings)
         except Exception as exc:  # noqa: BLE001 — one bad file must not stop the queue
@@ -529,10 +606,65 @@ class QueueManager:
                 self.store.save()
         self._current = entry_id
 
-    def _queue_subtitles(self, entry: QueueEntry) -> None:
-        """加入列队并做字幕: queue a translation of every MKV *entry* wrote,
-        at the end of the queue, with the request frozen when its button
-        was pressed (entry.then) and the same settings snapshot.
+    def _queue_encodes(self, entry: QueueEntry) -> None:
+        """加入列队并压制、做字幕: queue an encode of every MKV *entry* wrote,
+        right behind it — so a batch encodes each disc before remuxing the
+        next, and only one disc's lossless files take up space at a time.
+        Each gets the request frozen when the button was pressed
+        (entry.then_encode, source filled in) and entry.then, so the encode
+        queues its own subtitles when it is done.
+
+        Idempotent for the reasons _queue_subtitles is, plus one: a file
+        that already carries our encode tag is an encode already (a retried
+        disc lists titles whose lossless file was swapped for it).
+        Caller holds store.lock and saves."""
+        from app.services import encode
+
+        try:
+            template = entry.then_encode
+            taken = {e.encode.source for e in self.store.entries
+                     if e.kind == "encode" and e.encode is not None
+                     and e.status in ("queued", "running", "done")}
+            wanted, skipped = [], 0
+            for name in entry.result_files:
+                path = Path(name)
+                if name in taken or not path.is_file() \
+                        or encode.read_tags(path)["encode"] is not None:
+                    skipped += 1
+                    continue
+                wanted.append(name)
+            room = MAX_QUEUED - sum(1 for e in self.store.entries if e.status == "queued")
+            left_out = wanted[max(room, 0):]
+            now = time.time()
+            added = [QueueEntry(
+                id=uuid.uuid4().hex[:12],
+                kind="encode",
+                title=name,
+                created_at=now,
+                encode=template.model_copy(update={"source": name}),
+                settings=entry.settings,
+                group_id=entry.group_id or entry.id,
+                group_title=entry.group_title or entry.title,
+                then=entry.then,
+                origin=entry.id,
+                origin_kind="disc",
+            ) for name in wanted[:max(room, 0)]]
+            at = self.store.entries.index(entry) + 1
+            self.store.entries[at:at] = added
+            note = f"已自动加入 {len(added)} 条压制任务（紧跟在这张盘后面）"
+            if skipped:
+                note += f"，{skipped} 个已压制过或已在列队里，跳过"
+            if left_out:
+                note += f"；列队已满，另有 {len(left_out)} 个没有加入"
+            entry.note = note
+        except Exception as exc:  # noqa: BLE001 — the queue must go on
+            entry.note = f"自动加入压制任务失败：{exc}"
+
+    def _queue_subtitles(self, entry: QueueEntry,
+                         files: Optional[List[str]] = None) -> None:
+        """加入列队并做字幕: queue a translation of every MKV *entry* wrote
+        (or *files*), at the end of the queue, with the request frozen when
+        its button was pressed (entry.then) and the same settings snapshot.
 
         A failed remux still hands over what it did write — one broken
         title must not cost the others their subtitles, the same rule the
@@ -551,7 +683,7 @@ class QueueManager:
                      if e.kind == "job" and e.request is not None
                      and e.status in ("queued", "running", "done")}
             wanted, skipped = [], 0
-            for name in entry.result_files:
+            for name in (entry.result_files if files is None else files):
                 path = Path(name)
                 if name in taken or not path.is_file() or subtitle_state(
                         path.parent, path.stem,
@@ -572,15 +704,17 @@ class QueueManager:
                     group_id=entry.group_id or entry.id,
                     group_title=entry.group_title or entry.title,
                     origin=entry.id,
+                    origin_kind=entry.kind,
                 ))
             note = f"已自动加入 {len(wanted) - len(left_out)} 条字幕任务（排在列队最后）"
             if skipped:
                 note += f"，{skipped} 个已有字幕或已在列队里，跳过"
             if left_out:
                 note += f"；列队已满，另有 {len(left_out)} 个没有加入"
-            entry.note = note
         except Exception as exc:  # noqa: BLE001 — the queue must go on
-            entry.note = f"自动加入字幕任务失败：{exc}"
+            note = f"自动加入字幕任务失败：{exc}"
+        # an encode's note already says what it made; this goes after it
+        entry.note = f"{entry.note}；{note}" if entry.note else note
 
     def _poll_current(self) -> None:
         from app.services.pipeline import manager as job_manager
@@ -610,9 +744,11 @@ class QueueManager:
             entry.result_in_place = bool(job.status.srt_in_place)
             entry.result_files = list(job.status.outputs)
             entry.finished_at = time.time()
-            if entry.kind == "disc" and entry.then is not None \
-                    and entry.status in ("done", "failed") and entry.result_files:
-                self._queue_subtitles(entry)
+            if entry.kind == "encode" and entry.status == "done":
+                # 已压制：片名.mkv（3.2 GB，原 21 GB 的 15%…）— the one line
+                # worth keeping once the job has left memory
+                entry.note = job.status.message or ""
+            self._follow_up(entry)
             # one write for the entry's end and the entries it queued: two
             # writes, and a crash between them would lose the follow-ups for
             # good — a finished entry is never polled again
@@ -625,6 +761,34 @@ class QueueManager:
             prune_checkpoints()
         except OSError:
             pass          # housekeeping must never stop the queue
+
+    def _follow_up(self, entry: QueueEntry) -> None:
+        """Queue what a finished entry was told to lead to. Caller holds
+        store.lock and saves — in the same write as the entry's end.
+
+        A disc hands every MKV it wrote on, done or failed (a broken title
+        must not cost the others): to an encode first when there is one
+        (then_encode), else straight to subtitles. An encode hands on its
+        result once done; one that replaces a lossless file hands on that
+        name even when it failed — the lossless file is still there under
+        it, and gets its subtitles like any other. Cancelled leads nowhere.
+        """
+        if entry.status not in ("done", "failed"):
+            return
+        if entry.kind == "disc" and entry.result_files:
+            if entry.then_encode is not None:
+                self._queue_encodes(entry)
+            elif entry.then is not None:
+                self._queue_subtitles(entry)
+        elif entry.kind == "encode" and entry.then is not None:
+            if entry.status == "done":
+                files = entry.result_files
+            elif entry.encode is not None and entry.encode.replace_source:
+                files = [entry.encode.source]
+            else:
+                files = []
+            if files:
+                self._queue_subtitles(entry, files)
 
     # -- commands --------------------------------------------------------
 
@@ -660,7 +824,7 @@ class QueueManager:
                 raise KeyError(entry_id)
             if entry.status not in TERMINAL:
                 raise ValueError("这条任务还没有结束")
-            payload = entry.disc if entry.kind == "disc" else entry.request
+            payload = _payload(entry)
             if payload is None:
                 raise ValueError("这条任务的参数无法读取，无法重试")
             # Retry means "run that same thing again", so the snapshot is
@@ -673,10 +837,22 @@ class QueueManager:
                 # last time are skipped, not written again as 片名.2.mkv
                 # …and the same follow-up: _queue_subtitles skips the MKVs
                 # whose translation is already queued or done
+                # …and a remux → encode → subtitles chain keeps both steps;
+                # the titles already handed on are recognised by their tags
                 new = self.store.add_disc(payload, settings,
                                           group_id=entry.group_id,
                                           group_title=entry.group_title,
-                                          then=entry.then)
+                                          then=entry.then,
+                                          then_encode=entry.then_encode)
+            elif entry.kind == "encode":
+                # a finished encode finds its own file and does nothing
+                # (encode.existing_encode); a failed one runs again
+                new = self.store.add_encode(payload, settings,
+                                            group_id=entry.group_id,
+                                            group_title=entry.group_title,
+                                            then=entry.then,
+                                            origin=entry.origin,
+                                            origin_kind=entry.origin_kind)
             else:
                 new = self.store.add(payload, settings,
                                      group_id=entry.group_id,

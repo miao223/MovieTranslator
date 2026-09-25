@@ -34,6 +34,14 @@ def test_browse_lists_both_kinds_and_says_which_is_which(client, folder):
     }  # .txt is not media, the dot-file is hidden
 
 
+def test_the_encode_page_is_shown_videos_only(client, folder):
+    """压制 has nothing to do with an audio or subtitle file."""
+    (folder / "film.en.srt").write_text("x", encoding="utf-8")
+    r = client.get("/api/fs/browse", params={"path": str(folder), "mode": "video"}).json()
+    assert r["dirs"] == ["season"]
+    assert [f["name"] for f in r["files"]] == ["film.mkv"]
+
+
 def test_resolve_tells_the_page_what_it_was_handed(client, folder):
     def resolve(name):
         return client.get(

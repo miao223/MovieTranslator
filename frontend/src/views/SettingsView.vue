@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 import { THEMES, applyTheme, loadTheme } from '../theme'
+import EncodeFields from '../components/EncodeFields.vue'
 
 const theme = ref(loadTheme())
 
@@ -931,6 +932,19 @@ async function testVision() {
           列在「原盘」页的折叠区里并写明原因。</p>
         <p>· 多卷合集（同一个文件夹里的 <code>XXX_VOL01</code>、<code>XXX_VOL02</code>……）会被认成一套：
           共用片名，集号和花絮编号接着前一卷编。单独选第二卷时也一样。</p>
+      </div>
+    </el-card>
+
+    <el-card v-if="settings.encode" shadow="never" class="section">
+      <template #header>🎞️ 视频压制（默认参数）</template>
+      <EncodeFields v-model="settings.encode" />
+      <div class="model-notes">
+        <p><strong>📌 说明</strong></p>
+        <p>· 「压制」页和「原盘」页「加入列队并压制、做字幕」打开时从这里的参数出发，每次加入列队前仍可改；
+          改这里不影响已经在列队里的任务。</p>
+        <p>· 只会列出本机真正能用的编码器：显卡编码（NVENC / QSV / AMF）要有对应的显卡和驱动。
+          显卡编码快得多，同样体积下画质略逊于 CPU。</p>
+        <p>· 压制很慢而且占满 CPU / 显卡：列队同一时间只跑一个任务，压制期间别的任务都在排队。</p>
       </div>
     </el-card>
 

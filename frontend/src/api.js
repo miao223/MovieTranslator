@@ -100,6 +100,17 @@ export const api = {
   enqueueDiscBatch: (payload) =>
     request('/api/queue/disc-batch', { method: 'POST', body: JSON.stringify(payload) }),
 
+  // ------------------------------------------------------------- 压制
+  // one file: its streams, plus a few decoded frames' worth of detail
+  encodeProbe: (path) => request(`/api/encode/probe?path=${encodeURIComponent(path)}`),
+  // a folder: every video in it (headers only), never the insides of a disc
+  encodeScan: (payload) =>
+    request('/api/encode/scan', { method: 'POST', body: JSON.stringify(payload) }),
+  enqueueEncode: (payload) =>
+    request('/api/queue/encode', { method: 'POST', body: JSON.stringify(payload) }),
+  enqueueEncodeBatch: (payload) =>
+    request('/api/queue/encode-batch', { method: 'POST', body: JSON.stringify(payload) }),
+
   // ------------------------------------------------------------- 列队
   queue: () => request('/api/queue'),
   enqueueJob: (payload) =>

@@ -1,8 +1,9 @@
 <script setup>
-// The server-side file picker, shared by 翻译任务 and 原盘.
+// The server-side file picker, shared by 翻译任务, 原盘 and 压制.
 //
 // mode decides what a click picks:
 //   'file' — a video / audio / subtitle file
+//   'video' — a video file (压制: audio and subtitles have nothing to re-encode)
 //   'dir'  — a folder, through the footer button
 //   'disc' — a disc: a folder holding BDMV / VIDEO_TS (clicked directly, or
 //            the footer button once inside one), or an .iso image
@@ -23,12 +24,14 @@ const emit = defineEmits(['update:modelValue', 'pick'])
 
 const TITLES = {
   file: '选择视频 / 音频 / 字幕文件',
+  video: '选择视频文件',
   dir: '选择目录',
   disc: '选择原盘（BDMV / VIDEO_TS 文件夹，或 .iso 镜像）',
   discs: '选择文件夹（里面的原盘会全部列出来）',
 }
 const EMPTY = {
   file: '此目录没有子目录或视频 / 音频文件',
+  video: '此目录没有子目录或视频文件',
   dir: '此目录没有子目录',
   disc: '此目录没有子目录或 .iso 镜像',
   discs: '此目录没有子目录或 .iso 镜像',
@@ -42,7 +45,7 @@ const quickAccess = ref([])
 
 async function open(path = '') {
   try {
-    const data = await api.browse(path, discListing() ? 'disc' : '')
+    const data = await api.browse(path, discListing() ? 'disc' : props.mode === 'video' ? 'video' : '')
     Object.assign(browser, { disc_dirs: [], is_disc: false }, data)
     addressInput.value = data.path
     emit('update:modelValue', true)
@@ -109,6 +112,10 @@ async function jumpToAddress() {
     } else if (r.type === 'file' && r.is_media && props.mode === 'file') {
       choose(r.path)
       ElMessage.success('已选择: ' + r.path)
+    } else if (r.type === 'file' && props.mode === 'video' && r.is_media && !r.is_audio
+               && !r.is_subtitle) {
+      choose(r.path)
+      ElMessage.success('已选择: ' + r.path)
     } else if (r.type === 'file' && pickingFolder()) {
       ElMessage.warning('当前在选择目录，请粘贴文件夹路径或点「选择此目录」')
     } else if (r.type === 'file') {
@@ -141,7 +148,8 @@ const fileIcon = (f) => ({ audio: '🎵', subtitle: '💬', disc: '💿' }[f.kin
         :placeholder="mode === 'disc'
           ? '粘贴原盘文件夹或 .iso 的完整路径，回车跳转'
           : pickingFolder() ? '粘贴文件夹的完整路径，回车跳转'
-            : '粘贴文件夹或视频 / 音频文件的完整路径，回车跳转'"
+            : mode === 'video' ? '粘贴文件夹或视频文件的完整路径，回车跳转'
+              : '粘贴文件夹或视频 / 音频文件的完整路径，回车跳转'"
         @keyup.enter="jumpToAddress"
       >
         <template #append>

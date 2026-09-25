@@ -25,7 +25,9 @@ class FakeJob:
     """Stands in for pipeline.Job: an id, a status, nothing running."""
 
     def __init__(self, request, settings=None):
-        source = getattr(request, "video_path", None) or request.path   # a DiscRequest has .path
+        # a DiscRequest has .path, an EncodeRequest .source
+        source = (getattr(request, "video_path", None) or getattr(request, "source", None)
+                  or request.path)
         self.id = f"job-{source}"
         self.request = request
         self.settings = settings
@@ -55,6 +57,8 @@ class FakeManager:
         self.created.append(job)
         return job
 
+    create_encode = create_disc
+
     def get(self, job_id):
         return self.jobs[job_id]
 
@@ -62,11 +66,12 @@ class FakeManager:
         self.jobs[job_id].cancelled = True
         self.jobs[job_id].status.stage = "cancelled"
 
-    def finish(self, index=-1, stage="done", srt="out.srt", outputs=()):
+    def finish(self, index=-1, stage="done", srt="out.srt", outputs=(), message=""):
         job = self.created[index]
         job.status.stage = stage
         job.status.srt_filename = srt
         job.status.outputs = [str(o) for o in outputs]
+        job.status.message = message
 
 
 @pytest.fixture
@@ -854,6 +859,186 @@ def test_a_disc_without_the_follow_up_queues_nothing(runner, tmp_path):
     manager.step()
     assert len(manager.store.entries) == 1 and disc.then is None and not disc.note
     assert "完成后做字幕" not in jobqueue.describe_entry(disc)
+
+
+# ------------------------------------- 原盘：加入列队并压制、做字幕
+
+
+def _disc_with_encode(manager, tmp_path, name="Film", replace=True, subtitles=True):
+    """A disc entry queued with 加入列队并压制、做字幕."""
+    from app.models.schemas import DiscRequest, EncodeOptions, EncodeRequest
+
+    then = (JobRequest(video_path="", series_id="disc-abc", subtitle_fallback_asr=True,
+                       target_language="English") if subtitles else None)
+    template = EncodeRequest(source="", options=EncodeOptions(), replace_source=replace)
+    return manager.store.add_disc(DiscRequest(path=str(tmp_path / name)),
+                                  jobqueue.snapshot(), then=then, then_encode=template)
+
+
+def test_a_finished_disc_queues_its_encodes_right_behind_it(runner, tmp_path):
+    """The user's choice: each disc's MKVs are encoded before the next disc
+    is remuxed, so only one disc's lossless files take up space at a time."""
+    manager, fake = runner
+    film, extra = _mkvs(tmp_path, "Film.mkv", "Film.花絮01.mkv")
+    disc = _disc_with_encode(manager, tmp_path)
+    other = manager.store.add(req("/other.mkv"), jobqueue.snapshot())
+    manager.step()
+    fake.finish(outputs=[film, extra])
+    manager.step()
+    entries = manager.store.entries
+    assert [e.id for e in entries][0] == disc.id and entries[-1].id == other.id
+    encodes = entries[1:3]
+    assert [e.encode.source for e in encodes] == [str(film), str(extra)]
+    for e in encodes:
+        assert (e.kind, e.status, e.origin, e.origin_kind) == ("encode", "queued", disc.id, "disc")
+        assert e.encode.replace_source and e.then == disc.then
+        assert jobqueue.settings_hash(e.settings) == jobqueue.settings_hash(disc.settings)
+    assert disc.note == "已自动加入 2 条压制任务（紧跟在这张盘后面）"
+    assert jobqueue.describe_entry(disc).endswith(
+        "完成后压制：H.265 10bit（x265） · CRF 22 · medium · 无损音轨→E-AC-3 · 删除无损版"
+        " · 再做字幕：auto → English · 双语 · 语音识别")
+    assert jobqueue.describe_entry(encodes[0]) == (
+        "压制 · H.265 10bit（x265） · CRF 22 · medium · 无损音轨→E-AC-3 · 完成后替换无损版"
+        " · 完成后做字幕：auto → English · 双语 · 语音识别 · 原盘封装后自动加入")
+    # the next thing to run is the first encode, not the other entry
+    manager.step()
+    assert fake.created[-1].request.source == str(film)
+    again = QueueStore()
+    again.load()
+    assert again.get(disc.id).then_encode.replace_source
+    assert again.get(encodes[0].id).encode.source == str(film)
+    assert again.get(encodes[0].id).origin_kind == "disc"
+
+
+def test_a_finished_encode_queues_its_subtitles_at_the_end(runner, tmp_path):
+    manager, fake = runner
+    (film,) = _mkvs(tmp_path, "Film.mkv")
+    disc = _disc_with_encode(manager, tmp_path)
+    other = manager.store.add(req("/other.mkv"), jobqueue.snapshot())
+    manager.step()
+    fake.finish(outputs=[film])
+    manager.step()
+    manager.step()                                    # the encode starts
+    encoding = manager.store.entries[1]
+    assert encoding.kind == "encode" and encoding.status == "running"
+    fake.finish(outputs=[film], message="已压制：Film.mkv（1.00 GB，原 8.00 GB 的 12%）")
+    manager.step()
+    last = manager.store.entries[-1]
+    assert manager.store.entries[-2].id == other.id
+    assert (last.kind, last.request.video_path, last.origin, last.origin_kind) == \
+        ("job", str(film), encoding.id, "encode")
+    assert last.request.series_id == "disc-abc"
+    assert encoding.note.startswith("已压制：Film.mkv")
+    assert "已自动加入 1 条字幕任务" in encoding.note
+    assert jobqueue.describe_entry(last).endswith("压制后自动加入")
+    assert disc.status == "done"
+
+
+def test_a_failed_encode_that_was_to_replace_still_gets_the_lossless_file_subtitled(
+        runner, tmp_path):
+    """The lossless file stays under the name the encode would have taken,
+    so its subtitles fit whichever file ends up there."""
+    manager, fake = runner
+    (film,) = _mkvs(tmp_path, "Film.mkv")
+    _disc_with_encode(manager, tmp_path)
+    manager.step()
+    fake.finish(outputs=[film])
+    manager.step()
+    manager.step()
+    fake.finish(stage="failed")
+    manager.step()
+    subtitles = [e for e in manager.store.entries if e.kind == "job"]
+    assert [e.request.video_path for e in subtitles] == [str(film)]
+
+
+def test_a_failed_encode_that_keeps_its_source_hands_on_nothing(runner, tmp_path):
+    manager, fake = runner
+    (film,) = _mkvs(tmp_path, "Film.mkv")
+    _disc_with_encode(manager, tmp_path, replace=False)
+    manager.step()
+    fake.finish(outputs=[film])
+    manager.step()
+    manager.step()
+    fake.finish(stage="failed")
+    manager.step()
+    assert not [e for e in manager.store.entries if e.kind == "job"]
+
+
+def test_a_cancelled_disc_queues_no_encodes(runner, tmp_path):
+    manager, fake = runner
+    (film,) = _mkvs(tmp_path, "Film.mkv")
+    disc = _disc_with_encode(manager, tmp_path)
+    manager.step()
+    fake.finish(stage="cancelled", outputs=[film])
+    manager.step()
+    assert len(manager.store.entries) == 1 and not disc.note
+
+
+def test_encodes_are_not_queued_twice_nor_for_an_encode(runner, tmp_path, monkeypatch):
+    """A retried disc lists the titles it skipped again — including the ones
+    whose lossless file is an encode by now, which its tag says."""
+    from app.services import encode
+
+    manager, fake = runner
+    first, second, third = _mkvs(tmp_path, "S.E01.mkv", "S.E02.mkv", "S.E03.mkv")
+    monkeypatch.setattr(encode, "read_tags", lambda p: {
+        "encode": {"source": "x"} if str(p) == str(third) else None, "remux": None})
+    disc = _disc_with_encode(manager, tmp_path)
+    manager.step()
+    fake.finish(stage="failed", outputs=[first])
+    manager.step()
+    retried = manager.retry(disc.id)
+    assert retried.then_encode == disc.then_encode and retried.then == disc.then
+    manager.step()                                    # E01's encode runs first
+    fake.finish(outputs=[first])
+    manager.step()
+    while manager.store.get(retried.id).status == "queued":
+        manager.step()
+    fake.finish(outputs=[first, second, third])
+    manager.step()
+    sources = [e.encode.source for e in manager.store.entries if e.kind == "encode"]
+    assert sources == [str(first), str(second)]
+    assert "2 个已压制过或已在列队里，跳过" in manager.store.get(retried.id).note
+
+
+def test_a_retried_encode_keeps_its_follow_up_and_where_it_came_from(runner, tmp_path):
+    manager, fake = runner
+    (film,) = _mkvs(tmp_path, "Film.mkv")
+    _disc_with_encode(manager, tmp_path)
+    manager.step()
+    fake.finish(outputs=[film])
+    manager.step()
+    manager.step()
+    fake.finish(stage="failed")
+    manager.step()
+    failed = next(e for e in manager.store.entries if e.kind == "encode")
+    again = manager.retry(failed.id)
+    assert (again.kind, again.encode, again.then) == ("encode", failed.encode, failed.then)
+    assert (again.origin, again.origin_kind) == (failed.origin, "disc")
+
+
+def test_the_encode_defaults_do_not_make_a_new_generation_of_settings(settings_file):
+    before = AppSettings()
+    after = AppSettings(encode={"video_codec": "libx264", "quality": 18})
+    assert jobqueue.settings_hash(before) == jobqueue.settings_hash(after)
+
+
+def test_an_entry_from_before_encodes_existed_still_loads(settings_file, tmp_path):
+    settings_file()
+    raw = {"version": 1, "paused": False, "entries": [{
+        "id": "old1", "kind": "disc", "status": "done", "title": "/d/Film",
+        "disc": {"path": "/d/Film"}, "then": {"video_path": "", "target_language": "English"},
+    }, {
+        "id": "old2", "kind": "job", "status": "queued", "title": "/d/Film.mkv",
+        "request": {"video_path": "/d/Film.mkv", "target_language": "English"},
+        "origin": "old1",
+    }]}
+    jobqueue.queue_path().write_text(json.dumps(raw), encoding="utf-8")
+    store = QueueStore()
+    store.load()
+    disc, job = store.get("old1"), store.get("old2")
+    assert disc.then_encode is None and disc.then.target_language == "English"
+    assert jobqueue.describe_entry(job).endswith("原盘封装后自动加入")
 
 
 # ------------------------------------------------------- the three gaps

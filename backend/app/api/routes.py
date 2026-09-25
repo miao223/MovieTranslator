@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.core import config, joblog, server
 from app.core.cache import job_dir
 from app.core.auth import MCP_PREFIX
-from app.core.media import SOURCE_EXTS, kind_of, scan_media
+from app.core.media import SOURCE_EXTS, disc_root_of, kind_of, scan_media
 from app.models.schemas import (
     AppSettings,
     AudioTrack,
@@ -33,6 +33,11 @@ from app.models.schemas import (
     DiscRequest,
     DiscSkipped,
     DiscSubtitles,
+    EncodeBatchRequest,
+    EncodeEnqueueRequest,
+    EncodeOptions,
+    EncodeRequest,
+    EncodeScanRequest,
     JobRequest,
     JobStatus,
     LLMSettings,
@@ -40,7 +45,7 @@ from app.models.schemas import (
     QueueView,
     SubtitleTrack,
 )
-from app.services import audio, jobqueue, mcp_server, mux, series, subsource
+from app.services import audio, encode, jobqueue, mcp_server, mux, series, subsource
 from app.services.jobqueue import queue_manager
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
@@ -746,7 +751,18 @@ def media_encoders() -> dict:
             {"id": "libopus", "label": "Opus"},
         ],
         "presets": ["ultrafast", "fast", "medium", "slow", "veryslow"],
+        # for the 压制 form (encode.capabilities): 10-bit, tunings, and
+        # each encoder's own quality scale. Only added keys — the 翻译任务
+        # page reads the ones above and nothing else.
+        "capabilities": encode.capabilities(),
+        "deinterlace": "bwdif" in av_filters(),
     }
+
+
+def av_filters() -> set:
+    import av
+
+    return set(getattr(av.filter, "filters_available", ()) or ())
 
 
 @router.get("/media/audio-tracks", response_model=list[AudioTrack])
@@ -912,6 +928,9 @@ def fs_browse(path: str = "", mode: str = ""):
         raise HTTPException(status_code=400, detail=f"不是有效目录: {path}")
 
     disc_mode = mode == "disc"
+    # the 压制 page picks videos only: audio and subtitle files have nothing
+    # to re-encode
+    video_mode = mode == "video"
     dirs, files, disc_dirs = [], [], []
     try:
         for entry in sorted(p.iterdir(), key=lambda e: e.name.lower()):
@@ -926,7 +945,8 @@ def fs_browse(path: str = "", mode: str = ""):
                     if entry.suffix.lower() == ".iso":
                         files.append({"name": entry.name, "size": entry.stat().st_size,
                                       "kind": "disc"})
-                elif entry.suffix.lower() in SOURCE_EXTS:
+                elif entry.suffix.lower() in SOURCE_EXTS and (
+                        not video_mode or kind_of(entry) == "video"):
                     files.append({
                         "name": entry.name,
                         "size": entry.stat().st_size,
@@ -1193,12 +1213,15 @@ def enqueue_disc(req: DiscEnqueueRequest) -> dict:
     from app.services.disc.plan import Answer
 
     settings = jobqueue.snapshot()
+    then_encode = (_encode_template(req.encode, req.subtitles)
+                   if req.encode is not None else None)
     frozen, then = _freeze_discs(
         [(req.path, Answer(req.series, req.name, req.episode_start), req.titles)],
         req.output_mode, req.output_dir, settings, named=False,
         subtitles=req.subtitles)[0]
     try:
-        entry = queue_manager.store.add_disc(frozen, settings, then=then)
+        entry = queue_manager.store.add_disc(frozen, settings, then=then,
+                                             then_encode=then_encode)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     queue_manager.nudge()
@@ -1217,6 +1240,8 @@ def enqueue_disc_batch(req: DiscBatchRequest) -> dict:
     if not wanted:
         raise HTTPException(status_code=400, detail="没有勾选任何光盘")
     settings = jobqueue.snapshot()
+    then_encode = (_encode_template(req.encode, req.subtitles)
+                   if req.encode is not None else None)
     frozen = _freeze_discs(
         [(a.path, _disc_answer(a), a.titles) for a in wanted],
         req.output_mode, req.output_dir, settings, named=True,
@@ -1227,7 +1252,8 @@ def enqueue_disc_batch(req: DiscBatchRequest) -> dict:
     try:
         for request, then in frozen:
             added.append(queue_manager.store.add_disc(
-                request, settings, group_id=group_id, group_title=req.path, then=then))
+                request, settings, group_id=group_id, group_title=req.path, then=then,
+                then_encode=then_encode))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     queue_manager.nudge()
@@ -1236,6 +1262,245 @@ def enqueue_disc_batch(req: DiscBatchRequest) -> dict:
     position = next((i + 1 for i, e in enumerate(waiting) if e.id == added[0].id), 0)
     return {"entries": [_entry_view(e, current) for e in added],
             "count": len(added), "position": position}
+
+
+# ------------------------------------------------------------------ encode
+
+
+# a batch this large is almost certainly the wrong folder (a whole library),
+# and every file is opened to be listed
+MAX_ENCODE_FILES = 500
+
+
+def _encode_template(choice, subtitles: Optional[DiscSubtitles]) -> EncodeRequest:
+    """The encode every MKV of a disc gets once remuxed (QueueEntry.then_encode),
+    source filled in per file. It replaces the lossless MKV unless the
+    dialog said to keep it."""
+    if choice.options.container != "mkv":
+        raise HTTPException(status_code=400, detail=(
+            "全流程只能压成 MKV：MP4 装不下光盘的图形字幕，也就换不下那份无损 MKV"))
+    _check_encode(choice.options, subtitles)
+    return EncodeRequest(source="", options=choice.options, output_mode="beside",
+                         replace_source=not choice.keep_lossless)
+
+
+def _check_encode(options: EncodeOptions, subtitles: Optional[DiscSubtitles]) -> None:
+    """Refuse now what would fail in an hour: an encoder this machine lacks,
+    and a subtitle step whose track the encode throws away."""
+    try:
+        encode.check_options(options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if subtitles is None:
+        return
+    if not subtitles.target_language.strip():
+        raise HTTPException(status_code=400, detail="做字幕的目标语言是空的")
+    if subtitles.text_source == "subtitle":
+        if options.subtitles == "none" or options.container == "mp4":
+            raise HTTPException(status_code=400, detail=(
+                "做字幕要读片源里的字幕轨，可压制的设置不保留字幕轨"
+                + ("（MP4 装不下字幕轨）" if options.container == "mp4" else "")))
+        wanted = subtitles.subtitle_language
+        kept = [audio.canon_language(x) for x in options.subtitle_languages]
+        if options.subtitles == "languages" and wanted \
+                and audio.canon_language(wanted) not in kept:
+            raise HTTPException(status_code=400, detail=(
+                f"做字幕要读 {audio.language_name(wanted)} 字幕轨，"
+                f"可压制只保留 {'、'.join(options.subtitle_languages) or '（无）'} 的字幕轨"))
+    wanted = subtitles.audio_language
+    kept = [audio.canon_language(x) for x in options.audio_languages]
+    if kept and wanted and audio.canon_language(wanted) not in kept:
+        raise HTTPException(status_code=400, detail=(
+            f"做字幕要用 {audio.language_name(wanted)} 音轨，"
+            f"可压制只保留 {'、'.join(options.audio_languages)} 的音轨"))
+
+
+def _subtitles_after_encode(subtitles: DiscSubtitles, series_id: str) -> JobRequest:
+    """The translation an encode queues for its output (QueueEntry.then) —
+    built like the disc's (_subtitle_template), with the batch's own table
+    when the page asked for one."""
+    return JobRequest(
+        video_path="",
+        text_source=subtitles.text_source,
+        audio_language=subtitles.audio_language,
+        subtitle_language=subtitles.subtitle_language,
+        subtitle_fallback_asr=True,
+        source_language=subtitles.source_language,
+        target_language=subtitles.target_language.strip(),
+        output_mode=subtitles.output_mode,
+        embed_subtitle=subtitles.embed_subtitle,
+        series_id=series_id,
+    )
+
+
+def _clean_path(raw: str) -> Path:
+    return Path(raw.strip().strip('"').strip("'")).expanduser()
+
+
+def _custom_dir(output_mode: str, output_dir: str) -> Optional[Path]:
+    if output_mode != "custom":
+        return None
+    if not output_dir.strip():
+        raise HTTPException(status_code=400, detail="选了「指定的文件夹」，但还没有选是哪个文件夹")
+    return _clean_path(output_dir)
+
+
+def _same_folder(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
+def _video_files(folder: Path, recursive: bool) -> tuple[list, list]:
+    """(videos, disc roots) under *folder*: never inside a disc, whose
+    m2ts / VOB files are pieces, not films (the 原盘 page is for those)."""
+    videos, discs = [], set()
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        if not recursive:
+            dirs[:] = []
+        for name in sorted(names):
+            path = Path(root) / name
+            if name.startswith(".") or name.endswith(".part"):
+                continue
+            disc = disc_root_of(path)
+            if disc is not None:
+                discs.add(str(disc))
+                continue
+            if kind_of(path) == "video":
+                videos.append(path)
+    return videos, sorted(discs)
+
+
+@router.get("/encode/probe")
+def encode_probe(path: str) -> dict:
+    """One file for the 压制 page: its streams, plus what only decoded
+    frames tell — interlacing, HDR metadata."""
+    source = _clean_path(path)
+    if not source.is_file():
+        raise HTTPException(status_code=400, detail=f"文件不存在：{source}")
+    try:
+        info = encode.probe(source, sample_frames=60)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"读不出这个文件：{exc}") from exc
+    if info["video"] is None:
+        raise HTTPException(status_code=400, detail="这个文件里没有画面，没有可压制的视频")
+    return info
+
+
+@router.post("/encode/scan")
+def encode_scan(req: EncodeScanRequest) -> dict:
+    """The 压制 page's batch mode: every video in a folder, headers only."""
+    folder = _clean_path(req.path)
+    if not folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"不是有效目录：{folder}")
+    found, discs = _video_files(folder, req.recursive)
+    if len(found) > MAX_ENCODE_FILES:
+        raise HTTPException(status_code=400, detail=(
+            f"这个文件夹里有 {len(found)} 个视频，一次最多 {MAX_ENCODE_FILES} 个，"
+            f"请选一个小一点的文件夹"))
+    files, skipped = [], []
+    for path in found:
+        try:
+            info = encode.probe(path)
+        except Exception as exc:  # noqa: BLE001
+            skipped.append({"path": str(path), "reason": f"读不出来：{exc}"})
+            continue
+        if info["video"] is None:
+            skipped.append({"path": str(path), "reason": "没有画面"})
+            continue
+        info["relative"] = str(path.relative_to(folder))
+        files.append(info)
+    return {"path": str(folder), "files": files, "skipped": skipped, "discs": discs}
+
+
+def _enqueued(entries: list, settings) -> dict:
+    queue_manager.nudge()
+    current = jobqueue.settings_hash(settings)
+    waiting = [e for e in queue_manager.store.entries if e.status == "queued"]
+    position = next((i + 1 for i, e in enumerate(waiting) if e.id == entries[0].id), 0)
+    return {"entries": [_entry_view(e, current) for e in entries],
+            "entry": _entry_view(entries[0], current),
+            "count": len(entries), "position": position}
+
+
+@router.post("/queue/encode")
+def enqueue_encode(req: EncodeEnqueueRequest) -> dict:
+    """Add one video's encode to the queue — 加入列队, or with `subtitles`
+    加入列队并做字幕: the encode is translated once it is written."""
+    source = _clean_path(req.source)
+    if not source.is_file():
+        raise HTTPException(status_code=400, detail=f"文件不存在：{source}")
+    _check_encode(req.options, req.subtitles)
+    if not audio.has_picture(source):
+        raise HTTPException(status_code=400, detail="这个文件里没有画面，没有可压制的视频")
+    custom = _custom_dir(req.output_mode, req.output_dir)
+    if custom is not None and _same_folder(custom, source.parent):
+        raise HTTPException(status_code=400, detail=(
+            "指定的文件夹就是原文件所在的文件夹：请改选「放在原文件旁边」"))
+    request = EncodeRequest(source=str(source), options=req.options,
+                            output_mode=req.output_mode,
+                            output_dir=str(custom) if custom is not None else "")
+    then = _subtitles_after_encode(req.subtitles, "") if req.subtitles else None
+    settings = jobqueue.snapshot()
+    try:
+        entry = queue_manager.store.add_encode(request, settings, then=then)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _enqueued([entry], settings)
+
+
+@router.post("/queue/encode-batch")
+def enqueue_encode_batch(req: EncodeBatchRequest) -> dict:
+    """The batch mode's 加入列队: one entry per file, one group, one
+    settings snapshot. Everything is checked first — a batch is never half
+    queued. With a folder chosen, each file keeps its sub-folder under it,
+    so two 01.mkv from two seasons do not end up as 01.mkv and 01.2.mkv."""
+    folder = _clean_path(req.path)
+    files = list(dict.fromkeys(req.files))
+    if not files:
+        raise HTTPException(status_code=400, detail="没有勾选任何文件")
+    _check_encode(req.options, req.subtitles)
+    custom = _custom_dir(req.output_mode, req.output_dir)
+    requests, problems = [], []
+    for name in files:
+        source = _clean_path(name)
+        if not source.is_file():
+            problems.append(f"{source.name}：文件不存在")
+            continue
+        if kind_of(source) != "video":
+            problems.append(f"{source.name}：不是视频文件")
+            continue
+        out_dir = ""
+        if custom is not None:
+            try:
+                where = custom / source.parent.relative_to(folder)
+            except ValueError:
+                where = custom
+            if _same_folder(where, source.parent):
+                problems.append(f"{source.name}：指定的文件夹就是它所在的文件夹")
+                continue
+            out_dir = str(where)
+        requests.append(EncodeRequest(source=str(source), options=req.options,
+                                      output_mode=req.output_mode, output_dir=out_dir))
+    if problems:
+        raise HTTPException(status_code=400, detail="；".join(problems))
+    _queue_room(len(requests))
+    group_id = uuid.uuid4().hex[:12]
+    then = None
+    if req.subtitles is not None:
+        then = _subtitles_after_encode(
+            req.subtitles, f"enc-{group_id}" if req.subtitles.series_mode else "")
+    settings = jobqueue.snapshot()
+    added = []
+    try:
+        for request in requests:
+            added.append(queue_manager.store.add_encode(
+                request, settings, group_id=group_id, group_title=str(folder), then=then))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _enqueued(added, settings)
 
 
 @router.post("/queue/pause")

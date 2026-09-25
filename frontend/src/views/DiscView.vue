@@ -14,6 +14,7 @@ import { api } from '../api'
 import FileBrowser from '../components/FileBrowser.vue'
 import DiscTitles from '../components/DiscTitles.vue'
 import SubtitleDialog from '../components/SubtitleDialog.vue'
+import PipelineDialog from '../components/PipelineDialog.vue'
 
 const emit = defineEmits(['goto'])
 
@@ -117,8 +118,9 @@ const canQueue = computed(() => {
     && chosen.value.length > 0 && !busy.value
 })
 
-// subtitles: the 「加入列队并做字幕」 dialog's answer, null for plain 加入列队
-async function enqueue(subtitles = null) {
+// subtitles: the 「加入列队并做字幕」 dialog's answer, null for plain 加入列队;
+// encode: the full pipeline's (PipelineDialog), null otherwise
+async function enqueue(subtitles = null, encode = null) {
   const r = report.value
   if (!r) return
   busy.value = true
@@ -131,9 +133,12 @@ async function enqueue(subtitles = null) {
       episode_start: episodeStart.value,
       series: series.value,
       subtitles,
+      encode,
     })
-    enqueued.value = { position: resp.position, count: chosen.value.length, subtitles: !!subtitles }
+    enqueued.value = { position: resp.position, count: chosen.value.length,
+                       subtitles: !!subtitles, encode: !!encode }
     subDialog.value = false
+    pipeDialog.value = false
     ElMessage.success(`已加入列队（第 ${resp.position} 位）`)
   } catch (e) {
     ElMessage.error(e.message)
@@ -280,7 +285,7 @@ const batchTooBig = computed(() => {
 const canQueueBatch = computed(() =>
   wanted.value.length > 0 && !busy.value && wanted.value.every((d) => d.output_dir))
 
-async function enqueueBatch(subtitles = null) {
+async function enqueueBatch(subtitles = null, encode = null) {
   const b = batch.value
   if (!b) return
   busy.value = true
@@ -291,10 +296,12 @@ async function enqueueBatch(subtitles = null) {
                include: !!include[d.path] && titles.length > 0 }
     })
     const resp = await api.enqueueDiscBatch({
-      path: b.path, recursive: recursive.value, ...outputParams(), discs, subtitles,
+      path: b.path, recursive: recursive.value, ...outputParams(), discs, subtitles, encode,
     })
-    batchQueued.value = { count: resp.count, position: resp.position, subtitles: !!subtitles }
+    batchQueued.value = { count: resp.count, position: resp.position,
+                          subtitles: !!subtitles, encode: !!encode }
     subDialog.value = false
+    pipeDialog.value = false
     ElMessage.success(`已加入列队：${resp.count} 张盘`)
   } catch (e) {
     ElMessage.error(e.message)
@@ -325,6 +332,14 @@ function languagesOf(kind) {
 function confirmSubtitles(options) {
   if (mode.value === 'single') enqueue(options)
   else enqueueBatch(options)
+}
+
+// ---------------------------------- 加入列队并压制、做字幕 (both modes)
+const pipeDialog = ref(false)
+
+function confirmPipeline({ encode, subtitles }) {
+  if (mode.value === 'single') enqueue(subtitles, encode)
+  else enqueueBatch(subtitles, encode)
 }
 
 // ------------------------------------------------ both: output, browsing
@@ -530,6 +545,9 @@ function fmtBytes(bytes) {
         <el-button type="primary" plain :disabled="!canQueue" @click="subDialog = true">
           ＋ 加入列队并做字幕
         </el-button>
+        <el-button type="primary" plain :disabled="!canQueue" @click="pipeDialog = true">
+          ＋ 加入列队并压制、做字幕
+        </el-button>
       </div>
     </div>
     <el-alert
@@ -539,7 +557,8 @@ function fmtBytes(bytes) {
     <el-alert v-if="enqueued" type="success" :closable="false" style="margin-top: 10px">
       <template #title>
         已加入列队（第 {{ enqueued.position }} 位），{{ enqueued.count }} 个标题。
-        <template v-if="enqueued.subtitles">封装完成后，这些 MKV 会自动加入字幕任务（排在列队最后）。</template>
+        <template v-if="enqueued.encode">封装完成后，这些 MKV 会紧接着压制，压制完再自动加入字幕任务（排在列队最后）。</template>
+        <template v-else-if="enqueued.subtitles">封装完成后，这些 MKV 会自动加入字幕任务（排在列队最后）。</template>
         <el-link type="primary" :underline="false" @click="emit('goto', 'queue')">去列队查看进度 →</el-link>
       </template>
     </el-alert>
@@ -647,12 +666,16 @@ function fmtBytes(bytes) {
         <el-button type="primary" plain :disabled="!canQueueBatch" @click="subDialog = true">
           ＋ 加入列队并做字幕
         </el-button>
+        <el-button type="primary" plain :disabled="!canQueueBatch" @click="pipeDialog = true">
+          ＋ 加入列队并压制、做字幕
+        </el-button>
       </div>
     </div>
     <el-alert v-if="batchQueued" type="success" :closable="false" style="margin-top: 10px">
       <template #title>
         已加入列队：{{ batchQueued.count }} 张盘，每张一条任务（从第 {{ batchQueued.position }} 位起）。
-        <template v-if="batchQueued.subtitles">每张盘封装完成后，它的 MKV 会自动加入字幕任务（排在列队最后）。</template>
+        <template v-if="batchQueued.encode">每张盘封装完成后，它的 MKV 紧接着压制，压制完再自动加入字幕任务（排在列队最后）。</template>
+        <template v-else-if="batchQueued.subtitles">每张盘封装完成后，它的 MKV 会自动加入字幕任务（排在列队最后）。</template>
         <el-link type="primary" :underline="false" @click="emit('goto', 'queue')">去列队查看进度 →</el-link>
       </template>
     </el-alert>
@@ -665,6 +688,13 @@ function fmtBytes(bytes) {
     :discs="mode === 'single' ? 1 : wanted.length"
     :audio="languagesOf('audio')" :subtitles="languagesOf('subtitle')"
     @confirm="confirmSubtitles"
+  />
+  <PipelineDialog
+    v-model="pipeDialog" :busy="busy" :count="subTitles.length"
+    :extras="subTitles.filter((t) => t.category === 'extra').length"
+    :discs="mode === 'single' ? 1 : wanted.length"
+    :audio="languagesOf('audio')" :subtitles="languagesOf('subtitle')"
+    @confirm="confirmPipeline"
   />
 </template>
 

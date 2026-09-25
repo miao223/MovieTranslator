@@ -6,6 +6,7 @@ import SettingsView from './views/SettingsView.vue'
 import PromptView from './views/PromptView.vue'
 import QueueView from './views/QueueView.vue'
 import DiscView from './views/DiscView.vue'
+import EncodeView from './views/EncodeView.vue'
 
 const activeTab = ref('home')
 // the app ships as a zip and is updated by replacing files, so seeing which
@@ -35,6 +36,9 @@ onMounted(async () => {
         </el-tab-pane>
         <el-tab-pane label="原盘" name="disc" lazy>
           <DiscView @goto="activeTab = $event" />
+        </el-tab-pane>
+        <el-tab-pane label="压制" name="encode" lazy>
+          <EncodeView @goto="activeTab = $event" />
         </el-tab-pane>
         <!-- lazy defers the first mount; QueueView also takes :active
              because Element Plus keeps a pane mounted once visited, and

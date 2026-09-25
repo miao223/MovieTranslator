@@ -143,6 +143,8 @@ const visible = computed(() => {
 })
 
 const baseName = (p) => (p || '').split(/[\\/]/).pop() || p
+// a remux and an encode are not translations: said with an icon
+const KIND_ICONS = { disc: '💿 ', encode: '🎞️ ' }
 const waitingIds = computed(() =>
   entries.value.filter((e) => e.status === 'queued').map((e) => e.id))
 
@@ -268,7 +270,7 @@ async function showSettings(entry) {
 
       <el-empty v-if="!entries.length" description="列队是空的">
         <div class="hint" style="display: block; max-width: 460px; margin-bottom: 12px">
-          在「翻译任务」或「原盘」页填好后点「加入列队」。每条记录都会记住加入时
+          在「翻译任务」「原盘」或「压制」页填好后点「加入列队」。每条记录都会记住加入时
           <strong>已保存</strong>的设置，之后改设置不影响它。
         </div>
         <el-button type="primary" @click="emit('goto', 'home')">去添加</el-button>
@@ -282,7 +284,7 @@ async function showSettings(entry) {
             {{ stageLabel(entry.stage || entry.status) }}
           </el-tag>
           <span class="title" :title="entry.title">
-            {{ entry.kind === 'disc' ? '💿 ' : '' }}{{ baseName(entry.title) }}
+            {{ KIND_ICONS[entry.kind] || '' }}{{ baseName(entry.title) }}
           </span>
           <span class="summary">{{ entry.summary }}</span>
           <el-tag
@@ -340,9 +342,9 @@ async function showSettings(entry) {
           <!-- not v-else: a disc that failed on one title still queued
                subtitles for the rest, and says so here -->
           <div v-if="entry.note" class="row-note">{{ entry.note }}</div>
-          <!-- a disc writes its MKVs beside itself; tens of GB are not a
-               browser download, so the paths are the result -->
-          <div v-if="entry.kind === 'disc' && entry.result_files.length" class="row-note files">
+          <!-- a disc writes its MKVs beside itself, an encode its file; tens
+               of GB are not a browser download, so the paths are the result -->
+          <div v-if="entry.kind !== 'job' && entry.result_files.length" class="row-note files">
             <div v-for="f in entry.result_files" :key="f">📦 <code>{{ f }}</code></div>
           </div>
         </div>
