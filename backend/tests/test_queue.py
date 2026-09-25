@@ -764,6 +764,26 @@ def test_an_existing_subtitle_is_judged_by_its_language_not_its_name(tmp_path):
     assert not scan.with_source          # 不再只是「报告」，已经改用它了
 
 
+def test_a_capitalised_release_name_is_matched_to_its_subtitle(tmp_path):
+    """A release is named Some.Film.2019.mkv, and the scan groups films by
+    the lowercased stem. Looked up with a case-sensitive glob, the Chinese
+    subtitle beside it was never found: the finished film was taken for
+    untranslated, and that very subtitle was picked as the source to
+    translate into Chinese again. Lowercase names — every test above —
+    could not show it."""
+    from app.core.media import scan_media
+
+    (tmp_path / "Some.Film.2019.mkv").write_bytes(b"x")
+    (tmp_path / "Some.Film.2019.zh.srt").write_text(SRT_ZH, encoding="utf-8")
+    (tmp_path / "Other.Film.mkv").write_bytes(b"x")
+    (tmp_path / "Other.Film.EN.srt").write_text(SRT_EN, encoding="utf-8")
+
+    scan = scan_media(tmp_path, target_language="简体中文")
+
+    assert [p.name for p in scan.skipped] == ["Some.Film.2019.mkv"]
+    assert [p.name for p in scan.to_translate] == ["Other.Film.EN.srt"]
+
+
 def test_without_a_target_language_any_subtitle_still_counts_as_done(tmp_path):
     """Nothing to compare against means the old, conservative rule."""
     from app.core.media import scan_media

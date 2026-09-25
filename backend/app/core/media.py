@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import glob
+import os
 import re
 
 from pathlib import Path
@@ -296,16 +296,30 @@ def subtitles_beside(folder: Path, stem: str) -> List[Path]:
     收的是 (目录, 片名主干) 而不是一个 Path：调用方常常只有一个主干，而
     Path("/x/Movie.2019.1080p").with_suffix(".srt") 会得到 Movie.2019.srt
     ——发行版片名里全是点，这个坑一碰就是系统性的。
+
+    Matched without regard to case. The batch scan asks with the lowercased
+    stem it groups films by, and a release is named Some.Film.2019.mkv: a
+    case-sensitive glob (Linux) found nothing beside it, so a film already
+    translated was taken for untranslated — and its own Chinese subtitle
+    was picked as the source to translate into Chinese again. Lowercase
+    test names never showed it, and Windows ignores case anyway.
     """
-    found = [p for p in (folder / f"{stem}.srt", folder / f"{stem}.ass")
-             if p.is_file()]
-    for sibling in sorted(folder.glob(f"{glob.escape(stem)}.*")):
-        if sibling.suffix.lower() not in (".srt", ".ass") or not sibling.is_file():
+    want = stem.lower()
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    bare, tagged = [], []
+    for name in names:
+        low = name.lower()
+        if not low.startswith(want + "."):
             continue
-        middle = sibling.name[len(stem) + 1: -len(sibling.suffix)]
-        if _LANG_SUFFIX.match(middle.lower()):
-            found.append(sibling)
-    return found
+        rest = low[len(want) + 1:]
+        if rest in ("srt", "ass"):
+            bare.append(folder / name)
+        elif rest.endswith((".srt", ".ass")) and _LANG_SUFFIX.match(rest[:-4]):
+            tagged.append(folder / name)
+    return [p for p in bare + tagged if p.is_file()]
 
 
 def subtitle_state(folder: Path, stem: str,
