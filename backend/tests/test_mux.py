@@ -1021,3 +1021,60 @@ def test_an_audio_codec_the_container_cannot_hold_is_re_encoded_not_fatal(
     assert [m.get("language") for t, _, m in _streams(out) if t == "audio"] \
         == ["jpn", "eng"]
     assert sum("已转为 AAC" in n for n in notes) == 2
+
+
+# ------------------------------------------------------------- 0.29 fixes
+
+
+def test_the_film_s_chapters_come_through_moved_with_the_timeline(tmp_path):
+    """A remuxed Blu-ray carries its chapters; embedding a subtitle used to
+    drop every one of them."""
+    from tests.mediagen import make_source
+
+    source = make_source(tmp_path / "ch.mkv", frames=24, offset=3.0,
+                         chapters=[(3.0, 3.5), (3.5, 4.0)])
+    out = mux.embed(source, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文")
+    with av.open(str(out)) as c:
+        starts = [round(float(ch["start"] * ch["time_base"]), 3) for ch in c.chapters()]
+    assert starts == [0.0, 0.5]
+
+
+def test_a_re_encoded_track_keeps_its_default_and_commentary_flags(tmp_path):
+    from tests.mediagen import make_source
+
+    source = make_source(tmp_path / "flags.mkv", audio=[
+        {"codec": "flac", "format": "s16", "language": "jpn"},
+        {"codec": "flac", "format": "s16", "language": "eng"}])
+    marked = tmp_path / "marked.mkv"
+    with av.open(str(source)) as src, av.open(str(marked), "w", format="matroska") as dst:
+        copies = {}
+        for stream in src.streams:
+            copy = dst.add_stream_from_template(stream)
+            copy.metadata.update(dict(stream.metadata))
+            copies[stream.index] = copy
+        copies[1].disposition = av.stream.Disposition.default
+        copies[2].disposition = av.stream.Disposition.comment
+        for packet in src.demux():
+            if packet.size:
+                packet.stream = copies[packet.stream.index]
+                dst.mux(packet)
+    out = mux.embed(marked, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+                    opts=EmbedSettings(audio_codec="aac"))
+    with av.open(str(out)) as c:
+        flags = [c.streams.audio[i].disposition for i in (0, 1)]
+    assert flags[0] & av.stream.Disposition.default
+    assert flags[1] & av.stream.Disposition.comment
+
+
+def test_opus_takes_a_44k_source_instead_of_failing_the_embed(tmp_path):
+    """Opus has no 44.1 kHz. The rate was never fitted, so the first packet
+    failed and the whole embed fell back to a subtitle file."""
+    from tests.mediagen import make_source
+
+    source = make_source(tmp_path / "cd.mkv", audio=[
+        {"codec": "flac", "layout": "5.1(side)", "rate": 44100, "format": "s16"}])
+    out = mux.embed(source, _write_subs(tmp_path), tmp_path / "out.mkv", "简体中文",
+                    opts=EmbedSettings(audio_codec="libopus"))
+    with av.open(str(out)) as c:
+        cc = c.streams.audio[0].codec_context
+        assert (cc.name, cc.sample_rate, cc.layout.name) == ("opus", 48000, "5.1")
