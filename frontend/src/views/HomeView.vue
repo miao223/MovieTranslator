@@ -633,7 +633,10 @@ onBeforeUnmount(() => {
           </span>
         </template>
       </el-form-item>
-      <template v-else>
+      <!-- an explicit condition, not v-else: a v-else pairs with the element
+           right before it — the 字幕轨 item above — and put the batch-only
+           fields on the single-file form whenever that item was hidden -->
+      <template v-if="mode === 'batch'">
         <el-form-item label="视频目录" required>
           <el-input v-model="batchForm.directory" placeholder="将翻译该目录内的所有视频文件">
             <template #append>
