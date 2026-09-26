@@ -1075,13 +1075,16 @@ def _deinterlace_chain(opts: EncodeOptions, stream, sample: VideoSample,
 def encode_file(source_path: str | Path, part: str | Path, request: EncodeRequest, *,
                 log: Optional[LogFn] = None,
                 progress: Optional[Callable[[float, float, float], None]] = None,
-                should_cancel: Optional[Callable[[], bool]] = None) -> Result:
+                should_cancel: Optional[Callable[[], bool]] = None,
+                pace: Optional[Callable[[], None]] = None) -> Result:
     """Encode *source_path* into *part* as *request* says.
 
     The file is left at *part* for verify() and the caller's rename;
     anything that goes wrong — cancel included (InterruptedError) — removes
     it. *progress(fraction, fps, speed)* is called on every video packet;
-    throttling it is the caller's business.
+    throttling it is the caller's business. *pace()* is called on every
+    packet too, and may sleep: that is how 压制让路 (cpuyield) slows the
+    whole encode down, since the codec threads idle once nothing feeds them.
     """
     log = log or (lambda _m: None)
     should_cancel = should_cancel or (lambda: False)
@@ -1200,6 +1203,8 @@ def encode_file(source_path: str | Path, part: str | Path, request: EncodeReques
                 checked = {"at": time.monotonic()}
 
                 def on_packet(packet, pipe) -> None:
+                    if pace is not None:
+                        pace()
                     index = packet.stream.index
                     stats.seen[index] = stats.seen.get(index, 0) + 1
                     if packet.pts is not None:

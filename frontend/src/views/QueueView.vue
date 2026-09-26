@@ -148,6 +148,35 @@ const KIND_ICONS = { disc: '💿 ', encode: '🎞️ ' }
 const waitingIds = computed(() =>
   entries.value.filter((e) => e.status === 'queued').map((e) => e.id))
 
+// 压制让出 CPU: what the encode that is running right now is doing about it
+const percent = (x) => `${Math.round(x * 100)}%`
+const yieldTag = computed(() => {
+  const s = queue.value?.cpu_status
+  if (!queue.value?.cpu_yield || !s?.active) return null
+  if (!s.supported) return { type: 'info', text: '读不到 CPU 占用，只降了优先级' }
+  if (s.others == null) return { type: 'info', text: '正在测量其他程序的 CPU 占用…' }
+  if (s.limited) {
+    return { type: 'warning',
+             text: `其他程序占 ${percent(s.others)} · 压制最多用 ${percent(s.cap)}` }
+  }
+  return { type: 'success', text: `其他程序占 ${percent(s.others)} · 压制全速` }
+})
+
+// 压制内存上限: the choices stop at the machine's own memory
+const gib = (x) => `${x >= 10 ? Math.round(x) : x.toFixed(1)} GB`
+const memory = computed(() => queue.value?.memory_status || null)
+const memoryChoices = computed(() => {
+  const total = memory.value?.total_gb || 0
+  return [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128].filter((gb) => gb < total)
+})
+const memoryTag = computed(() => {
+  const m = memory.value
+  if (!m?.active || !m.supported) return null
+  const tight = m.used_gb > 0.8 * m.limit_gb || m.available_gb < 2 * m.floor_gb
+  return { type: tight ? 'warning' : 'info',
+           text: `压制占 ${gib(m.used_gb)} · 整机可用 ${gib(m.available_gb)}` }
+})
+
 // ------------------------------------------------------------- commands
 
 async function act(fn, okMessage) {
@@ -165,6 +194,8 @@ async function act(fn, okMessage) {
 }
 
 const setPaused = (paused) => act(() => api.pauseQueue(paused))
+const setCpuYield = (on) => act(() => api.cpuYield(on))
+const setMemoryLimit = (gb) => act(() => api.memoryLimit(gb))
 const cancelEntry = (entry) => act(() => api.cancelQueueEntry(entry.id))
 const removeEntry = (entry) => act(() => api.removeQueueEntry(entry.id))
 const retryEntry = (entry, fresh) =>
@@ -219,6 +250,28 @@ async function showSettings(entry) {
           :disabled="busy"
           @update:model-value="setPaused"
         />
+        <el-switch
+          :model-value="queue.cpu_yield"
+          active-text="压制让出 CPU"
+          :disabled="busy || queue.cpu_status?.supported === false"
+          :title="queue.cpu_status?.supported === false ? '这个系统上读不到整机的 CPU 占用' : ''"
+          @update:model-value="setCpuYield"
+        />
+        <el-tag v-if="yieldTag" size="small" :type="yieldTag.type">{{ yieldTag.text }}</el-tag>
+        <span v-if="memory?.supported" class="counts">
+          压制内存上限
+          <el-select
+            :model-value="queue.memory_limit_gb"
+            size="small"
+            style="width: 132px"
+            :disabled="busy"
+            @update:model-value="setMemoryLimit"
+          >
+            <el-option :value="0" :label="`自动（${gib(memory.auto_gb)}）`" />
+            <el-option v-for="gb in memoryChoices" :key="gb" :value="gb" :label="`${gb} GB`" />
+          </el-select>
+        </span>
+        <el-tag v-if="memoryTag" size="small" :type="memoryTag.type">{{ memoryTag.text }}</el-tag>
         <span class="counts">
           等待 {{ counts.queued }} · 完成 {{ counts.done }}
           <template v-if="counts.failed"> · 失败 {{ counts.failed }}</template>
@@ -231,7 +284,11 @@ async function showSettings(entry) {
       <div class="hint" style="display: block; margin-top: 6px">
         暂停后不再开始新的任务，<strong>正在跑的那一条不会被打断</strong>；
         想立刻停手就先暂停，再取消正在跑的那条。<br />
-        每条任务记住的是<strong>加入列队时已保存的设置</strong>，之后改设置只影响后面加入的任务。
+        每条任务记住的是<strong>加入列队时已保存的设置</strong>，之后改设置只影响后面加入的任务。<br />
+        「压制让出 CPU」：压制以最低优先级运行；其他程序的 CPU 占用超过 20% 时自动限速（最多用剩余空闲的一半），
+        回落后恢复全速。只管压制，随时开关，正在压的那条一秒内跟上。<br />
+        「压制内存上限」：压制自己用的内存超过它就停下；整机可用内存低于 {{ memory?.supported ? gib(memory.floor_gb) : '物理内存的 10%' }} 时也会停下，免得把机器的内存耗尽，腾出内存后点「重试」即可。
+        实测 1080p 用 x265 约 1 GB，4K 用 SVT-AV1 要 6–10 GB。
       </div>
     </el-card>
 

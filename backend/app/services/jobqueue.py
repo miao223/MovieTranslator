@@ -42,6 +42,7 @@ from typing import List, Optional, Tuple
 from pydantic import ValidationError
 
 from app.core import config
+from app.services import cpuyield, memguard
 from app.models.schemas import (
     AppSettings, DiscRequest, EncodeRequest, JobRequest, QueueEntry,
 )
@@ -278,6 +279,11 @@ class QueueStore:
         self.lock = threading.RLock()
         self.entries: List[QueueEntry] = []
         self.paused = False
+        # 列队页的「压制让出 CPU」。存在这里只为跨重启记住；正在跑的压制读的是
+        # cpuyield 里的现值，这里每次读到或改了都推过去
+        self.cpu_yield = False
+        # 列队页的「压制内存上限」（GB，0 = 自动），同理推给 memguard
+        self.memory_limit_gb = 0.0
         self._loaded_from: Optional[Path] = None
 
     # -- disk ------------------------------------------------------------
@@ -288,6 +294,10 @@ class QueueStore:
         self._loaded_from = path
         self.entries = []
         self.paused = False
+        self.cpu_yield = False
+        cpuyield.set_enabled(False)
+        self.memory_limit_gb = 0.0
+        memguard.set_limit(0)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -301,6 +311,13 @@ class QueueStore:
                 pass
             return
         self.paused = bool(raw.get("paused", False))
+        self.cpu_yield = bool(raw.get("cpu_yield", False))
+        cpuyield.set_enabled(self.cpu_yield)
+        try:
+            self.memory_limit_gb = max(float(raw.get("memory_limit_gb", 0) or 0), 0.0)
+        except (TypeError, ValueError):
+            self.memory_limit_gb = 0.0
+        memguard.set_limit(self.memory_limit_gb)
         for item in raw.get("entries", []) or []:
             if isinstance(item, dict):
                 self.entries.append(_entry_from_raw(item))
@@ -326,7 +343,8 @@ class QueueStore:
         with self.lock:
             self._prune()
             payload = json.dumps(
-                {"version": 1, "paused": self.paused,
+                {"version": 1, "paused": self.paused, "cpu_yield": self.cpu_yield,
+                 "memory_limit_gb": self.memory_limit_gb,
                  "entries": [e.model_dump() for e in self.entries]},
                 ensure_ascii=False, indent=2, default=str,
             )
@@ -474,6 +492,18 @@ class QueueStore:
     def set_paused(self, paused: bool) -> None:
         with self.lock:
             self.paused = paused
+            self.save()
+
+    def set_cpu_yield(self, on: bool) -> None:
+        with self.lock:
+            self.cpu_yield = bool(on)
+            cpuyield.set_enabled(self.cpu_yield)
+            self.save()
+
+    def set_memory_limit(self, gb: float) -> None:
+        with self.lock:
+            self.memory_limit_gb = max(float(gb), 0.0)
+            memguard.set_limit(self.memory_limit_gb)
             self.save()
 
 

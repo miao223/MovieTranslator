@@ -269,6 +269,56 @@ def test_pause_survives_a_restart(settings_file):
     assert again.paused is True
 
 
+def test_the_cpu_switch_survives_a_restart_and_reaches_the_encoder(settings_file, monkeypatch):
+    """压制让出 CPU lives in queue.json; a running encode reads cpuyield's copy."""
+    from app.services import cpuyield
+
+    monkeypatch.setattr(cpuyield, "_enabled", False)
+    settings_file()
+    store = QueueStore()
+    store.load()
+    assert store.cpu_yield is False and not cpuyield.enabled()
+    store.set_cpu_yield(True)
+    assert cpuyield.enabled()
+
+    cpuyield.set_enabled(False)     # a fresh process
+    again = QueueStore()
+    again.load()
+    assert again.cpu_yield is True and cpuyield.enabled()
+
+    # a queue.json from before the switch existed
+    raw = json.loads(jobqueue.queue_path().read_text(encoding="utf-8"))
+    del raw["cpu_yield"]
+    jobqueue.queue_path().write_text(json.dumps(raw), encoding="utf-8")
+    older = QueueStore()
+    older.load()
+    assert older.cpu_yield is False and not cpuyield.enabled()
+
+
+def test_the_memory_limit_survives_a_restart_and_reaches_the_guard(settings_file, monkeypatch):
+    from app.services import memguard
+
+    monkeypatch.setattr(memguard, "_limit_gb", 0.0)
+    settings_file()
+    store = QueueStore()
+    store.load()
+    assert store.memory_limit_gb == 0 and memguard.limit_gb() == 0
+    store.set_memory_limit(6)
+    assert memguard.limit_gb() == 6
+
+    memguard.set_limit(0)           # a fresh process
+    again = QueueStore()
+    again.load()
+    assert again.memory_limit_gb == 6 and memguard.limit_gb() == 6
+
+    raw = json.loads(jobqueue.queue_path().read_text(encoding="utf-8"))
+    del raw["memory_limit_gb"]
+    jobqueue.queue_path().write_text(json.dumps(raw), encoding="utf-8")
+    older = QueueStore()
+    older.load()
+    assert older.memory_limit_gb == 0 and memguard.limit_gb() == 0
+
+
 def test_retry_reuses_the_snapshot_and_fresh_retry_takes_a_new_one(runner, settings_file):
     manager, fake = runner
     settings_file(llm__model="model-A")
@@ -658,6 +708,43 @@ def test_pause_is_reported_back_and_persisted(client):
     again = QueueStore()
     again.load()
     assert again.paused is True
+
+
+def test_the_cpu_switch_is_reported_back_with_what_it_is_doing(client, monkeypatch):
+    from app.services import cpuyield
+
+    monkeypatch.setattr(cpuyield, "_enabled", False)
+    api, manager = client
+    body = api.get("/api/queue").json()
+    assert body["cpu_yield"] is False
+    assert body["cpu_status"] == {"supported": cpuyield.supported(), "active": False,
+                                  "limited": False, "others": None, "cap": 1.0}
+    assert api.post("/api/queue/cpu-yield", json={"enabled": True}).json() == {"enabled": True}
+    assert manager.store.cpu_yield is True and cpuyield.enabled()
+    assert api.get("/api/queue").json()["cpu_yield"] is True
+    assert api.post("/api/queue/cpu-yield", json={"enabled": False}).json() == {"enabled": False}
+    assert not cpuyield.enabled()
+
+
+def test_the_memory_limit_is_checked_reported_and_kept(client, monkeypatch):
+    from app.services import memguard
+
+    monkeypatch.setattr(memguard, "_limit_gb", 0.0)
+    api, manager = client
+    body = api.get("/api/queue").json()
+    assert body["memory_limit_gb"] == 0
+    status = body["memory_status"]
+    if status["supported"]:
+        assert status["limit_gb"] == pytest.approx(status["total_gb"] / 2, rel=0.01)
+        assert 1 <= status["floor_gb"] <= 4 and not status["active"]
+    assert api.post("/api/queue/memory-limit", json={"gb": 2}).json() == {"gb": 2}
+    assert manager.store.memory_limit_gb == 2 and memguard.limit_gb() == 2
+    assert api.get("/api/queue").json()["memory_limit_gb"] == 2
+    for nonsense in (0.5, -1, 1e6, "lots"):
+        r = api.post("/api/queue/memory-limit", json={"gb": nonsense})
+        assert r.status_code == 400, nonsense
+    assert memguard.limit_gb() == 2
+    assert api.post("/api/queue/memory-limit", json={"gb": 0}).json() == {"gb": 0}
 
 
 def test_an_immediate_job_never_touches_the_queue_file(client, tmp_path, monkeypatch):

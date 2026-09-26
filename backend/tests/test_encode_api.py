@@ -141,6 +141,86 @@ def test_an_encode_runs_writes_beside_its_source_and_says_what_it_saved(api, tmp
     assert not (tmp_path / "Film.H264.2.mkv").exists()
 
 
+def test_the_cpu_switch_slows_a_running_encode_and_says_so(api, tmp_path, monkeypatch):
+    """压制让出 CPU end to end: switched on from the 列队 page, picked up by the
+    encode as it runs. The other programs are faked at 60% of the machine, so
+    the encode is held to 20% (half of the 40% left) whatever this machine is
+    really doing."""
+    import os
+    import time
+
+    from app.services import cpuyield
+
+    client, manager = api
+    monkeypatch.setattr(cpuyield, "_enabled", False)
+    monkeypatch.setattr(cpuyield, "SAMPLE", 0.02)
+    monkeypatch.setattr(cpuyield, "WINDOW", 0.06)
+    cpus = os.cpu_count() or 1
+    monkeypatch.setattr(cpuyield, "read_system", lambda: (
+        time.process_time() + 0.6 * time.monotonic() * cpus, time.monotonic() * cpus))
+    source = make_source(tmp_path / "Film.mkv", frames=480, size=(320, 240))
+    assert client.post("/api/queue/cpu-yield", json={"enabled": True}).status_code == 200
+    client.post("/api/queue/encode", json={"source": str(source), "options": FAST})
+    entry, job = _run(manager)
+    assert entry.status == "done", job.status.error
+    logged = [e.log for e in job.events if e.log]
+    assert any(line.startswith("压制让路已开启") for line in logged)
+    assert any("其他程序的 CPU 占用 60%" in line and "压制开始限速" in line for line in logged)
+    assert any(line.startswith("压制让路：限速 1 次") for line in logged)
+    assert cpuyield.status()["active"] is False   # the page stops showing it
+
+
+def test_an_encode_that_outgrows_the_memory_limit_stops_and_leaves_nothing(
+        api, tmp_path, monkeypatch):
+    """The limit, end to end: the encode is stopped, the job says why, and
+    neither the half-written file nor a finished one is left behind."""
+    import time
+
+    from app.services import memguard
+
+    client, manager = api
+    monkeypatch.setattr(memguard, "_limit_gb", 0.005)     # 5 MB: any encode is over
+    monkeypatch.setattr(memguard, "CHECK_SECONDS", 0.0)
+    from app.services.pipeline import manager as jobs
+
+    stages = []     # the job's stage each time memory is handed back
+    real_trim = memguard.trim
+
+    def trim():
+        stages.append(jobs.get(manager.store.entries[0].job_id).status.stage)
+        real_trim()
+
+    monkeypatch.setattr(memguard, "trim", trim)
+    source = make_source(tmp_path / "Film.mkv", frames=240, size=(640, 480))
+    client.post("/api/queue/encode", json={"source": str(source), "options": FAST})
+    entry, job = _run(manager)
+    assert entry.status == "failed"
+    assert "超过上限 0.0 GB，已停止" in entry.error
+    assert source.exists() and not list(tmp_path.glob("Film.H264*"))   # no .mkv, no .part
+    assert memguard.status()["active"] is False
+    # before measuring, and once the job is over (the runner's last act, so
+    # it may land a moment after the queue sees the failure)
+    deadline = time.monotonic() + 10
+    while "failed" not in stages and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert stages == ["encoding", "failed"]
+
+
+def test_an_encode_logs_how_much_memory_it_took(api, tmp_path, monkeypatch):
+    from app.services import memguard
+
+    client, manager = api
+    monkeypatch.setattr(memguard, "_limit_gb", 0.0)
+    monkeypatch.setattr(memguard, "CHECK_SECONDS", 0.0)
+    source = make_source(tmp_path / "Film.mkv", frames=48, size=(320, 240))
+    client.post("/api/queue/encode", json={"source": str(source), "options": FAST})
+    entry, job = _run(manager)
+    assert entry.status == "done", job.status.error
+    logged = [e.log for e in job.events if e.log]
+    assert any(line.startswith("内存保护：压制最多用") for line in logged)
+    assert any(line.startswith("压制占用内存峰值") for line in logged)
+
+
 # -------------------------------------------------- the 原盘 page's third button
 
 

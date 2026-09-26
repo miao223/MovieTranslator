@@ -45,7 +45,9 @@ from app.models.schemas import (
     QueueView,
     SubtitleTrack,
 )
-from app.services import audio, encode, jobqueue, mcp_server, mux, series, subsource
+from app.services import (
+    audio, cpuyield, encode, jobqueue, mcp_server, memguard, mux, series, subsource,
+)
 from app.services.jobqueue import queue_manager
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
@@ -1028,7 +1030,9 @@ def _queue_view() -> QueueView:
     with store.lock:
         entries = [_entry_view(e, current) for e in store.entries]
         active = next((e.id for e in store.entries if e.status == "running"), "")
-        return QueueView(paused=store.paused, worker_alive=queue_manager.alive,
+        return QueueView(paused=store.paused, cpu_yield=store.cpu_yield,
+                         cpu_status=cpuyield.status(), memory_limit_gb=store.memory_limit_gb,
+                         memory_status=memguard.status(), worker_alive=queue_manager.alive,
                          active_id=active, settings_hash=current, entries=entries)
 
 
@@ -1509,6 +1513,32 @@ def pause_queue(body: dict) -> dict:
     if not queue_manager.store.paused:
         queue_manager.nudge()
     return {"paused": queue_manager.store.paused}
+
+
+@router.post("/queue/cpu-yield")
+def set_cpu_yield(body: dict) -> dict:
+    """压制让出 CPU：开着时压制以最低优先级运行，其他程序占用 CPU 超过 20%
+    时限速。正在跑的压制一秒内跟上（services/cpuyield.py）。"""
+    queue_manager.store.set_cpu_yield(bool(body.get("enabled", True)))
+    return {"enabled": queue_manager.store.cpu_yield}
+
+
+@router.post("/queue/memory-limit")
+def set_memory_limit(body: dict) -> dict:
+    """压制内存上限（GB，0 = 自动：物理内存的一半）。压制自己用的超过它就停下；
+    正在跑的压制下一次检查（两秒内）就按新值算（services/memguard.py）。"""
+    try:
+        gb = float(body.get("gb", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="上限要是一个数（GB），0 表示自动")
+    got = memguard.machine()
+    total = got[0] / memguard.GIB if got else 0.0
+    if gb < 0 or (gb and gb < 1) or (total and gb > total):
+        raise HTTPException(status_code=400, detail=(
+            f"上限要在 1 GB 到物理内存（{total:.0f} GB）之间，0 表示自动" if total
+            else "上限至少 1 GB，0 表示自动"))
+    queue_manager.store.set_memory_limit(gb)
+    return {"gb": queue_manager.store.memory_limit_gb}
 
 
 @router.put("/queue/order", response_model=QueueView)

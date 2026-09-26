@@ -446,6 +446,13 @@ class JobManager:
                 job.publish("failed", job.status.progress,
                             message=f"失败: {exc}", log=tb)
         finally:
+            if job.kind == "encode":
+                # An encode leaves gigabytes behind in glibc's per-thread
+                # arenas (4.1 GB after a 4K SVT-AV1 one). Handed back here,
+                # not in _execute_encode: until a failed encode's exception
+                # is gone, its traceback still holds the encoder.
+                from app.services import memguard
+                memguard.trim()
             _run_slot.release()
 
     def _download_model_with_progress(self, job: Job, settings, check_cancel) -> float:
@@ -871,7 +878,7 @@ class JobManager:
         been reopened and checked (encode.verify). Anything short of that
         keeps both files and says why.
         """
-        from app.services import encode
+        from app.services import cpuyield, encode, memguard
 
         settings = _settings_for(job)
         source = Path(req.source)
@@ -904,6 +911,9 @@ class JobManager:
         before = source.stat()
         started = time.monotonic()
         shown = {"pct": -1, "time": 0.0}
+        # the 列队 page's 压制让出 CPU switch, read live: it may be flipped
+        # while this runs, and takes effect within a second
+        governor = cpuyield.Governor(note, cancelled=job.cancel_event.is_set)
 
         def progress(fraction: float, fps: float, speed: float) -> None:
             # the disc remux's throttle: at most a line every 2 s, and one
@@ -917,11 +927,26 @@ class JobManager:
             shown["pct"], shown["time"] = pct, now
             job.publish("encoding", 98 * fraction,
                         message=f"压制 {fraction:.0%} · {fps:.1f} fps · {speed:.2f} 倍速"
-                                + _eta(started, fraction, True))
+                                + _eta(started, fraction, True) + governor.note())
 
         note(f"开始压制 → {target.name}（{encode.describe_options(req.options)}）")
-        result = encode.encode_file(source, part, req, log=note, progress=progress,
-                                    should_cancel=job.cancel_event.is_set)
+        # never let an encode take the machine down with it: it stops when the
+        # machine runs short or it outgrows the 列队 page's limit (memguard)
+        guard = memguard.MemoryGuard(note)
+        governor.start()
+        try:
+            guard.start(job.cancel_event.is_set,
+                        waiting=lambda message: job.publish("encoding", 0, message=message))
+
+            def pace() -> None:
+                governor.pace()
+                guard.check()
+
+            result = encode.encode_file(source, part, req, log=note, progress=progress,
+                                        should_cancel=job.cancel_event.is_set, pace=pace)
+        finally:
+            guard.close()
+            governor.close()
         stats = result.stats
         job.publish("encoding", 98, message="校验压制结果…",
                     log=f"编码完成：{stats.frames_in} 帧进，{stats.frames_out} 帧出，"

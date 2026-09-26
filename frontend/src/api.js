@@ -119,6 +119,10 @@ export const api = {
     request('/api/queue/batch', { method: 'POST', body: JSON.stringify(payload) }),
   pauseQueue: (paused) =>
     request('/api/queue/pause', { method: 'POST', body: JSON.stringify({ paused }) }),
+  cpuYield: (enabled) =>
+    request('/api/queue/cpu-yield', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  memoryLimit: (gb) =>
+    request('/api/queue/memory-limit', { method: 'POST', body: JSON.stringify({ gb }) }),
   reorderQueue: (ids) =>
     request('/api/queue/order', { method: 'PUT', body: JSON.stringify({ ids }) }),
   clearFinished: () => request('/api/queue/finished', { method: 'DELETE' }),

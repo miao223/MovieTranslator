@@ -920,8 +920,34 @@ class QueueEntryView(BaseModel):
     group_title: str = ""
 
 
+class CpuYieldStatus(BaseModel):
+    """压制让路此刻的状态（services/cpuyield.py），列队页显示用。"""
+    supported: bool = True           # 这个系统读得到整机的 CPU 占用
+    active: bool = False             # 有压制正在受它管
+    limited: bool = False            # 正在限速
+    others: Optional[float] = None   # 其他程序的 CPU 占用（0–1），还没量到时为空
+    cap: float = 1.0                 # 压制此刻最多能用的份额（1 = 不限）
+
+
+class MemoryStatus(BaseModel):
+    """压制的内存保护（services/memguard.py），列队页显示用。单位 GB。"""
+    supported: bool = True           # 这个系统读得到内存用量
+    total_gb: float = 0.0            # 物理内存
+    available_gb: float = 0.0        # 整机此刻可用
+    floor_gb: float = 0.0            # 整机可用低于它就停下压制
+    limit_gb: float = 0.0            # 压制自己最多用多少（生效的值）
+    auto_gb: float = 0.0             # 「自动」对应的值：物理内存的一半
+    active: bool = False             # 有压制正在受它管
+    used_gb: float = 0.0             # 这次压制此刻用了多少
+    peak_gb: float = 0.0
+
+
 class QueueView(BaseModel):
     paused: bool = False
+    cpu_yield: bool = False          # 列队页的「压制让出 CPU」
+    cpu_status: CpuYieldStatus = CpuYieldStatus()
+    memory_limit_gb: float = 0.0     # 列队页的「压制内存上限」，0 = 自动
+    memory_status: MemoryStatus = MemoryStatus()
     worker_alive: bool = False
     active_id: str = ""        # answers "why is nothing running"
     settings_hash: str = ""    # fingerprint of the CURRENT settings
