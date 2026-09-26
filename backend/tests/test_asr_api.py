@@ -365,6 +365,19 @@ def test_a_silent_window_costs_one_request_and_no_retry(run):
     assert any("无人说话" in line for line in logged)
 
 
+def test_an_answer_with_nothing_left_in_it_is_a_silent_window(run):
+    """Every line the model wrote is dropped ("♪" has nothing readable) in
+    a window where silero heard under 3s — validate calls that no fault,
+    and the window used to be returned with kept[-1] read off an empty
+    list: IndexError, and the whole film's recognition gone with it."""
+    client = FakeAudio(replies=["[00:01.000 --> 00:04.000] ♪"])
+    segments, _, logged = run(client, intervals=[(0.0, 1.0)])
+
+    assert segments == []
+    assert len(client.calls) == 2  # one per window, no retry
+    assert any("无人说话" in line for line in logged)
+
+
 def test_a_disputed_silence_is_believed_not_argued_with(run):
     """Silero says there is a minute of speech and the model says there is
     none. The model wins — measured: pressing it over a stretch of score

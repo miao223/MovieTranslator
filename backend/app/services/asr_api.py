@@ -1031,6 +1031,16 @@ def transcribe(
                 continue
             if notes and log:
                 log(f"  {where} {'；'.join(notes)}")
+            if not kept:
+                # Every line the model wrote was dropped — outside the
+                # window, or nothing readable in it ("♪") — and the window
+                # holds too little speech for that to count as a fault
+                # (validate's MIN_SPEECH_FOR_TEXT). An answer with nothing
+                # left in it is "no one speaks here", the same as NO SPEECH;
+                # reading kept[-1] below instead took the whole film down.
+                return {"window": window, "cues": [], "attempts": attempt,
+                        "reply": reply, "speech": speech, "no_speech": True,
+                        "disputed": False}
             return {
                 "window": window, "attempts": attempt, "reply": reply,
                 "speech": speech, "no_speech": False,
