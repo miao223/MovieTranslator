@@ -630,6 +630,19 @@ def test_the_reply_parser_tolerates_the_usual_model_noise(reply, expected):
     assert ocr.parse_sheet(reply) == expected
 
 
+@pytest.mark.parametrize("reply,expected", [
+    # measured on Qwen3-Omni: every two-row Japanese cue came back like this
+    ("[1] 一緒に逃げよう\nまだ間に合う\n[2] 鍵はどこ？", {1: "一緒に逃げよう まだ間に合う", 2: "鍵はどこ？"}),
+    ("[1] Who sent you?\nTell me now.", {1: "Who sent you? Tell me now."}),
+    # trailing prose after the last cue is not a third and fourth row
+    ("[1] one\nThat is all of them.\nLet me know if\nyou need more.", {1: "one"}),
+])
+def test_a_cue_written_on_two_lines_keeps_its_second_row(reply, expected):
+    """The numbers still cover the sheet when the second row is dropped, so
+    the coverage check never noticed it going missing."""
+    assert ocr.parse_sheet(reply) == expected
+
+
 # -------------------------------------------------------- through the job
 
 

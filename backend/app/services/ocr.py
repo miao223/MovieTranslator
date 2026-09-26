@@ -112,6 +112,9 @@ DEBUG_IMAGES = 30
 _LINE_RE = re.compile(r"^\s*[*\-•]?\s*\[?\s*(\d+)\s*\]?\s*[:：.、]?\s*(.*?)\s*$")
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*$")
 _NOTHING = "[无]"
+# rows one subtitle cue can have: an unnumbered line in a vision reply is
+# the cue's next row only this many times over (see parse_sheet)
+MAX_CUE_ROWS = 3
 
 
 @dataclass
@@ -609,15 +612,39 @@ def build_vision_prompt(language_hint: str = "") -> str:
 
 
 def parse_sheet(reply: str) -> dict[int, str]:
+    """``[n] text`` per cue, with a cue's second row joined back onto it.
+
+    The prompt asks for one line per cue, but a two-row subtitle often
+    comes back as two lines, the second without a number — measured on
+    Qwen3-Omni with every two-row Japanese cue. Dropping the unnumbered
+    line lost the second row silently: the numbers still covered the
+    sheet, so no check could notice. A cue has at most a couple of rows,
+    so only that many unnumbered lines after the last cue are taken as its
+    continuation; more than that is the model talking.
+    """
     out: dict[int, str] = {}
+    current: Optional[int] = None
+    pending: list[str] = []
+
+    def flush() -> None:
+        if current is not None and pending:
+            out[current] = " ".join([out[current]] + pending).strip()
+        pending.clear()
+
     for raw in (reply or "").splitlines():
         line = raw.strip()
         if not line or _FENCE_RE.match(line):
             continue
         m = _LINE_RE.match(line)
         if not m:
+            if current is not None:
+                pending.append(line)
             continue
-        out[int(m.group(1))] = m.group(2).strip()
+        flush()
+        current = int(m.group(1))
+        out[current] = m.group(2).strip()
+    if len(pending) <= MAX_CUE_ROWS - 1:
+        flush()
     return out
 
 
