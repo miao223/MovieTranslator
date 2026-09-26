@@ -115,3 +115,42 @@ def make_source(path: Path, *, frames: int = 24, rate=24, size=(128, 96), sar=No
         if sub_in is not None:
             sub_in.close()
     return path
+
+
+def make_open_gop_cut(path: Path, frames: int = 96) -> Path:
+    """What `ffmpeg -ss … -c copy` leaves of a film with open GOPs: it starts on
+    a keyframe followed, in decode order, by two B-frames that are shown
+    before it and predicted from the GOP the cut removed. Read back, the
+    matroska demuxer makes up DTS for them that the muxer then refuses
+    (mux.CopyPipe). The x264 settings are the ones that put B-frames right
+    before a keyframe: without b-adapt=0 it ends each GOP on a P-frame."""
+    whole = path.with_name(path.stem + ".whole.mkv")
+    with av.open(str(whole), "w", format="matroska") as c:
+        v = c.add_stream("libx264", rate=24)
+        v.width, v.height, v.pix_fmt = 160, 120, "yuv420p"
+        v.options = {"x264-params":
+                     "open-gop=1:bframes=3:b-adapt=0:keyint=23:min-keyint=23:scenecut=0"}
+        for i in range(frames):
+            img = np.zeros((120, 160, 3), np.uint8)
+            img[:, :, 0] = (i * 7) % 256
+            img[(i * 3) % 120, :, 1] = 255
+            img[:, (i * 5) % 160, 2] = 255
+            frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            frame.pts = i
+            for p in v.encode(frame):
+                c.mux(p)
+        for p in v.encode(None):
+            c.mux(p)
+    with av.open(str(whole)) as s, av.open(str(path), "w", format="matroska") as o:
+        vs = s.streams.video[0]
+        ov = o.add_stream_from_template(vs)
+        keys = 0
+        for p in s.demux(vs):
+            if not p.size:
+                continue
+            keys += p.is_keyframe
+            if keys >= 2:          # from the second keyframe on
+                p.stream = ov
+                o.mux(p)
+    whole.unlink()
+    return path

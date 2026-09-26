@@ -220,6 +220,23 @@ def test_the_picture_can_stay_as_it_is_while_the_sound_shrinks(tmp_path):
     assert src == dst and not result.video_encoded
 
 
+def test_a_cut_that_opens_mid_gop_can_keep_its_picture(tmp_path):
+    """画面原样 on a file cut with a plain stream copy: it used to fail on the
+    fifth packet (EINVAL). Now the two undecodable leading pictures are left
+    out, said so, and verify() still passes — the copied count is what went
+    into the file, and the missing frames are allowed for in the span."""
+    from tests.mediagen import make_open_gop_cut
+
+    source = make_open_gop_cut(tmp_path / "cut.mkv")
+    out, result, lines = run(source, video_codec="copy")
+    assert any("丢掉 2 个解不出来的前导帧" in line for line in lines)
+    with av.open(str(source)) as a, av.open(str(out)) as b:
+        src = [bytes(p) for p in a.demux(a.streams.video[0]) if p.size]
+        dst = [bytes(p) for p in b.demux(b.streams.video[0]) if p.size]
+    assert dst == [src[0]] + src[3:], "the keyframe, then everything after the two"
+    assert result.stats.dropped == {0: 2}
+
+
 def test_only_the_lossless_tracks_are_re_encoded(tmp_path):
     source = make_source(tmp_path / "bd.mkv", audio=[
         {"codec": "flac", "layout": "5.1(side)", "format": "s16", "language": "jpn",

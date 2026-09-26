@@ -846,6 +846,7 @@ class Stats:
     frames_out: int = 0         # handed to the encoder (after the filters)
     video_packets: int = 0      # what the encoder gave back
     copied: Dict[int, int] = field(default_factory=dict)   # source index -> packets
+    dropped: Dict[int, int] = field(default_factory=dict)  # left out of a copy's opening
     bad: Dict[int, int] = field(default_factory=dict)      # source index -> decode errors
     seen: Dict[int, int] = field(default_factory=dict)     # source index -> packets
     spans: Dict[int, List[float]] = field(default_factory=dict)  # source index -> [start, end]
@@ -1015,8 +1016,17 @@ class CountingCopy(mux.CopyPipe):
         self.stats, self.index = stats, index
 
     def feed(self, packet) -> list:
-        self.stats.copied[self.index] = self.stats.copied.get(self.index, 0) + 1
-        return super().feed(packet)
+        return self._count(super().feed(packet))
+
+    def flush(self) -> list:
+        return self._count(super().flush())
+
+    def _count(self, made: list) -> list:
+        # what reaches the file, which is what verify() compares: the copy may
+        # leave out a cut's undecodable opening (mux.CopyPipe)
+        self.stats.copied[self.index] = self.stats.copied.get(self.index, 0) + len(made)
+        self.stats.dropped[self.index] = self.dropped
+        return made
 
 
 # -------------------------------------------------------------- the encode
@@ -1214,6 +1224,10 @@ def encode_file(source_path: str | Path, part: str | Path, request: EncodeReques
 
                 mux.pump(source, out, pipes, should_cancel, on_packet)
                 _check_bad(stats)
+                for index, dropped in stats.dropped.items():
+                    if dropped:
+                        log(f"流 #{index} 开头是从 GOP 中间切开的：丢掉 {dropped} 个解不出来的前导帧"
+                            f"（它们参照的是被切掉的上一段）")
         stats.seconds = time.monotonic() - stats.started
     except BaseException:
         part.unlink(missing_ok=True)
@@ -1400,6 +1414,7 @@ def verify(part: str | Path, result: Result) -> List[str]:
         length_in, length_out = want[1] - want[0], have[1] - have[0]
         if kind == "video":
             slack = max(3 * result.frame_step, 0.001 * length_in)
+            slack += stats.dropped.get(src_index, 0) * result.frame_step
         else:
             slack = 0.5
         if abs(length_in - length_out) > slack:

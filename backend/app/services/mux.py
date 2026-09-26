@@ -581,12 +581,39 @@ def _encode(enc, frame, shift: int, resampler) -> list:
 # and gives up whatever it still holds at the end.
 
 
+OPENING_LIMIT = 240   # packets a copied picture may hold waiting for a first keyframe
+
+
 class CopyPipe:
-    """A source stream copied packet for packet into *target*."""
+    """A source stream copied packet for packet into *target*.
+
+    A picture that opens mid-GOP gets one repair. A file cut out of a longer
+    one with a plain stream copy (`ffmpeg -ss … -c copy`) often starts on an
+    open GOP: its keyframe is followed, in decode order, by B-frames shown
+    *before* it and predicted from the GOP the cut removed. They cannot be
+    decoded, and the timestamps the matroska demuxer makes up for them are
+    what the muxer then refuses — measured on a real cut: pts 1007 923 965
+    1132 1049 1090 with dts none none none none 923 923; the muxer derives
+    the four missing ones from pts and rejects the fifth packet with EINVAL,
+    so the whole copy failed. Those leading pictures are dropped (ffmpeg's
+    dvdvideo does the same, and so does disc/remux for DVD cells) and the
+    rest of the picture gets DTS of our own. A stream that does not open
+    like that is passed through untouched: the keyframe is only held until
+    the packet after it shows there is nothing to drop.
+    """
 
     def __init__(self, target, shift: int = 0):
         self.target = target
         self.shift = shift
+        self.dropped = 0          # undecodable packets left out at the start
+        attached = getattr(getattr(av.stream, "Disposition", None), "attached_pic", 0)
+        self._opening = (getattr(target, "type", "") == "video"
+                         and not (attached and target.disposition & attached))
+        self._held: list = []     # the opening, until we know what to make of it
+        self._keyed = False
+        self._key_pts = None
+        self._retime = False
+        self._last_dts = None
 
     def wants(self, packet) -> bool:
         # Only the empty packet demux emits at end-of-stream may be dropped,
@@ -605,10 +632,56 @@ class CopyPipe:
             if packet.dts is not None:
                 packet.dts -= self.shift
         packet.stream = self.target
-        return [packet]
+        if self._opening:
+            return self._open(packet)
+        return self._dts(packet) if self._retime else [packet]
 
     def flush(self) -> list:
-        return []
+        held, self._held = self._held, []
+        return [made for packet in held for made in self._dts(packet)] if self._retime else held
+
+    def _open(self, packet) -> list:
+        if not self._keyed:
+            if not packet.is_keyframe:
+                # Nothing before the first keyframe can be decoded. Held, not
+                # dropped, until one turns up: a demuxer that marks no
+                # keyframes at all must not cost the whole picture.
+                self._held.append(packet)
+                if len(self._held) < OPENING_LIMIT:
+                    return []
+                self._opening = False
+                held, self._held = self._held, []
+                return held
+            self.dropped += len(self._held)
+            self._keyed, self._key_pts, self._held = True, packet.pts, [packet]
+            return []
+        if (not packet.is_keyframe and packet.pts is not None
+                and self._key_pts is not None and packet.pts < self._key_pts):
+            self.dropped += 1           # a leading picture of an open GOP
+            self._retime = True
+            return []
+        self._opening = False
+        held, self._held = self._held + [packet], []
+        if not self._retime:
+            return held
+        return [made for p in held for made in self._dts(p)]
+
+    def _dts(self, packet) -> list:
+        """Monotonic DTS no later than PTS, keeping the demuxer's once they
+        are consistent again (a few packets in, on the cut above)."""
+        last, pts, dts = self._last_dts, packet.pts, packet.dts
+        if last is None:
+            # the keyframe: with its leading pictures gone, nothing kept is
+            # shown before it
+            dts = pts if pts is not None else (dts if dts is not None else 0)
+        elif dts is None or dts <= last:
+            dts = last + 1
+        if pts is not None and pts < dts:
+            self.dropped += 1           # would be shown before what is already decoded
+            return []
+        packet.dts = dts
+        self._last_dts = dts
+        return [packet]
 
 
 class TranscodePipe:
@@ -946,6 +1019,9 @@ def embed(
             for _, cue, cue_stream in cues[next_cue:]:
                 cue.stream = cue_stream
                 out.mux(cue)
+            for pipe in pipes.values():
+                if log and getattr(pipe, "dropped", 0):
+                    log(f"片源画面是从 GOP 中间切开的：丢掉开头 {pipe.dropped} 个解不出来的前导帧")
 
         os.replace(part, out_path)
     except BaseException:

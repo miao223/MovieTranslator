@@ -514,6 +514,89 @@ def test_both_subtitle_formats_ride_along_intact(tmp_path, styled):
     assert "你好" in cues[0] and "再见" in cues[1]
 
 
+# ------------------------------------------------ a copy that opens mid-GOP
+
+
+class _Packet:
+    def __init__(self, pts, dts=None, key=False):
+        self.pts, self.dts, self.is_keyframe, self.size = pts, dts, key, 100
+        self.stream = None
+
+
+def _pipe(kind="video", disposition=0):
+    from types import SimpleNamespace
+    return mux.CopyPipe(SimpleNamespace(type=kind, disposition=disposition))
+
+
+def _run(pipe, packets):
+    out = [m for p in packets for m in pipe.feed(p)]
+    return out + pipe.flush()
+
+
+def test_a_picture_that_opens_cleanly_is_passed_through_untouched():
+    """The start of a normal matroska file: no DTS on the first four packets,
+    and the muxer is left to derive them exactly as before."""
+    packets = [_Packet(0, key=True), _Packet(83), _Packet(42), _Packet(209),
+               _Packet(125, 0), _Packet(167, 42)]
+    out = _run(_pipe(), packets)
+    assert out == packets and [p.dts for p in out] == [None, None, None, None, 0, 42]
+
+
+def test_the_leading_pictures_of_an_open_gop_cut_are_left_out_and_dts_repaired():
+    """The measured cut: pts 1007 923 965 1132 1049 1090, dts none ×4 923 923."""
+    pipe = _pipe()
+    packets = [_Packet(1007, key=True), _Packet(923), _Packet(965), _Packet(1132),
+               _Packet(1049, 923), _Packet(1090, 923), _Packet(1215, 965),
+               _Packet(1174, 1049), _Packet(1341, 1090)]
+    out = _run(pipe, packets)
+    assert [p.pts for p in out] == [1007, 1132, 1049, 1090, 1215, 1174, 1341]
+    dts = [p.dts for p in out]
+    assert all(a < b for a, b in zip(dts, dts[1:])), dts
+    assert all(p.dts <= p.pts for p in out)
+    assert dts[-2:] == [1049, 1090], "the demuxer's DTS are kept once they make sense"
+    assert pipe.dropped == 2
+
+
+def test_what_comes_before_the_first_keyframe_is_left_out():
+    pipe = _pipe()
+    out = _run(pipe, [_Packet(0), _Packet(42), _Packet(83, key=True), _Packet(125)])
+    assert [p.pts for p in out] == [83, 125] and pipe.dropped == 2
+
+
+def test_a_demuxer_that_marks_no_keyframe_does_not_cost_the_picture():
+    packets = [_Packet(i * 42) for i in range(mux.OPENING_LIMIT + 10)]
+    pipe = _pipe()
+    out = _run(pipe, packets)
+    assert out == packets and pipe.dropped == 0
+
+
+def test_sound_and_a_cover_image_are_never_held_or_changed():
+    audio = [_Packet(10), _Packet(5)]
+    assert _run(_pipe("audio"), audio) == audio
+    attached = int(av.stream.Disposition.attached_pic)
+    cover = [_Packet(0)]
+    assert _run(_pipe("video", attached), cover) == cover
+
+
+def test_a_cut_that_opens_mid_gop_is_embedded_not_given_up_on(tmp_path):
+    """It used to fail with EINVAL on the fifth packet, and embedding fell
+    back to a subtitle file beside the video."""
+    from tests.mediagen import make_open_gop_cut
+
+    source = make_open_gop_cut(tmp_path / "cut.mkv")
+    lines = []
+    out = mux.embed(source, _write_subs(tmp_path), tmp_path / "out.mkv", "中文",
+                    log=lines.append)
+    assert out is not None and out.exists()
+    assert any("丢掉开头 2 个解不出来的前导帧" in line for line in lines)
+    def packets(path):
+        with av.open(str(path)) as c:
+            return sum(1 for p in c.demux(video=0) if p.size)
+
+    # every packet that is left decodes, and only the two are missing
+    assert _frames(out) == packets(out) == packets(source) - 2
+
+
 def test_a_codec_mkv_cannot_hold_fails_loudly(tmp_path, monkeypatch):
     """PyAV asks libavformat at normal compliance, which turns down a few
     old codecs (msmpeg4v2, wmv, vc1, adpcm) that MKV can technically carry.
