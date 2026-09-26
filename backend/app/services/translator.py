@@ -600,7 +600,21 @@ class Translator:
                 + ("（样本不足，未校验）" if before is None else f"{before:+.2f}")
             )
         if before is None or before >= ALIGNMENT_MIN_CORRELATION:
-            return reply
+            # A whole batch can clear the threshold on the lines before a
+            # shift began. Measured on Qwen3-Omni: 113 lines at an accepted
+            # r, of which 61 sat one line off; its pieces showed it plainly.
+            # Aligned pieces do not trip this — across 120 pieces of four
+            # aligned translations (gemini, deepseek, Omni) the lowest r
+            # was +0.71 — so a clean batch still costs no extra request.
+            slipped = [p for p in self._pieces(chunk)
+                       if (r := _length_correlation(p)) is not None
+                       and r < ALIGNMENT_MIN_CORRELATION]
+            if not slipped:
+                return reply
+            spans = "、".join(f"{p[0].index}-{p[-1].index}" for p in slipped)
+            self.log(f"⚠ 第 {first}-{last} 行整批看似对齐，但第 {spans} 行疑似错位，"
+                     "拆成小段重新请求…")
+            return self._repair(messages, chunk, reply)
 
         self.log(
             f"⚠ 第 {first}-{last} 行译文疑似整批错位（长度相关性 {before:+.2f}），重新请求…"
@@ -625,16 +639,91 @@ class Translator:
                 f"批次 [{first}-{last}] 重发后相关性 r="
                 + ("（无法计算）" if after is None else f"{after:+.2f}")
             )
+        if after is not None and after >= ALIGNMENT_MIN_CORRELATION:
+            self.log(f"第 {first}-{last} 行重新请求后对齐正常（{after:+.2f}）")
+            return retry
         if after is None or after <= before:
             for line in chunk:  # the retry was no better; keep the first answer
                 line.translation = kept.get(line.index, line.translation)
+        # Asking again for the same batch is the retry that just failed —
+        # measured on Qwen3-Omni, it failed every time. What does work is a
+        # shorter request: the model loses its place over a long batch, and
+        # a shift that starts in the middle leaves the first half intact.
+        self.log(f"⚠ 第 {first}-{last} 行重试后仍未对齐，拆成更小的段重新请求…")
+        return self._repair(messages, chunk, reply)
+
+    @staticmethod
+    def _pieces(chunk: List[SubtitleLine]) -> List[List[SubtitleLine]]:
+        """*chunk* halved down to the smallest pieces the correlation can
+        still judge (20–39 lines) — the same cut _realign walks."""
+        if len(chunk) >= 2 * ALIGNMENT_MIN_LINES:
+            mid = len(chunk) // 2
+            return Translator._pieces(chunk[:mid]) + Translator._pieces(chunk[mid:])
+        return [chunk]
+
+    def _repair(self, messages: List[dict], chunk: List[SubtitleLine], reply: str) -> str:
+        """Re-ask for the pieces of *chunk* that are off; report what stayed off.
+
+        Returns the batch as the conversation should remember it.
+        """
+        first, last = chunk[0].index, chunk[-1].index
+        context = messages + [{"role": "assistant", "content": reply}]
+        unresolved = self._realign(context, chunk)
+        if unresolved:
+            spans = "、".join(f"{a}-{b}" for a, b in unresolved)
             self.log(
-                f"⚠ 第 {first}-{last} 行重试后仍未对齐，已保留首次结果；"
+                f"⚠ 第 {spans} 行拆小重译后仍未对齐，已保留相关性最高的结果；"
                 "该段译文可能与原文错位，建议人工核对"
             )
-            return reply
-        self.log(f"第 {first}-{last} 行重新请求后对齐正常（{after:+.2f}）")
-        return retry
+        else:
+            self.log(f"第 {first}-{last} 行拆小重译后对齐正常")
+        # what the model sees of this batch from now on is the repaired text,
+        # not the shifted answer it would otherwise keep building on
+        return "\n".join(f"[{line.index}] {line.translation}" for line in chunk)
+
+    def _realign(self, context: List[dict], chunk: List[SubtitleLine]) -> List[tuple]:
+        """Re-translate a batch known to be off, one checkable piece at a time.
+
+        The batch is split down to pieces of 20–39 lines — the smallest the
+        length correlation can still judge — and every piece is checked,
+        including those whose half looked fine. That is deliberate: a shift
+        that starts part-way through leaves the lines before it aligned, and
+        they carry the half's correlation over the threshold. Measured on
+        Qwen3-Omni: a 56-line half at r=+0.60 held 30 shifted lines, which
+        its 28-line quarter showed at once (+0.23).
+
+        Only the pieces that fail are asked for again. Returns the
+        (first, last) ranges that never came right, each keeping whichever
+        answer correlated best.
+        """
+        if len(chunk) >= 2 * ALIGNMENT_MIN_LINES:
+            mid = len(chunk) // 2
+            return self._realign(context, chunk[:mid]) + self._realign(context, chunk[mid:])
+        before = _length_correlation(chunk)
+        if before is None or before >= ALIGNMENT_MIN_CORRELATION:
+            return []
+        first, last = chunk[0].index, chunk[-1].index
+        kept = {line.index: line.translation for line in chunk}
+        reply = self._chat(context + [{"role": "user", "content": (
+            f"上面的译文从某一行开始与原文错开了。请只重新输出第 {first} 行到第 {last} 行的译文，"
+            "每行格式 `[行号] 译文`，逐行核对行号与原文，不要合并或跳过任何一行：\n"
+            + _numbered(chunk)
+        )}])
+        parsed = parse_translations(reply)
+        for line in chunk:
+            line.translation = parsed.get(line.index) or kept.get(line.index, "")
+        after = _length_correlation(chunk)
+        if self.debug:
+            self.debug.line(
+                f"批次 [{first}-{last}] 拆小重译 r={before:+.2f} → "
+                + ("（无法计算）" if after is None else f"{after:+.2f}")
+            )
+        if after is not None and after >= ALIGNMENT_MIN_CORRELATION:
+            return []
+        if after is None or after <= before:
+            for line in chunk:
+                line.translation = kept.get(line.index, line.translation)
+        return [(first, last)]
 
     # ------------------------------------------------------ chunked mode
 

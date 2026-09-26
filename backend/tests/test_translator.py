@@ -3,6 +3,7 @@
 import pytest
 
 from app.models.schemas import LLMSettings, SubtitleLine
+from app.services import translator
 from app.services.translator import (
     TranslationError,
     Translator,
@@ -332,12 +333,111 @@ def test_a_shifted_batch_is_detected_and_re_requested():
     assert all(l.translation == zh_for(l.text) for l in lines)
 
 
-def test_a_batch_that_stays_shifted_keeps_the_first_answer_and_warns():
+def test_a_batch_that_stays_shifted_is_retranslated_in_halves():
+    """Measured on Qwen3-Omni: the whole-batch retry failed every time, and
+    the shifted text went into the subtitles with a warning. A shorter
+    request is what the model can keep its place over."""
     lines = aligned_lines()
     client = FakeClient([
         "glossary",
         reply_for(lines, shift=1),
         reply_for(lines, shift=1),   # retry is no better
+        reply_for(lines[:20]),       # ...but each half comes back right
+        reply_for(lines[20:]),
+    ])
+    logs = []
+    Translator(LLMSettings(model="m", batch_size=200), target_language="简体中文",
+               client=client, log=logs.append).translate(lines)
+    assert all(l.translation == zh_for(l.text) for l in lines)
+    assert any("拆小重译后对齐正常" in m for m in logs)
+    assert not any("建议人工核对" in m for m in logs)
+
+
+def test_only_the_pieces_that_slipped_are_asked_for_again():
+    lines = aligned_lines(80)
+    slipped = reply_for(lines[:40]) + "\n" + reply_for(lines[40:], shift=1)
+    client = FakeClient(["glossary", slipped, slipped,
+                         reply_for(lines[40:60]), reply_for(lines[60:])])
+    Translator(LLMSettings(model="m", batch_size=200), target_language="简体中文",
+               client=client).translate(lines)
+    assert len(client.calls) == 5  # glossary, batch, retry, the two slipped pieces
+    asked = [c[-1]["content"] for c in client.calls[3:]]
+    assert "[41]" in asked[0] and "[61]" in asked[1]
+    assert not any("[1] Yes." in a for a in asked)
+    assert all(l.translation == zh_for(l.text) for l in lines)
+
+
+def test_a_shift_hidden_behind_an_aligned_start_is_still_found():
+    """A half can clear the threshold on its aligned lines alone — measured:
+    a 56-line half at r=+0.60 with 30 of its lines shifted. The pieces
+    inside it are checked anyway."""
+    from app.services.translator import (
+        ALIGNMENT_MIN_CORRELATION, _length_correlation, parse_translations)
+
+    lines = aligned_lines(80)
+    slipped = reply_for(lines[:32]) + "\n" + reply_for(lines[32:], shift=1)
+    parsed = parse_translations(slipped)
+    for line in lines:
+        line.translation = parsed[line.index]
+    # the premise: the first half passes, its second piece does not
+    assert _length_correlation(lines[:40]) >= ALIGNMENT_MIN_CORRELATION
+    assert _length_correlation(lines[20:40]) < ALIGNMENT_MIN_CORRELATION
+    for line in lines:
+        line.translation = ""
+
+    client = FakeClient(["glossary", slipped, slipped,
+                         reply_for(lines[20:40]), reply_for(lines[40:60]),
+                         reply_for(lines[60:])])
+    Translator(LLMSettings(model="m", batch_size=200), target_language="简体中文",
+               client=client).translate(lines)
+    assert all(l.translation == zh_for(l.text) for l in lines)
+
+
+def test_a_batch_that_passes_as_a_whole_is_still_checked_piece_by_piece():
+    """Measured on Qwen3-Omni: a 113-line batch cleared the threshold while
+    61 of its lines sat one line off, and nothing was flagged at all. The
+    whole-batch retry is skipped: only the piece that slipped is asked for."""
+    from app.services.translator import ALIGNMENT_MIN_CORRELATION, _length_correlation
+
+    lines = aligned_lines(80)
+    slipped = reply_for(lines[:64]) + "\n" + reply_for(lines[64:], shift=1)
+    client = FakeClient(["glossary", slipped, reply_for(lines[60:])])
+    logs = []
+    tr = Translator(LLMSettings(model="m", batch_size=200), target_language="简体中文",
+                    client=client, log=logs.append)
+    tr.translate(lines)
+    assert len(client.calls) == 3  # glossary, batch, the one piece
+    assert "[61]" in client.calls[-1][-1]["content"]
+    assert all(l.translation == zh_for(l.text) for l in lines)
+    assert any("整批看似对齐" in m for m in logs)
+
+
+def test_the_repaired_batch_is_what_the_conversation_remembers():
+    """Leaving the shifted answer in the history hands the next batch a
+    worked example of losing count."""
+    lines = aligned_lines(60)
+    client = FakeClient([
+        "glossary",
+        reply_for(lines[:40], shift=1), reply_for(lines[:40], shift=1),
+        reply_for(lines[:20]), reply_for(lines[20:40]),
+        reply_for(lines[40:]),
+    ])
+    Translator(LLMSettings(model="m", batch_size=40), target_language="简体中文",
+               client=client).translate(lines)
+    history = client.calls[-1]
+    second = next(i for i, m in enumerate(history) if "请输出第 41 行" in m["content"])
+    assert history[second - 1]["role"] == "assistant"  # batch 1's answer
+    assert history[second - 1]["content"] == reply_for(lines[:40])
+
+
+def test_a_batch_that_never_comes_right_keeps_its_best_answer_and_warns():
+    lines = aligned_lines()
+    client = FakeClient([
+        "glossary",
+        reply_for(lines, shift=1),
+        reply_for(lines, shift=1),
+        reply_for(lines[:20], shift=1),
+        reply_for(lines[20:], shift=1),
     ])
     logs = []
     Translator(LLMSettings(model="m", batch_size=200), target_language="简体中文",
