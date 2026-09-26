@@ -243,6 +243,43 @@ def test_glossary_request_demands_target_language_names():
     assert "不得用罗马音" in system
 
 
+class ReasoningModelClient(FakeClient):
+    """OpenAI's reasoning models: any temperature but the default is a 400."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.sent = []
+
+    def create(self, model, messages, temperature=None, **kw):
+        self.sent.append(temperature)
+        if temperature is not None and temperature != 1:
+            raise RuntimeError(
+                "Error code: 400 - {'error': {'message': \"Unsupported value: 'temperature' "
+                "does not support 0.3 with this model. Only the default (1) value is "
+                "supported.\", 'type': 'invalid_request_error'}}")
+        return super().create(model, messages, temperature, **kw)
+
+
+@pytest.mark.parametrize("no_thinking", [True, False])
+def test_a_model_that_only_takes_the_default_temperature_still_translates(no_thinking):
+    """Measured on gpt-6-luna: every request of every stage was a 400."""
+    fake = ReasoningModelClient(["foo → 富", "[1] 一"])
+    lines = make_lines(1)
+    Translator(settings(disable_thinking=no_thinking), "简体中文", client=fake).translate(lines)
+    assert lines[0].translation == "一"
+    assert None in fake.sent  # retried without the field
+
+
+def test_a_real_error_that_mentions_nothing_about_temperature_still_raises():
+    class Broken(FakeClient):
+        def create(self, *a, **kw):
+            raise RuntimeError("Error code: 401 - invalid api key")
+
+    with pytest.raises(RuntimeError, match="401"):
+        Translator(settings(disable_thinking=False), "简体中文",
+                   client=Broken([])).translate(make_lines(1))
+
+
 def test_synopsis_included_in_system_prompt():
     lines = make_lines(1)
     fake = FakeClient(["glossary", "[1] 一"])

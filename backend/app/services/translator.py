@@ -261,16 +261,31 @@ def chat_completion(client, *, model, messages, temperature, no_thinking=True):
     """
     if no_thinking:
         try:
-            return client.chat.completions.create(
-                model=model, messages=messages, temperature=temperature,
-                extra_body=_THINKING_OFF,
-            ), True
+            return _create(client, model=model, messages=messages,
+                           temperature=temperature, extra_body=_THINKING_OFF), True
         except Exception as exc:  # noqa: BLE001
             if not _rejects_thinking(exc):
                 raise
-    return client.chat.completions.create(
-        model=model, messages=messages, temperature=temperature,
-    ), False
+    return _create(client, model=model, messages=messages,
+                   temperature=temperature), False
+
+
+def _create(client, **kwargs):
+    """The request, without ``temperature`` for a model that refuses to be
+    given one. OpenAI's reasoning models answer any value but the default
+    with a 400 ("Only the default (1) value is supported") — measured on
+    gpt-6-luna, where every request of every stage failed before it began.
+    The refusal costs nothing, so it is simply retried without the field.
+    """
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        text = str(exc).lower()
+        if "temperature" not in kwargs or "temperature" not in text or not any(
+                hint in text for hint in ("unsupported", "only the default", "not supported")):
+            raise
+    kwargs.pop("temperature")
+    return client.chat.completions.create(**kwargs)
 
 
 def reply_text(resp) -> str:
