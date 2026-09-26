@@ -64,7 +64,10 @@ function confirm() {
 
     <div class="section">
       <div class="section-title">压制</div>
-      <EncodeFields v-model="encodeOpts" lock-container />
+      <EncodeFields
+        v-model="encodeOpts" lock-container
+        auto-hint="每个 MKV 开压前各让视觉模型看一次画面（每个一次调用）；判断不了时用下面这些参数。"
+      />
       <div class="keep">
         <el-switch :model-value="!keepLossless" @update:model-value="keepLossless = !$event" />
         <span class="keep-label">压制成功后删除无损 MKV，压制版沿用原来的文件名</span>

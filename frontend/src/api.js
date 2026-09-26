@@ -121,6 +121,8 @@ export const api = {
     request('/api/queue/pause', { method: 'POST', body: JSON.stringify({ paused }) }),
   cpuYield: (enabled) =>
     request('/api/queue/cpu-yield', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  encodePick: (body) =>
+    request('/api/encode/pick', { method: 'POST', body: JSON.stringify(body) }),
   memoryLimit: (gb) =>
     request('/api/queue/memory-limit', { method: 'POST', body: JSON.stringify({ gb }) }),
   reorderQueue: (ids) =>

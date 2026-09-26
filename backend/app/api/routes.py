@@ -14,6 +14,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import ValidationError
 
 from app.core import config, joblog, server
 from app.core.cache import job_dir
@@ -1391,6 +1392,39 @@ def encode_probe(path: str) -> dict:
     if info["video"] is None:
         raise HTTPException(status_code=400, detail="这个文件里没有画面，没有可压制的视频")
     return info
+
+
+@router.post("/encode/pick")
+def encode_pick(body: dict) -> dict:
+    """按画面自动选编码, previewed: the 压制 page asks as soon as a file is
+    chosen, so the choice is in the form before it is queued and can still
+    be changed. The same judgement an auto encode makes when it starts
+    (encodepick), on the settings as they stand; *options* is the form, of
+    which only the picture's fields are replaced.
+    """
+    import base64
+
+    from app.services import encodepick
+
+    path = Path(str(body.get("path", "")).strip())
+    if not path.is_file():
+        raise HTTPException(status_code=400, detail=f"找不到这个文件：{path}")
+    try:
+        options = EncodeOptions(**(body.get("options") or {}))
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        verdict, image = encodepick.analyze(path, config.load_settings())
+        picked = encodepick.apply(verdict, options)
+        encode.check_options(picked)
+    except Exception as exc:  # noqa: BLE001 — the page shows it and keeps its own
+        raise HTTPException(status_code=400, detail=f"视觉模型没判断出来：{exc}") from exc
+    return {
+        "content": verdict.content, "grain": verdict.grain, "reason": verdict.reason,
+        "summary": verdict.describe(), "options": picked.model_dump(),
+        "described": encode.describe_options(picked),
+        "image": "data:image/jpeg;base64," + base64.b64encode(image).decode(),
+    }
 
 
 @router.post("/encode/scan")

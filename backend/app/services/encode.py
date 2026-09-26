@@ -249,18 +249,23 @@ def describe_options(opts: EncodeOptions) -> str:
     """One line for the queue and the log: 'H.265 10bit（x265）· CRF 22 · medium · …'."""
     parts = []
     if opts.video_codec == mux.COPY:
-        parts.append("画面原样")
+        parts.append("按画面自动选编码（判断不了时画面原样）" if opts.auto_pick else "画面原样")
     else:
         depth = "10bit" if wants_ten_bit(opts) else "8bit"
         family = _family(opts.video_codec) or opts.video_codec
-        parts.append(f"{family} {depth}（{encoder_name(opts.video_codec)}）")
+        picture = [f"{family} {depth}（{encoder_name(opts.video_codec)}）"]
         if opts.rate_control == "bitrate":
-            parts.append(f"{opts.bitrate_kbps} kbps")
+            picture.append(f"{opts.bitrate_kbps} kbps")
         else:
-            parts.append(f"{quality_scale(opts.video_codec)[3]} {opts.quality}")
-        parts.append(opts.preset)
+            picture.append(f"{quality_scale(opts.video_codec)[3]} {opts.quality}")
+        picture.append(opts.preset)
         if opts.tune:
-            parts.append(f"tune {opts.tune}")
+            picture.append(f"tune {opts.tune}")
+        if opts.auto_pick:
+            # decided when the encode starts (encodepick); these are the fallback
+            parts.append(f"按画面自动选编码（判断不了时 {' · '.join(picture)}）")
+        else:
+            parts.extend(picture)
         if opts.max_height:
             parts.append(f"≤{opts.max_height}p")
         if opts.deinterlace != "auto":

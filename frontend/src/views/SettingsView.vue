@@ -383,7 +383,7 @@ async function testVision() {
         <el-form-item label="视觉模型">
           <el-input v-model="settings.llm.vision_model" placeholder="（可选）qwen-vl-plus / gpt-4o-mini / glm-4v …" />
           <span class="hint">
-            画面翻译、以及「图形字幕 OCR」选用视觉引擎时使用；留空则用上方主模型。
+            画面翻译、「图形字幕 OCR」选用视觉引擎时、以及压制的「按画面选」使用；留空则用上方主模型。
             DeepSeek 等纯文本模型不支持这两项。
           </span>
         </el-form-item>
@@ -937,7 +937,10 @@ async function testVision() {
 
     <el-card v-if="settings.encode" shadow="never" class="section">
       <template #header>🎞️ 视频压制（默认参数）</template>
-      <EncodeFields v-model="settings.encode" />
+      <EncodeFields
+        v-model="settings.encode"
+        auto-hint="开着时，压制页和原盘全流程默认按画面选编码。要一个能看图的模型：上面「翻译模型」里的视觉模型（留空就用主模型），「测试视觉模型」能通过即可；每个文件一次调用、一张图。判断不了时用下面这些参数。"
+      />
       <div class="model-notes">
         <p><strong>📌 说明</strong></p>
         <p>· 「压制」页和「原盘」页「加入列队并压制、做字幕」打开时从这里的参数出发，每次加入列队前仍可改；

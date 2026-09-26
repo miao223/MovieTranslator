@@ -37,7 +37,7 @@ export function defaultEncodeOptions() {
     bitrate_kbps: 6000, preset: 'medium', tune: '', bit_depth: 'auto', max_height: 0,
     deinterlace: 'auto', audio_codec: 'eac3', audio_scope: 'lossless',
     audio_bitrate_kbps: 0, audio_mixdown: 'keep', audio_languages: [],
-    subtitles: 'all', subtitle_languages: [],
+    subtitles: 'all', subtitle_languages: [], auto_pick: false,
   }
 }
 

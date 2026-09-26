@@ -301,6 +301,12 @@ class EncodeOptions(BaseModel):
     audio_languages: list[str] = []
     subtitles: Literal["all", "languages", "none"] = "all"
     subtitle_languages: list[str] = []
+    # 按画面自动选编码 (services/encodepick.py): before the encode starts a
+    # vision model looks at a contact sheet of the film and says what it is
+    # — animation or live action, how grainy — and video_codec, preset,
+    # quality, tune and rate_control are taken from the measured table
+    # instead of from here. If it cannot say, the fields above are used.
+    auto_pick: bool = False
 
 
 class AppSettings(BaseModel):

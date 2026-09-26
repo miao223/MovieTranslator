@@ -221,6 +221,78 @@ def test_an_encode_logs_how_much_memory_it_took(api, tmp_path, monkeypatch):
     assert any(line.startswith("压制占用内存峰值") for line in logged)
 
 
+def _vision(monkeypatch, *replies):
+    """Every vision call in the app goes to a scripted fake."""
+    from app.services import translator
+    from tests.test_ocr import FakeVision
+
+    fake = FakeVision(list(replies))
+    monkeypatch.setattr(translator, "make_vision_client", lambda *a, **k: fake)
+    return fake
+
+
+def test_an_auto_encode_is_judged_when_it_starts_and_named_after_the_choice(
+        api, tmp_path, monkeypatch):
+    """A folder's worth is queued with auto_pick on: each file is looked at
+    as its encode starts, and its name follows what was chosen."""
+    import json
+
+    client, manager = api
+    fake = _vision(monkeypatch, json.dumps(
+        {"content": "animation", "grain": "none", "reason": "线条干净的动画"}))
+    source = make_source(tmp_path / "Film.mkv", frames=24)
+    r = client.post("/api/queue/encode", json={
+        "source": str(source), "options": {**FAST, "auto_pick": True}})
+    assert r.status_code == 200, r.text
+    from app.services import jobqueue
+    assert "按画面自动选编码（判断不了时 H.264" in jobqueue.describe_entry(manager.store.entries[0])
+    entry, job = _run(manager)
+    assert entry.status == "done", job.status.error
+    assert entry.result_files == [str(tmp_path / "Film.AV1.mkv")]
+    with av.open(entry.result_files[0]) as c:
+        assert c.streams.video[0].codec_context.name in ("av1", "libdav1d", "libaom-av1")
+    logged = [e.log for e in job.events if e.log]
+    assert any(line.startswith("按画面自动选编码：动画，画面干净（线条干净的动画） → AV1")
+               for line in logged)
+    assert len(fake.calls) == 1
+
+
+def test_an_auto_encode_the_model_cannot_judge_runs_as_the_form_says(api, tmp_path, monkeypatch):
+    client, manager = api
+    _vision(monkeypatch, ConnectionError("relay down"))
+    source = make_source(tmp_path / "Film.mkv", frames=24)
+    client.post("/api/queue/encode", json={"source": str(source),
+                                           "options": {**FAST, "auto_pick": True}})
+    entry, job = _run(manager)
+    assert entry.status == "done", job.status.error
+    assert entry.result_files == [str(tmp_path / "Film.H264.mkv")]
+    logged = [e.log for e in job.events if e.log]
+    assert any(line.startswith("⚠ 按画面自动选编码没做成（relay down）") for line in logged)
+
+
+def test_the_page_can_see_the_choice_before_queueing(api, tmp_path, monkeypatch):
+    import json
+
+    client, _ = api
+    source = make_source(tmp_path / "Film.mkv", frames=48)
+    _vision(monkeypatch, json.dumps({"content": "live", "grain": "heavy", "reason": "胶片颗粒明显"}))
+    r = client.post("/api/encode/pick", json={
+        "path": str(source), "options": {"audio_codec": "flac", "auto_pick": True}})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["summary"] == "真人实拍，颗粒重" and body["reason"] == "胶片颗粒明显"
+    options = body["options"]
+    assert (options["video_codec"], options["preset"], options["quality"], options["tune"]) == (
+        "libx265", "slow", 18, "grain")
+    assert options["audio_codec"] == "flac" and options["auto_pick"] is False
+    assert body["image"].startswith("data:image/jpeg;base64,")
+    missing = client.post("/api/encode/pick", json={"path": str(tmp_path / "no.mkv")})
+    assert missing.status_code == 400
+    _vision(monkeypatch, ConnectionError("relay down"))
+    down = client.post("/api/encode/pick", json={"path": str(source)})
+    assert down.status_code == 400 and "relay down" in down.json()["detail"]
+
+
 # -------------------------------------------------- the 原盘 page's third button
 
 

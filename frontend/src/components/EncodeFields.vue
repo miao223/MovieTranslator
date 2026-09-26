@@ -18,6 +18,8 @@ const props = defineProps({
   lockContainer: { type: Boolean, default: false },
   // one probed file (GET /api/encode/probe), for the hints that depend on it
   source: { type: Object, default: null },
+  // what 按画面选 means where this form is shown (settings / one file / batch)
+  autoHint: { type: String, default: '' },
 })
 
 const encoders = ref([])
@@ -129,6 +131,12 @@ const ntscInterlaced = computed(() => video.value && video.value.interlaced >= 0
       <div v-if="opts.container === 'mp4'" class="hint block warn">
         MP4 装不下字幕轨和字体附件，片源里的这些会被略去；需要保留请用 MKV。
       </div>
+    </el-form-item>
+
+    <el-form-item label="按画面选">
+      <el-switch v-model="opts.auto_pick" />
+      <span class="hint">让视觉模型看一张截图拼图，判断是动画还是真人、颗粒轻重，按实测选编码、速度和质量</span>
+      <div v-if="opts.auto_pick && autoHint" class="hint block">{{ autoHint }}</div>
     </el-form-item>
 
     <el-form-item label="视频编码">

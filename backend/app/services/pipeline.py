@@ -878,7 +878,7 @@ class JobManager:
         been reopened and checked (encode.verify). Anything short of that
         keeps both files and says why.
         """
-        from app.services import cpuyield, encode, memguard
+        from app.services import cpuyield, encode, encodepick, memguard
 
         settings = _settings_for(job)
         source = Path(req.source)
@@ -890,6 +890,14 @@ class JobManager:
 
         def note(message: str) -> None:
             job.publish("encoding", job.status.progress, log=message)
+
+        if req.options.auto_pick:
+            # before anything that depends on the codec: the file's name
+            # (片名.AV1.mkv) and the tag that finds a finished encode again.
+            # A copy, not the queue entry's own request, which keeps asking.
+            job.publish("encoding", 0, message="视觉模型正在看画面，选编码…")
+            req = req.model_copy(update={"options": encodepick.decide(
+                source, req.options, settings, log=note)})
 
         finished = encode.existing_encode(source, req)
         if finished is not None:

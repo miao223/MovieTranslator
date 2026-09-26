@@ -68,6 +68,44 @@ async function probe() {
   }
 }
 
+// ----------------------------------------------- 按画面选, for one file
+//
+// Asked as soon as the file is known, so the choice is in the form before
+// it is queued — and can still be changed there. What is queued is the
+// form as it stands (auto_pick off), never a second judgement at run time.
+// A folder and the 原盘 page's full pipeline judge each file as it starts.
+const pick = ref(null)              // /api/encode/pick's answer, for pick.path
+const picking = ref(false)
+const pickError = ref('')
+const PICKED = ['video_codec', 'preset', 'quality', 'tune', 'rate_control']
+
+async function runPick() {
+  const file = info.value?.path
+  if (!file) return
+  picking.value = true
+  pickError.value = ''
+  try {
+    const r = await api.encodePick({ path: file, options: opts.value })
+    if (info.value?.path !== file) return      // another file was chosen meanwhile
+    for (const k of PICKED) opts.value[k] = r.options[k]
+    pick.value = { ...r, path: file }
+  } catch (e) {
+    pick.value = null
+    pickError.value = e.message
+  } finally {
+    picking.value = false
+  }
+}
+
+watch([info, () => opts.value.auto_pick], () => {
+  if (mode.value !== 'single' || !info.value) return
+  if (!opts.value.auto_pick) {
+    pickError.value = ''
+    return
+  }
+  if (pick.value?.path !== info.value.path && !picking.value) runPick()
+})
+
 // ------------------------------------------------------- a whole folder
 const folder = ref('')
 const recursive = ref(true)
@@ -132,7 +170,7 @@ const busy = ref(false)
 const enqueued = ref(null)          // { position, count, subtitles }
 const subDialog = ref(false)
 
-const canQueue = computed(() => !busy.value
+const canQueue = computed(() => !busy.value && !picking.value
   && (!custom.value || !!customDir.value.trim())
   && (mode.value === 'single' ? !!info.value : picked.value.length > 0))
 
@@ -142,7 +180,9 @@ async function enqueue(subtitles = null) {
   try {
     const out = { output_mode: outputMode.value, output_dir: custom.value ? customDir.value.trim() : '' }
     const resp = mode.value === 'single'
-      ? await api.enqueueEncode({ source: info.value.path, options: opts.value, ...out, subtitles })
+      // the form already holds what the picture was judged to need
+      ? await api.enqueueEncode({ source: info.value.path, options: { ...opts.value, auto_pick: false },
+        ...out, subtitles })
       : await api.enqueueEncodeBatch({
         path: scan.value.path, files: picked.value.map((f) => f.path),
         options: opts.value, ...out, subtitles,
@@ -323,6 +363,26 @@ function audioLine(a) {
           <template v-if="info.attachments">附件 {{ info.attachments }} 个（字体等）</template>
         </div>
       </div>
+      <div v-if="opts.auto_pick" class="pick" v-loading="picking">
+        <template v-if="picking">🤖 视觉模型正在看画面…</template>
+        <template v-else-if="pick && pick.path === info.path">
+          <el-image
+            :src="pick.image" :preview-src-list="[pick.image]" fit="cover" class="pick-sheet"
+            title="模型看到的拼图：上两行 6 个时间点的整帧，最下一行 1:1 原始像素"
+          />
+          <div>
+            🤖 视觉模型判断：<strong>{{ pick.summary }}</strong>
+            <template v-if="pick.reason">（{{ pick.reason }}）</template>
+            <div class="file-meta">已填进下面的压制参数：{{ pick.described }}。可以再改。</div>
+          </div>
+        </template>
+        <el-alert v-else-if="pickError" type="warning" :closable="false" show-icon>
+          <template #title>
+            {{ pickError }}；用下面的参数。
+            <el-link type="primary" :underline="false" @click="runPick">重新判断</el-link>
+          </template>
+        </el-alert>
+      </div>
     </template>
   </el-card>
 
@@ -376,7 +436,30 @@ function audioLine(a) {
       <span class="card-title">压制参数</span>
       <span class="hint">默认值在「设置 → 视频压制」里改；这里改的只对这次有效</span>
     </template>
-    <EncodeFields v-model="opts" :source="mode === 'single' ? info : null" />
+    <EncodeFields
+      v-model="opts" :source="mode === 'single' ? info : null"
+      :auto-hint="mode === 'single'
+        ? '选好文件就先让视觉模型看一眼，判断结果填进下面的参数，加入列队前还能改。'
+        : '每个文件开压前各让视觉模型看一次画面（每个文件一次调用）；判断不了时用下面这些参数。'"
+    />
+    <div class="advice">
+      <div class="advice-title">想尽量保住画质，怎么选（实测：1080p 蓝光里颗粒重的电影、真人剧集、动画各一段，VMAF 打分；速度按 6 核 12 线程的 CPU）</div>
+      <ul>
+        <li>
+          <strong>真人电影、剧集</strong>：H.265、速度「较慢」、CRF 18，和原片几乎看不出区别。颗粒是片子质感的（老胶片、颗粒明显的电影），「更多选项 → 内容类型」再选「保留胶片颗粒」：最接近原片，体积约翻倍。
+        </li>
+        <li>
+          <strong>动画</strong>：AV1、速度「最慢」、CRF 25：分数最高，体积不到 H.265 的一半，还快 3 倍。颗粒或噪点重的老动画按真人片选。
+        </li>
+        <li>
+          <strong>不建议</strong>：真人片用 AV1（会把颗粒当噪声抹掉，放大看皮肤发「塑料」，CRF 降到 18 也追不上）；H.264（除了颗粒极重的片子，同画质体积大得多）。
+        </li>
+        <li>
+          <strong>要多久</strong>：H.265 较慢约 4–6 帧/秒，两小时的电影 8–12 小时，加「保留胶片颗粒」13–16 小时；嫌慢用「中等」+ CRF 18，快 2.6 倍、画质略低。AV1 最慢压动画约 25 帧/秒，一集 24 分钟约 25 分钟。
+        </li>
+      </ul>
+      <div>打开上面的「按画面选」，就由视觉模型看截图、按这张表替你选。</div>
+    </div>
   </el-card>
 
   <el-card shadow="never" class="block">
@@ -486,6 +569,40 @@ function audioLine(a) {
   font-size: 12px;
   color: var(--el-text-color-secondary);
   line-height: 1.6;
+}
+.pick {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 10px;
+  min-height: 32px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--el-text-color-regular);
+}
+.pick-sheet {
+  width: 192px;
+  height: 108px;
+  flex: none;
+  border-radius: var(--app-radius);
+  cursor: zoom-in;
+}
+.advice {
+  margin-top: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--app-radius);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--el-text-color-secondary);
+}
+.advice-title {
+  font-weight: 600;
+  color: var(--el-text-color-regular);
+}
+.advice ul {
+  margin: 4px 0;
+  padding-left: 18px;
 }
 .footer {
   display: flex;
