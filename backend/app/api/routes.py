@@ -22,6 +22,8 @@ from app.core.auth import MCP_PREFIX
 from app.core.media import SOURCE_EXTS, disc_root_of, kind_of, scan_media
 from app.models.schemas import (
     AppSettings,
+    AudioBatchRequest,
+    AudioRequest,
     AudioTrack,
     BatchRequest,
     BatchStatus,
@@ -47,7 +49,8 @@ from app.models.schemas import (
     SubtitleTrack,
 )
 from app.services import (
-    audio, cpuyield, encode, jobqueue, mcp_server, memguard, mux, series, subsource,
+    audio, audioextract, cpuyield, encode, jobqueue, mcp_server, memguard, mux, series,
+    subsource,
 )
 from app.services.jobqueue import queue_manager
 from app.services.batch import batch_manager
@@ -1536,6 +1539,108 @@ def enqueue_encode_batch(req: EncodeBatchRequest) -> dict:
         for request in requests:
             added.append(queue_manager.store.add_encode(
                 request, settings, group_id=group_id, group_title=str(folder), then=then))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _enqueued(added, settings)
+
+
+# ------------------------------------------------------------------- audio
+
+
+@router.get("/audio/probe")
+def audio_probe(path: str) -> dict:
+    """One file for the 音频 page: its length and audio tracks."""
+    source = _clean_path(path)
+    if not source.is_file():
+        raise HTTPException(status_code=400, detail=f"文件不存在：{source}")
+    try:
+        return audioextract.probe(source)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"读不出这个文件的音轨：{exc}") from exc
+
+
+@router.post("/audio/scan")
+def audio_scan(req: EncodeScanRequest) -> dict:
+    """The 音频 page's batch mode: every video in a folder, headers only.
+    Videos only — the audio files in it are likely our own earlier output."""
+    folder = _clean_path(req.path)
+    if not folder.is_dir():
+        raise HTTPException(status_code=400, detail=f"不是有效目录：{folder}")
+    found, discs = _video_files(folder, req.recursive)
+    if len(found) > MAX_ENCODE_FILES:
+        raise HTTPException(status_code=400, detail=(
+            f"这个文件夹里有 {len(found)} 个视频，一次最多 {MAX_ENCODE_FILES} 个，"
+            f"请选一个小一点的文件夹"))
+    files, skipped = [], []
+    for path in found:
+        try:
+            info = audioextract.probe(path)
+        except Exception as exc:  # noqa: BLE001
+            skipped.append({"path": str(path), "reason": f"读不出音轨：{exc}"})
+            continue
+        info["relative"] = str(path.relative_to(folder))
+        files.append(info)
+    return {"path": str(folder), "files": files, "skipped": skipped, "discs": discs}
+
+
+@router.post("/queue/audio")
+def enqueue_audio(req: AudioRequest) -> dict:
+    """Add one video's audio extraction to the queue."""
+    source = _clean_path(req.source)
+    if not source.is_file():
+        raise HTTPException(status_code=400, detail=f"文件不存在：{source}")
+    try:
+        tracks = audio.list_tracks(source)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"读不出这个文件的音轨：{exc}") from exc
+    if req.track is not None and all(t["index"] != req.track for t in tracks):
+        raise HTTPException(status_code=400, detail=f"这个文件里没有音轨 #{req.track}")
+    custom = _custom_dir(req.output_mode, req.output_dir)
+    request = req.model_copy(update={
+        "source": str(source), "output_dir": str(custom) if custom is not None else ""})
+    settings = jobqueue.snapshot()
+    try:
+        entry = queue_manager.store.add_audio(request, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _enqueued([entry], settings)
+
+
+@router.post("/queue/audio-batch")
+def enqueue_audio_batch(req: AudioBatchRequest) -> dict:
+    """The batch mode's 加入列队: one entry per file, one group. Tracks are
+    chosen by language, since each file numbers its own; a file without
+    that language takes its default track and its log says so."""
+    folder = _clean_path(req.path)
+    files = list(dict.fromkeys(req.files))
+    if not files:
+        raise HTTPException(status_code=400, detail="没有勾选任何文件")
+    custom = _custom_dir(req.output_mode, req.output_dir)
+    requests, problems = [], []
+    for name in files:
+        source = _clean_path(name)
+        if not source.is_file():
+            problems.append(f"{source.name}：文件不存在")
+            continue
+        out_dir = ""
+        if custom is not None:
+            try:
+                out_dir = str(custom / source.parent.relative_to(folder))
+            except ValueError:
+                out_dir = str(custom)
+        requests.append(AudioRequest(source=str(source), options=req.options,
+                                     language=req.language.strip(),
+                                     output_mode=req.output_mode, output_dir=out_dir))
+    if problems:
+        raise HTTPException(status_code=400, detail="；".join(problems))
+    _queue_room(len(requests))
+    group_id = uuid.uuid4().hex[:12]
+    settings = jobqueue.snapshot()
+    added = []
+    try:
+        for request in requests:
+            added.append(queue_manager.store.add_audio(
+                request, settings, group_id=group_id, group_title=str(folder)))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _enqueued(added, settings)

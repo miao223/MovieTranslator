@@ -93,7 +93,7 @@ def language_name(code: str) -> str:
     return _LANG_NAMES.get(canon, canon)
 
 
-def _track_info(stream) -> dict:
+def track_info(stream) -> dict:
     cc = stream.codec_context
     layout = getattr(cc, "layout", None)
     channels = getattr(layout, "nb_channels", 0) or 0
@@ -158,7 +158,7 @@ def list_tracks(video_path: str | Path) -> list[dict]:
     """
     video_path = Path(video_path)
     with av.open(str(video_path)) as container:
-        tracks = [_track_info(s) for s in container.streams.audio]
+        tracks = [track_info(s) for s in container.streams.audio]
     if not tracks:
         raise ValueError(f"视频中没有音频流: {video_path.name}")
     return tracks
@@ -192,7 +192,7 @@ def describe_media(video_path: str | Path) -> list[str]:
                 f"视频流        : #{stream.index} {cc.name} "
                 f"{cc.width}x{cc.height} {float(stream.average_rate or 0):.3f} fps"
             )
-        for track in (_track_info(s) for s in container.streams.audio):
+        for track in (track_info(s) for s in container.streams.audio):
             lines.append(f"音轨          : {describe_track(track)} @{track['sample_rate']}Hz")
         # via subsource so the log names these the way the picker does —
         # same language table, and it says which ones hold no readable text
@@ -244,8 +244,34 @@ def extract_audio(
     index is not an audio stream, or so little was decoded that transcribing
     it would be pointless (see MIN_YIELD_RATIO).
     """
+    return write_track(video_path, out_wav, progress=progress,
+                       track_index=track_index, log=log)
+
+
+def write_track(
+    video_path: str | Path,
+    out_path: str | Path,
+    progress: Optional[ProgressFn] = None,
+    track_index: Optional[int] = None,
+    log: Optional[LogFn] = None,
+    *,
+    fmt: str = "wav",
+    codec: str = "pcm_s16le",
+    bit_rate: int = 0,
+    metadata: Optional[dict] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Path:
+    """extract_audio, into any 16 kHz mono format: the WAV the pipeline
+    transcribes, or the FLAC / Opus of the 音频 page (audioextract.py).
+
+    One loop for both, so the lessons in it (a clock that runs backwards,
+    damaged packets, a file that breaks off halfway) are written once. The
+    defaults are the WAV, byte for byte what this function wrote before it
+    took any of these parameters. *should_cancel* is asked once per packet
+    and raises InterruptedError; the caller owns the half-written file.
+    """
     video_path = Path(video_path)
-    out_wav = Path(out_wav)
+    out_wav = Path(out_path)
 
     with av.open(str(video_path)) as in_container:
         if not in_container.streams.audio:
@@ -265,10 +291,18 @@ def extract_audio(
         codec_name = (in_stream.codec_context.name or "未知").upper()
         duration = float(in_container.duration / av.time_base) if in_container.duration else 0.0
 
-        with av.open(str(out_wav), mode="w", format="wav") as out_container:
-            out_stream = out_container.add_stream("pcm_s16le", rate=SAMPLE_RATE)
+        with av.open(str(out_wav), mode="w", format=fmt) as out_container:
+            for key, value in (metadata or {}).items():
+                out_container.metadata[key] = value
+            out_stream = out_container.add_stream(codec, rate=SAMPLE_RATE)
             out_stream.layout = "mono"
-            resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+            if bit_rate:
+                out_stream.bit_rate = bit_rate
+            # the WAV's s16 is also its encoder's own; a FLAC / Opus encoder
+            # names what it takes (PyAV then cuts the frames to its size)
+            resampler = av.AudioResampler(
+                format="s16" if codec == "pcm_s16le" else out_stream.format.name,
+                layout="mono", rate=SAMPLE_RATE)
 
             decoded = bad_packets = written = rewinds = 0
             reached = 0.0
@@ -297,6 +331,8 @@ def extract_audio(
 
             demuxer = in_container.demux(in_stream)
             while True:
+                if should_cancel is not None and should_cancel():
+                    raise InterruptedError
                 try:
                     packet = next(demuxer)
                 except StopIteration:

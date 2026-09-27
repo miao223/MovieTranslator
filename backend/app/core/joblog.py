@@ -260,6 +260,22 @@ class JobLogWriter:
             lines.append(f"本卷名称      : {request.own_name}（多卷合集里按盘编号的文件用它命名）")
         self.section("任务参数", lines)
 
+    def write_audio_request(self, request) -> None:
+        """任务参数 for an 音频 job (AudioRequest)."""
+        from app.services.audioextract import describe
+
+        where = ("原文件旁边" if request.output_mode == "beside"
+                 else f"指定文件夹 {request.output_dir}")
+        track = (f"#{request.track}" if request.track is not None
+                 else f"按语言 {request.language}（没有就用默认音轨）" if request.language
+                 else "默认音轨")
+        self.section("任务参数", [
+            "任务类型      : 提取音频",
+            f"格式          : {describe(request.options)}",
+            f"音轨          : {track}",
+            f"输出位置      : {where}",
+        ])
+
     def write_encode_request(self, request) -> None:
         """任务参数 for a 压制 job (EncodeRequest)."""
         from app.services.encode import describe_options

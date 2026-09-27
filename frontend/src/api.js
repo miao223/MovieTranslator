@@ -110,6 +110,13 @@ export const api = {
     request('/api/queue/encode', { method: 'POST', body: JSON.stringify(payload) }),
   enqueueEncodeBatch: (payload) =>
     request('/api/queue/encode-batch', { method: 'POST', body: JSON.stringify(payload) }),
+  audioProbe: (path) => request(`/api/audio/probe?path=${encodeURIComponent(path)}`),
+  audioScan: (payload) =>
+    request('/api/audio/scan', { method: 'POST', body: JSON.stringify(payload) }),
+  enqueueAudio: (payload) =>
+    request('/api/queue/audio', { method: 'POST', body: JSON.stringify(payload) }),
+  enqueueAudioBatch: (payload) =>
+    request('/api/queue/audio-batch', { method: 'POST', body: JSON.stringify(payload) }),
 
   // ------------------------------------------------------------- 列队
   queue: () => request('/api/queue'),

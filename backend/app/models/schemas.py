@@ -658,6 +658,54 @@ class EncodeScanRequest(BaseModel):
     recursive: bool = True
 
 
+class AudioOptions(BaseModel):
+    """What the 音频 page makes of a video's sound (services/audioextract.py):
+    one track, 16 kHz mono — what the pipeline itself turns every source into
+    before transcribing (audio.SAMPLE_RATE).
+
+    FLAC is the default — the user's choice: lossless, it decodes to exactly
+    the WAV a direct translation of the video would transcribe, so going
+    through the file changes nothing. Opus is the small option (about a
+    sixth the size) and costs a little: silero found 97.6% of the same
+    speech on Opus 24k.
+    """
+
+    format: Literal["flac", "opus"] = "flac"
+    # Opus only; 0 = its default (audioextract.FORMATS)
+    bitrate_kbps: int = Field(0, ge=0, le=128)
+
+
+class AudioRequest(BaseModel):
+    """Extract one video's audio (音频). Queue-only, like an encode; also the
+    body of POST /api/queue/audio."""
+
+    source: str
+    options: AudioOptions = AudioOptions()
+    # container stream index, as the page's track list showed it; None =
+    # by `language`, else the default track (audio.pick_track)
+    track: Optional[int] = None
+    # ISO 639 tag — what a batch chooses by, since each file numbers its
+    # tracks its own way. A file without it falls back to its default track.
+    language: str = ""
+    # "beside": 片名.opus next to the video; "custom": output_dir
+    output_mode: Literal["beside", "custom"] = "beside"
+    # for "custom": this file's folder — a batch keeps each file's
+    # sub-folder under the chosen one, worked out when it is queued
+    output_dir: str = ""
+
+
+class AudioBatchRequest(BaseModel):
+    """POST /api/queue/audio-batch: the files the 音频 page's batch mode
+    ticked, from one scanned folder."""
+
+    path: str
+    files: list[str] = []
+    options: AudioOptions = AudioOptions()
+    language: str = ""
+    output_mode: Literal["beside", "custom"] = "beside"
+    output_dir: str = ""
+
+
 class DiscStreamInfo(BaseModel):
     kind: str
     codec: str
@@ -750,6 +798,7 @@ JobStage = Literal[
     "remuxing",
     # re-encoding a video (EncodeRequest) — likewise
     "encoding",
+    # the translation's first step, and all of an AudioRequest's
     "extracting",
     # reading a subtitle the release already carries, in place of
     # extracting + transcribing (text_source="subtitle")
@@ -840,7 +889,8 @@ class QueueEntry(BaseModel):
     kind: str = "job"          # a free string, not a Literal: an entry from a
                                # newer version should report itself, not fail.
                                # "job" = translate (request), "disc" = remux
-                               # (disc), "encode" = re-encode (encode)
+                               # (disc), "encode" = re-encode (encode),
+                               # "audio" = extract the audio (audio)
     status: Literal["queued", "running", "done", "failed", "cancelled"] = "queued"
     title: str = ""            # survives even when the rest cannot be parsed
     created_at: float = 0.0
@@ -850,6 +900,7 @@ class QueueEntry(BaseModel):
     request: Optional[JobRequest] = None
     disc: Optional[DiscRequest] = None
     encode: Optional[EncodeRequest] = None
+    audio: Optional[AudioRequest] = None
     settings: Optional[AppSettings] = None
     error: str = ""
     note: str = ""

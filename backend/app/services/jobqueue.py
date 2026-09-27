@@ -44,7 +44,7 @@ from pydantic import ValidationError
 from app.core import config
 from app.services import cpuyield, memguard
 from app.models.schemas import (
-    AppSettings, DiscRequest, EncodeRequest, JobRequest, QueueEntry,
+    AppSettings, AudioRequest, DiscRequest, EncodeRequest, JobRequest, QueueEntry,
 )
 
 # Terminal states, the same three the rest of the app uses (batch.TERMINAL).
@@ -125,6 +125,8 @@ def describe_entry(entry: QueueEntry) -> str:
         if entry.origin:
             line += " · 原盘封装后自动加入"
         return line
+    if entry.kind == "audio":
+        return describe_audio(entry.audio)
     line = describe(entry.request)
     if entry.origin:
         line += (" · 压制后自动加入" if entry.origin_kind == "encode"
@@ -145,6 +147,22 @@ def describe_encode(request: Optional[EncodeRequest]) -> str:
         parts.append(f"输出到 {request.output_dir}")
     else:
         parts.append("放在原文件旁边")
+    return " · ".join(parts)
+
+
+def describe_audio(request: Optional[AudioRequest]) -> str:
+    """"提取音频 · Opus 24 kbps · 16 kHz 单声道 · 音轨 #2 · 放在原文件旁边"."""
+    if request is None:
+        return ""
+    from app.services.audioextract import describe as describe_options
+
+    parts = ["提取音频", describe_options(request.options)]
+    if request.track is not None:
+        parts.append(f"音轨 #{request.track}")
+    elif request.language:
+        parts.append(f"{request.language} 音轨")
+    parts.append(f"输出到 {request.output_dir}" if request.output_mode == "custom"
+                 else "放在原文件旁边")
     return " · ".join(parts)
 
 
@@ -267,6 +285,8 @@ def _payload(entry: QueueEntry):
         return entry.disc
     if entry.kind == "encode":
         return entry.encode
+    if entry.kind == "audio":
+        return entry.audio
     return entry.request
 
 
@@ -453,6 +473,25 @@ class QueueStore:
             self.save()
             return entry
 
+    def add_audio(self, request: AudioRequest, settings: AppSettings,
+                  group_id: str = "", group_title: str = "") -> QueueEntry:
+        with self.lock:
+            if sum(1 for e in self.entries if e.status == "queued") >= MAX_QUEUED:
+                raise ValueError(f"列队已满（最多 {MAX_QUEUED} 条等待中的任务）")
+            entry = QueueEntry(
+                id=uuid.uuid4().hex[:12],
+                kind="audio",
+                title=request.source,
+                created_at=time.time(),
+                audio=request,
+                settings=settings,
+                group_id=group_id,
+                group_title=group_title,
+            )
+            self.entries.append(entry)
+            self.save()
+            return entry
+
     def remove(self, entry_id: str) -> bool:
         with self.lock:
             entry = self.get(entry_id)
@@ -618,6 +657,8 @@ class QueueManager:
                 job = job_manager.create_disc(payload, settings=settings)
             elif kind == "encode":
                 job = job_manager.create_encode(payload, settings=settings)
+            elif kind == "audio":
+                job = job_manager.create_audio(payload, settings=settings)
             else:
                 job = job_manager.create(payload, settings=settings)
         except Exception as exc:  # noqa: BLE001 — one bad file must not stop the queue
@@ -774,7 +815,7 @@ class QueueManager:
             entry.result_in_place = bool(job.status.srt_in_place)
             entry.result_files = list(job.status.outputs)
             entry.finished_at = time.time()
-            if entry.kind == "encode" and entry.status == "done":
+            if entry.kind in ("encode", "audio") and entry.status == "done":
                 # 已压制：片名.mkv（3.2 GB，原 21 GB 的 15%…）— the one line
                 # worth keeping once the job has left memory
                 entry.note = job.status.message or ""
@@ -883,6 +924,11 @@ class QueueManager:
                                             then=entry.then,
                                             origin=entry.origin,
                                             origin_kind=entry.origin_kind)
+            elif entry.kind == "audio":
+                # a finished one finds its own file (audioextract.existing)
+                new = self.store.add_audio(payload, settings,
+                                           group_id=entry.group_id,
+                                           group_title=entry.group_title)
             else:
                 new = self.store.add(payload, settings,
                                      group_id=entry.group_id,

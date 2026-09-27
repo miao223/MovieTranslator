@@ -27,6 +27,7 @@ from app.core.debuglog import DebugLog, open_debug_log
 from app.core.joblog import JobLogWriter, _settings_lines as joblog_settings_lines
 from app.models.schemas import (
     AppSettings,
+    AudioRequest,
     DiscRequest,
     EncodeRequest,
     JobRequest,
@@ -167,12 +168,15 @@ class Job:
         self.request = request
         # "job" translates a file (JobRequest); "disc" remuxes a disc's
         # titles to MKV (DiscRequest); "encode" re-encodes a video
-        # (EncodeRequest). Everything that follows the job — SSE, cancel,
-        # the log, the queue — is the same for all three.
+        # (EncodeRequest); "audio" extracts its sound (AudioRequest).
+        # Everything that follows the job — SSE, cancel, the log, the
+        # queue — is the same for all four.
         self.kind = ("disc" if isinstance(request, DiscRequest)
-                     else "encode" if isinstance(request, EncodeRequest) else "job")
+                     else "encode" if isinstance(request, EncodeRequest)
+                     else "audio" if isinstance(request, AudioRequest) else "job")
         path = (request.path if self.kind == "disc"
-                else request.source if self.kind == "encode" else request.video_path)
+                else request.source if self.kind in ("encode", "audio")
+                else request.video_path)
         self.path = path
         # A source with no picture cannot be muxed into a video and has no
         # frames to translate. Worked out here rather than only in
@@ -183,7 +187,8 @@ class Job:
         # 自己那次探测传进来，好让一个任务只开一次文件。
         self.source_kind = source_kind or (
             "disc" if self.kind == "disc"
-            else "video" if self.kind == "encode" else media.probe_kind(request.video_path))
+            else "video" if self.kind in ("encode", "audio")
+            else media.probe_kind(request.video_path))
         # 下面每一处守卫问的其实都是「有没有画面」，字幕文件与纯音频同答
         self.audio_only = (
             audio_only if audio_only is not None
@@ -357,6 +362,18 @@ class JobManager:
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job
 
+    def create_audio(self, request: AudioRequest,
+                     settings: Optional[AppSettings] = None) -> Job:
+        """An 音频 job (extract one track, small). Queue-only as well."""
+        source = Path(request.source)
+        if not source.is_file():
+            raise FileNotFoundError(f"片源文件不存在: {source}")
+        job = Job(request, audio_only=False, settings=settings, source_kind="video")
+        self._evict_old()
+        self.jobs[job.id] = job
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return job
+
     def get(self, job_id: str) -> Job:
         if job_id not in self.jobs:
             raise KeyError(job_id)
@@ -405,8 +422,9 @@ class JobManager:
         per-job directory, which the next startup wipes.
         """
         # an encode has nothing to resume from: an interrupted one starts
-        # over, and a finished one is recognised by its own file's tag
-        if job.kind == "encode" or not checkpoints_enabled():
+        # over, and a finished one is recognised by its own file's tag.
+        # An audio extraction likewise (audioextract.existing)
+        if job.kind in ("encode", "audio") or not checkpoints_enabled():
             return job_dir(job.id)
         job.checkpoint = checkpoint_key(job, _settings_for(job))
         return checkpoint_dir(job.checkpoint)
@@ -980,12 +998,79 @@ class JobManager:
             message += f"；无损版没有替换：{why}"
         job.publish("done", 100, message=message)
 
+    def _execute_audio(self, job: Job, req: AudioRequest) -> None:
+        """Extract one track to a small Opus / MP3 (音频 page).
+
+        Written as .part beside the target and renamed into place, so a
+        cancelled or failed run leaves nothing a player (or the next batch
+        scan) would take for the finished file.
+        """
+        from app.services import audioextract
+
+        source = Path(req.source)
+        job.logfile.write_environment()
+        job.logfile.write_audio_request(req)
+        job.logfile.write_media(str(source))
+        job.publish("extracting", 0, message="读取片源…")
+
+        def note(message: str) -> None:
+            job.publish("extracting", job.status.progress, log=message)
+
+        tracks = audio.list_tracks(source)
+        track = audio.pick_track(tracks, req.track, req.language)
+        if req.track is not None and track["index"] != req.track:
+            note(f"⚠ 音轨 #{req.track} 已不存在（文件可能换过），改用 {audio.describe_track(track)}")
+        elif (req.track is None and req.language
+              and track["language"] != audio.canon_language(req.language)):
+            note(f"⚠ 没有{audio.language_name(req.language)}音轨，改用 {audio.describe_track(track)}")
+        else:
+            note(f"使用 {audio.describe_track(track)}")
+
+        finished = audioextract.existing(source, req, track["index"])
+        if finished is not None:
+            job.status.outputs.append(str(finished))
+            job.publish("done", 100, message=f"已经提取过了：{finished.name}",
+                        log=f"↻ {finished.name} 带着本程序的标记：上次已经完成，这次不再提取")
+            return
+        target = audioextract.output_target(source, req)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        part = target.with_name(target.name + ".part")
+        if part.exists():
+            # left by a run that was killed outright (nothing in-process
+            # could remove it); this exact name only — see mux.embed
+            part.unlink()
+            note(f"删掉了上次中断留下的半成品 {part.name}")
+        started = time.monotonic()
+        shown = {"time": 0.0}
+
+        def progress(fraction: float) -> None:
+            now = time.monotonic()
+            if now - shown["time"] < 2 and fraction < 1:
+                return
+            shown["time"] = now
+            job.publish("extracting", 99 * fraction, message=f"提取音频 {fraction:.0%}")
+
+        note(f"开始提取 → {target.name}（{audioextract.describe(req.options)}）")
+        try:
+            audioextract.extract(source, part, req, track["index"], log=note,
+                                 progress=progress, should_cancel=job.cancel_event.is_set)
+            os.replace(part, target)
+        finally:
+            part.unlink(missing_ok=True)
+        job.status.outputs.append(str(target))
+        message = (f"已提取：{target.name}（{_size(target.stat().st_size)}，"
+                   f"用时 {_hms(time.monotonic() - started)}）")
+        job.publish("done", 100, message=message)
+
     def _execute(self, job: Job, req, workdir: Path) -> None:
         if job.kind == "disc":
             self._execute_disc(job, req, workdir)
             return
         if job.kind == "encode":
             self._execute_encode(job, req, workdir)
+            return
+        if job.kind == "audio":
+            self._execute_audio(job, req)
             return
         settings = _settings_for(job)
         self._write_diagnostics(job, req, settings)

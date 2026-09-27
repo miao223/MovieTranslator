@@ -143,8 +143,8 @@ const visible = computed(() => {
 })
 
 const baseName = (p) => (p || '').split(/[\\/]/).pop() || p
-// a remux and an encode are not translations: said with an icon
-const KIND_ICONS = { disc: '💿 ', encode: '🎞️ ' }
+// a remux, an encode and an audio extraction are not translations: said with an icon
+const KIND_ICONS = { disc: '💿 ', encode: '🎞️ ', audio: '🎵 ' }
 const waitingIds = computed(() =>
   entries.value.filter((e) => e.status === 'queued').map((e) => e.id))
 
