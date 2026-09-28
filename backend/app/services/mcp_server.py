@@ -29,7 +29,7 @@ import anyio.to_thread
 from app.core import joblog
 from app.core.config import load_settings
 from app.core.media import kind_of, scan_media
-from app.models.schemas import BatchRequest, EmbedSettings, JobRequest
+from app.models.schemas import GEMINI_ASR_MODEL, BatchRequest, EmbedSettings, JobRequest
 from app.services import audio, mux, subsource
 from app.services.batch import batch_manager
 from app.services.pipeline import manager
@@ -199,7 +199,7 @@ def build() -> Optional["FastMCP"]:
             "version": joblog.APP_VERSION,
             "asr_engine": settings.asr.engine,
             "asr_model": (
-                (settings.llm.audio_model or settings.llm.model)
+                GEMINI_ASR_MODEL
                 if settings.asr.engine == "api"
                 else settings.asr.model_path.strip() or settings.asr.model_size
             ),

@@ -88,11 +88,27 @@ def test_the_vision_endpoint_can_carry_its_own_key():
 # ------------------------------------------------------- the audio client
 
 
-def test_the_audio_model_uses_the_main_endpoint_by_default():
-    client = make_audio_client(settings(base_url="https://api.x.com/v1",
-                                        api_key="sk-main"))
-    assert str(client.base_url).startswith("https://api.x.com/v1")
-    assert client.api_key == "sk-main"
+def test_the_audio_client_goes_to_google_by_default():
+    """The listening model is fixed (gemini-3.8-flash), so an empty address
+    means Google's own endpoint — never the translator's."""
+    from app.models.schemas import GEMINI_BASE_URL
+
+    for base in ("", GEMINI_BASE_URL):
+        client = make_audio_client(settings(base_url="https://api.x.com/v1",
+                                            api_key="sk-main",
+                                            audio_base_url=base))
+        assert str(client.base_url) == GEMINI_BASE_URL
+        assert client.api_key != "sk-main"
+
+
+def test_the_audio_client_waits_long_enough_for_flex():
+    """A Flex request may queue for ~15 minutes; the SDK default is 10."""
+    from app.services.asr_api import AUDIO_TIMEOUT
+
+    client = make_audio_client(settings(audio_api_key="k"))
+    assert client.timeout == AUDIO_TIMEOUT >= 900
+    # ...and nobody else's client changes
+    assert make_vision_client(settings()).timeout != AUDIO_TIMEOUT
 
 
 def test_an_audio_endpoint_of_its_own_is_used_and_inherits_no_key():

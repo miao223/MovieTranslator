@@ -154,8 +154,18 @@ def _settings_for(job: Job) -> AppSettings:
     live = config.load_settings()
     if job.settings is None:
         return live
-    return job.settings.model_copy(update={
-        "llm": job.settings.llm.model_copy(
+    return with_live_keys(job.settings, live)
+
+
+def with_live_keys(frozen: AppSettings, live: AppSettings) -> AppSettings:
+    """A snapshot with the keys it will actually run with: today's.
+
+    Snapshots are stored without their keys (queue.json must never hold
+    one), so anything that shows a snapshot has to fill them in the same
+    way the run will — or it reports "no key" for a job that has one.
+    """
+    return frozen.model_copy(update={
+        "llm": frozen.llm.model_copy(
             update={f: getattr(live.llm, f) for f in LIVE_KEY_FIELDS}),
     })
 

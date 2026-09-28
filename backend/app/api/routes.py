@@ -21,6 +21,7 @@ from app.core.cache import job_dir
 from app.core.auth import MCP_PREFIX
 from app.core.media import SOURCE_EXTS, disc_root_of, kind_of, scan_media
 from app.models.schemas import (
+    GEMINI_ASR_MODEL,
     AppSettings,
     AudioBatchRequest,
     AudioRequest,
@@ -54,7 +55,7 @@ from app.services import (
 )
 from app.services.jobqueue import queue_manager
 from app.services.batch import batch_manager
-from app.services.pipeline import manager
+from app.services.pipeline import manager, with_live_keys
 
 router = APIRouter(prefix="/api")
 
@@ -452,7 +453,7 @@ PROBE_QUESTION = ("这段音频是一个单一的纯音。它的音调是一直�
 
 
 @router.post("/settings/test-asr-api")
-def test_asr_api(llm: LLMSettings):
+def test_asr_api(llm: LLMSettings, flex: bool = False):
     """Prove the audio endpoint works — by sending it actual audio.
 
     Two different things can be wrong and they need different answers. The
@@ -467,17 +468,25 @@ def test_asr_api(llm: LLMSettings):
     audio costs about 25 tokens a second and text alone cannot fake that.
 
     The clip is built with the engine's own encoder, the same way
-    test-vision draws its picture with ocr.py's own helpers.
+    test-vision draws its picture with ocr.py's own helpers — and it is
+    asked with the engine's own request options (thinking, and Flex when
+    the page has it on), so a relay that rejects either field says so here
+    rather than in the first window of a film. A capacity refusal is not a
+    failure: the key and the endpoint worked, Google is busy, and a job
+    would wait it out (`busy`).
     """
     import random
 
     import numpy as np
 
     from app.services import asr_api
-    from app.services.translator import make_audio_client, reply_text
+    from app.services.translator import _create, make_audio_client, reply_text
 
-    model = llm.audio_model.strip() or llm.model
-    endpoint = llm.audio_base_url.strip() or llm.base_url
+    model = GEMINI_ASR_MODEL
+    endpoint = asr_api.audio_endpoint(llm)
+    if not llm.audio_api_key.strip():
+        return {"ok": False, "model": model, "endpoint": endpoint,
+                "error": "还没有填写 Gemini API key（主接口的 key 不会被沿用）"}
 
     rate = asr_api.SAMPLE_RATE
     rising = random.choice((True, False))
@@ -488,22 +497,29 @@ def test_asr_api(llm: LLMSettings):
 
     try:
         client = make_audio_client(llm, config.load_settings().network)
-        resp = client.chat.completions.create(
+        resp = _create(
+            client,
             model=model,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": PROBE_QUESTION},
                 asr_api.audio_part(asr_api.encode_samples(clip, "mp3"), "mp3"),
             ]}],
             temperature=0,
+            **asr_api.request_options(flex),
         )
         reply = reply_text(resp)
     except Exception as exc:  # noqa: BLE001 — report connectivity errors verbatim
+        if asr_api.capacity_refusal(exc):
+            return {"ok": True, "busy": True, "flex": flex, "error": str(exc),
+                    "model": model, "endpoint": endpoint}
         return {"ok": False, "error": str(exc), "model": model, "endpoint": endpoint}
 
     said, other = ("升高", "降低") if rising else ("降低", "升高")
     usage = getattr(resp, "usage", None)
     return {
         "ok": True,
+        "busy": False,
+        "flex": flex,
         "reply": reply,
         "model": model,
         "endpoint": endpoint,
@@ -1703,6 +1719,11 @@ def queue_entry_settings(entry_id: str) -> dict:
     Reuses joblog._settings_lines so that what you approve before the run
     and what the downloadable log says during it are the same text — and
     that rendering never prints a key.
+
+    The keys are the one part a snapshot does not freeze (they are read
+    when the job starts), so they are filled in from today's settings
+    before rendering — otherwise every entry says "API key: 未配置" about a
+    job that will authenticate fine.
     """
     entry = queue_manager.store.get(entry_id)
     if entry is None:
@@ -1711,7 +1732,7 @@ def queue_entry_settings(entry_id: str) -> dict:
     if entry.settings is None:
         return {"lines": joblog._settings_lines(current), "differs": [],
                 "same_as_current": True, "unreadable": True}
-    lines = joblog._settings_lines(entry.settings)
+    lines = joblog._settings_lines(with_live_keys(entry.settings, current))
     live = joblog._settings_lines(current)
     differs = [line for line in lines if line not in live]
     return {"lines": lines, "differs": differs,

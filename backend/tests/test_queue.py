@@ -701,6 +701,29 @@ def test_the_settings_of_an_entry_can_be_read_back_without_any_key(client, setti
     assert "sk-secret" not in text
 
 
+def test_the_frozen_settings_report_the_keys_the_job_will_run_with(client, settings_file, tmp_path):
+    """Keys are not frozen — the job reads today's at start — so the view
+    must not say 未配置 about an entry that will authenticate fine."""
+    api, manager = client
+    settings_file(llm__api_key="sk-main", llm__audio_api_key="gemini-key",
+                  asr__engine="api")
+    api.post("/api/queue/jobs", json={"video_path": a_film(tmp_path),
+                                      "target_language": "中文"})
+    entry_id = manager.store.entries[0].id
+    assert manager.store.entries[0].settings.llm.audio_api_key == ""  # still not stored
+
+    body = api.get(f"/api/queue/{entry_id}/settings").json()
+    text = "\n".join(body["lines"])
+    assert "未配置" not in text
+    assert text.count("API key: 已配置") == 2      # Gemini and the translator
+    assert "gemini-key" not in text and "sk-main" not in text
+    assert body["same_as_current"] is True
+
+    settings_file(asr__engine="api")               # keys removed since
+    text = "\n".join(api.get(f"/api/queue/{entry_id}/settings").json()["lines"])
+    assert "API key: 未配置" in text
+
+
 def test_pause_is_reported_back_and_persisted(client):
     api, manager = client
     assert api.post("/api/queue/pause", json={"paused": True}).json() == {"paused": True}
@@ -1503,3 +1526,11 @@ def test_the_subtitle_a_job_read_from_is_just_another_file_it_will_not_touch(tmp
     target, taken = output_target(film, ".ja", ".srt")
     assert target.name == "film.ja.2.srt" and taken == source
     assert target.name != "film.zh.srt"
+
+
+def test_switching_flex_is_not_another_generation_of_settings():
+    """Flex changes the price and the wait, not the subtitles: flipping it
+    must not flag every queued entry, nor orphan a checkpoint."""
+    on, off = AppSettings(), AppSettings()
+    off.asr.api_flex = False
+    assert jobqueue.settings_hash(on) == jobqueue.settings_hash(off)

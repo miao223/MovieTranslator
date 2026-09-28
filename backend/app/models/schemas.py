@@ -9,6 +9,13 @@ from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------- settings
 
+# The one model the api recognition engine speaks to, and where it lives by
+# default. Everything asr_api.py knows was measured on this model — the 25
+# audio tokens a second, the timestamp format it insists on, the empty
+# replies keyed to one clip — so the choice is a constant, not a setting.
+GEMINI_ASR_MODEL = "gemini-3.8-flash"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
 
 class LLMSettings(BaseModel):
     base_url: str = "https://api.openai.com/v1"
@@ -24,13 +31,17 @@ class LLMSettings(BaseModel):
     # inside one job, so without this only one of them can be reached.
     vision_base_url: str = ""
     vision_api_key: str = ""
-    # ...and the same again for the model that listens, used when
+    # ...and the endpoint of the model that listens, used when
     # ASRSettings.engine is "api". Its own endpoint for the same reason as
     # the vision one: recognition runs at the start of a job and translation
-    # at the end, so both have to be reachable at once. Empty = the main
-    # endpoint; the key is never inherited across a different base_url.
+    # at the end, so both have to be reachable at once. The model is fixed
+    # (GEMINI_ASR_MODEL); empty base_url = Google's own endpoint, and the key
+    # is always this one — the main key is never sent to it.
+    #
+    # `audio_model` is read by nothing any more. It stays so that settings
+    # files and queue snapshots written before the model was fixed still load.
     audio_model: str = ""
-    audio_base_url: str = ""
+    audio_base_url: str = GEMINI_BASE_URL
     audio_api_key: str = ""
     temperature: float = Field(0.3, ge=0.0, le=2.0)
     # Lines translated per output batch, bounded by the model's max output
@@ -162,6 +173,15 @@ class ASRSettings(BaseModel):
     # so a film is as fast as the endpoint allows; raise it only as far as
     # the endpoint's rate limit.
     api_concurrency: int = Field(3, ge=1, le=8)
+    # Gemini's Flex tier: half price, served from capacity that standard
+    # traffic can take back. Measured 2026-09-27 on the official endpoint: 5
+    # of 9 requests answered 503 "high demand", the rest in 5–48s. A 503 is
+    # the server saying "not now", not a verdict on the audio, so under
+    # this switch it is waited out and the same request resent — never
+    # counted against the window, never split, never a gap (asr_api
+    # `capacity_refusal`). Slow, which the queue does not mind; the only way
+    # a job stops waiting is being cancelled. Off = standard price.
+    api_flex: bool = True
 
 
 class SubtitleSettings(BaseModel):

@@ -41,6 +41,14 @@ def cue_lines(seconds: float, step: float = 10.0, text="line", rate: float = 0.0
     return "\n".join(out)
 
 
+class StatusError(Exception):
+    """What the OpenAI SDK raises for an HTTP error: a message and a status."""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(f"Error code: {status_code} - {message}")
+        self.status_code = status_code
+
+
 def _clock(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{seconds % 60:06.3f}"
 
@@ -60,13 +68,16 @@ class FakeAudio:
     window length and returns the reply text.
     """
 
-    def __init__(self, replies=None, audio_tokens=True, lang="ja"):
+    def __init__(self, replies=None, audio_tokens=True, lang="ja", thinking=0):
         self.replies = list(replies) if replies is not None else None
         self.audio_tokens = audio_tokens
+        self.thinking = thinking
         self.lang = lang
         self.calls = []
         self.seconds = []
         self.parts = []
+        self.models = []
+        self.options = []
         self.chat = self
         self.completions = self
 
@@ -76,6 +87,8 @@ class FakeAudio:
         part = content[1]
         seconds = float(re.search(r"这段音频长 ([\d.]+) 秒", prompt).group(1))
         self.calls.append(messages)
+        self.models.append(model)
+        self.options.append(kw)
         self.seconds.append(seconds)
         self.parts.append(part)
 
@@ -98,6 +111,8 @@ class FakeAudio:
             int(A.AUDIO_TOKENS_PER_SECOND * seconds) + 272 if self.audio_tokens else 272
         )
         usage.completion_tokens = 120
+        # Gemini leaves thinking out of completion_tokens; only the total has it
+        usage.total_tokens = usage.prompt_tokens + usage.completion_tokens + self.thinking
         message, choice, resp = Obj(), Obj(), Obj()
         message.content = reply
         choice.message = message
@@ -609,7 +624,8 @@ def test_the_local_engine_still_goes_to_whisper(monkeypatch, wav):
 # ------------------------------------------------- the settings-page probe
 
 
-def probe(monkeypatch, reply, settings_file, prompt_tokens=None, seconds=4.0):
+def probe(monkeypatch, reply, settings_file, prompt_tokens=None, seconds=4.0,
+          llm=None, query=""):
     """Run POST /api/settings/test-asr-api against a scripted endpoint."""
     from app.main import app as fastapi_app
     from tests.conftest import local_client
@@ -619,9 +635,13 @@ def probe(monkeypatch, reply, settings_file, prompt_tokens=None, seconds=4.0):
             self.chat = self
             self.completions = self
             self.sent = None
+            self.model = None
+            self.options = None
 
         def create(self, model, messages, temperature, **kw):
             self.sent = messages
+            self.model = model
+            self.options = kw
             if isinstance(reply, Exception):
                 raise reply
 
@@ -645,8 +665,10 @@ def probe(monkeypatch, reply, settings_file, prompt_tokens=None, seconds=4.0):
                         lambda *a, **k: client)
     settings_file()
     body = local_client(fastapi_app).post(
-        "/api/settings/test-asr-api",
-        json={"base_url": "http://x/v1", "model": "m", "audio_model": "listener"},
+        "/api/settings/test-asr-api" + query,
+        json=llm if llm is not None else {
+            "base_url": "http://main/v1", "model": "m", "audio_model": "listener",
+            "audio_base_url": "http://x/v1", "audio_api_key": "k"},
     ).json()
     return body, client
 
@@ -660,7 +682,9 @@ def test_the_probe_sends_real_audio_and_checks_it_was_heard(monkeypatch,
     body, client = probe(monkeypatch, "升高", settings_file)
 
     assert body["ok"] and body["heard_it"]
-    assert body["model"] == "listener"
+    # the model is fixed: whatever an old settings file says in audio_model
+    assert body["model"] == client.model == "gemini-3.8-flash"
+    assert client.options == {"reasoning_effort": "none"}
     assert body["asked"] == "升高"
     part = client.sent[0]["content"][1]
     assert part["type"] == "input_audio" and part["input_audio"]["format"] == "mp3"
@@ -696,6 +720,36 @@ def test_a_dead_audio_endpoint_answers_ok_false_inside_a_200(monkeypatch,
     assert body["ok"] is False
     assert "connection refused" in body["error"]
     assert body["endpoint"] == "http://x/v1"
+
+
+def test_the_probe_asks_for_flex_when_the_page_has_it_on(monkeypatch, settings_file):
+    monkeypatch.setattr("random.choice", lambda options: True)
+    body, client = probe(monkeypatch, "升高", settings_file, query="?flex=true")
+    assert body["ok"] and body["flex"] is True
+    assert client.options == {"reasoning_effort": "none", "service_tier": "flex"}
+
+
+def test_a_busy_flex_tier_is_not_called_a_broken_endpoint(monkeypatch, settings_file):
+    """The key and the endpoint worked; Google is full. A job would wait."""
+    busy = StatusError(503, "This model is currently experiencing high demand.")
+    body, _ = probe(monkeypatch, busy, settings_file, query="?flex=true")
+    assert body["ok"] is True and body["busy"] is True
+    assert "high demand" in body["error"]
+
+
+def test_the_probe_wants_a_key_of_its_own(monkeypatch, settings_file):
+    """The main key belongs to the translator's provider and is never sent."""
+    body, client = probe(monkeypatch, "升高", settings_file,
+                         llm={"base_url": "http://main/v1", "api_key": "main-key"})
+    assert body["ok"] is False and "API key" in body["error"]
+    assert client.sent is None
+
+
+def test_the_probe_goes_to_google_when_no_address_is_given(monkeypatch, settings_file):
+    monkeypatch.setattr("random.choice", lambda options: True)
+    body, _ = probe(monkeypatch, "升高", settings_file,
+                    llm={"audio_base_url": "", "audio_api_key": "k"})
+    assert body["endpoint"] == A.GEMINI_BASE_URL
 
 
 # ------------------------------------------------- where a cue really starts
@@ -1064,3 +1118,118 @@ def test_the_billed_tokens_of_an_empty_reply_are_still_counted(run):
     assert usage["empty"] == 2          # one refused window each
     assert usage["calls"] == 4          # two refusals, two that answered
     assert usage["prompt"] > A.AUDIO_TOKENS_PER_SECOND * 600
+
+
+# ------------------------------------------- the request: Gemini, no thinking, Flex
+#
+# Measured 2026-09-27 on Google's endpoint: reasoning_effort="none" costs a
+# third less than the default with the same words; Flex is half price and
+# answered 503 "high demand" to 5 requests of 9.
+
+
+def test_every_window_asks_gemini_without_thinking_and_on_flex(run):
+    fake = FakeAudio()
+    run(fake)
+    assert set(fake.models) == {"gemini-3.8-flash"}
+    assert all(o == {"reasoning_effort": "none", "service_tier": "flex"}
+               for o in fake.options)
+    # never the DeepSeek-style switch: Google answers it with a 400
+    assert not any("extra_body" in o for o in fake.options)
+
+
+def test_the_model_is_fixed_whatever_an_old_settings_file_says(monkeypatch, wav):
+    monkeypatch.setattr(A, "cut_intervals", lambda audio: [(0.0, 8.0)])
+    monkeypatch.setattr(asr, "speech_intervals_of", lambda audio, s: [(0.0, 8.0)])
+    fake = FakeAudio()
+    A.transcribe(str(wav), ASRSettings(engine="api", api_audio_format="wav"),
+                 LLMSettings(audio_model="some-other-model", audio_api_key="k"),
+                 client=fake)
+    assert set(fake.models) == {"gemini-3.8-flash"}
+
+
+def test_flex_off_sends_no_service_tier(run):
+    fake = FakeAudio()
+    run(fake, settings=ASRSettings(engine="api", api_window_seconds=300.0,
+                                   api_concurrency=1, api_audio_format="wav",
+                                   api_flex=False))
+    assert all(o == {"reasoning_effort": "none"} for o in fake.options)
+
+
+def test_flex_is_on_by_default():
+    assert ASRSettings().api_flex is True
+
+
+def test_a_busy_server_is_waited_out_not_split(run, monkeypatch):
+    """A 503 says "not now", nothing about the audio: the same request goes
+    again after a pause, and the window loses no attempt, is not split and
+    becomes no gap."""
+    paused = []
+    monkeypatch.setattr(A, "_pause", lambda seconds, cancel: paused.append(seconds))
+    busy = StatusError(503, "This model is currently experiencing high demand.")
+    fake = FakeAudio([busy, busy, cue_lines])
+    segments, _, logged = run(fake)
+
+    assert paused == [A.CAPACITY_BACKOFF[0], A.CAPACITY_BACKOFF[1]]
+    assert len(fake.calls) == 2 + 2          # two refusals, then one per window
+    # the resend is the same request — no "your last answer…" in it
+    assert fake.calls[2] == fake.calls[0]
+    assert not any("拆成两段" in line for line in logged)
+    assert not any("放弃这一段" in line for line in logged)
+    assert not any("第 2 次通过" in line for line in logged)
+    assert sum("分钟后原样重发" in line for line in logged) == 2
+    assert any("等了 2 次" in line for line in logged)
+    assert segments
+
+
+def test_the_wait_keeps_growing_and_then_holds(run, monkeypatch):
+    paused = []
+    monkeypatch.setattr(A, "_pause", lambda seconds, cancel: paused.append(seconds))
+    busy = StatusError(503, "UNAVAILABLE")
+    run(FakeAudio([busy] * 7 + [cue_lines]))
+    last = A.CAPACITY_BACKOFF[-1]
+    assert paused == list(A.CAPACITY_BACKOFF) + [last] * (7 - len(A.CAPACITY_BACKOFF))
+
+
+def test_a_quota_429_is_a_real_failure_not_a_wait(run, monkeypatch):
+    """Waiting on a spent quota would wait forever."""
+    monkeypatch.setattr(A, "_pause", lambda *a: pytest.fail("must not wait"))
+    quota = StatusError(429, "You exceeded your current quota, please check "
+                             "your plan and billing details.")
+    _, _, logged = run(FakeAudio([quota, cue_lines]))
+    assert any("第 1 次请求失败" in line and "quota" in line for line in logged)
+
+
+@pytest.mark.parametrize("exc, expected", [
+    (StatusError(503, "This model is currently experiencing high demand."), True),
+    (StatusError(429, "Resource has been exhausted (e.g. check quota)."), False),
+    (StatusError(429, "RESOURCE_EXHAUSTED: too many requests"), True),
+    (StatusError(400, "Unknown name service_tier"), False),
+    (StatusError(500, "internal"), False),
+    (RuntimeError("connection refused"), False),
+    (RuntimeError("The service is currently unavailable."), True),
+])
+def test_what_counts_as_a_capacity_refusal(exc, expected):
+    assert A.capacity_refusal(exc) is expected
+
+
+def test_cancelling_during_a_wait_stops_the_run(run, monkeypatch):
+    monkeypatch.setattr(A, "CAPACITY_BACKOFF", (30.0,))
+    busy = StatusError(503, "high demand")
+    fake = FakeAudio([busy])
+    with pytest.raises(InterruptedError):
+        run(fake, should_cancel=lambda: len(fake.calls) >= 1)
+    assert len(fake.calls) == 1
+
+
+def test_a_missing_key_fails_before_anything_is_decoded(tmp_path):
+    with pytest.raises(RuntimeError, match="API key"):
+        A.transcribe(str(tmp_path / "not-even-there.wav"),
+                     ASRSettings(engine="api"),
+                     LLMSettings(api_key="main-key-is-not-borrowed"))
+
+
+def test_thinking_tokens_are_counted_from_the_total(run):
+    usage: dict = {}
+    _, _, logged = run(FakeAudio(thinking=50), usage=usage)
+    assert usage["thinking"] == 50 * usage["calls"]
+    assert any(f"思考 {usage['thinking']}" in line for line in logged)

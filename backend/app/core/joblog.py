@@ -93,14 +93,15 @@ def _settings_lines(settings) -> list[str]:
         # Which engine ran is the first thing support needs, and under the
         # api one most of the whisper settings below are inert — say so
         # here rather than let someone tune a slider nothing reads.
-        own_endpoint = llm.audio_base_url.strip()
-        same = "" if llm.audio_model.strip() else "（同主模型）"
+        from app.services.asr_api import REASONING_EFFORT, audio_endpoint
+        from app.models.schemas import GEMINI_ASR_MODEL
+
         recogniser = [
-            f"识别引擎      : API 多模态模型 "
-            f"{llm.audio_model.strip() or llm.model}{same} @ "
-            f"{own_endpoint or llm.base_url}"
-            + (f" (API key: {'已配置' if llm.audio_api_key.strip() else '未配置'})"
-               if own_endpoint else "（同主接口）"),
+            f"识别引擎      : Gemini 3.8 Flash（云端）{GEMINI_ASR_MODEL} @ "
+            f"{audio_endpoint(llm)}"
+            f" (API key: {'已配置' if llm.audio_api_key.strip() else '未配置'})",
+            f"  思考={REASONING_EFFORT} service_tier="
+            + ("flex（半价，满载时等待重发）" if asr.api_flex else "标准"),
             f"  每段={asr.api_window_seconds:.0f}s 格式={asr.api_audio_format} "
             f"并发={asr.api_concurrency}（音频分段上传，不使用本地模型）",
             f"VAD           : 仅用于决定切分位置（固定阈值），"

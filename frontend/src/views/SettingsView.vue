@@ -286,10 +286,17 @@ async function testLLM() {
 async function testAsrApi() {
   testingAsrApi.value = true
   try {
-    const r = await api.testAsrApi(settings.value.llm)
+    const r = await api.testAsrApi(settings.value.llm, settings.value.asr.api_flex)
     const at = `${r.model} @ ${r.endpoint}`
     if (!r.ok) {
       ElMessage({ type: 'error', duration: 8000, message: `语音接口连接失败（${at}）：${r.error}` })
+    } else if (r.busy) {
+      // a capacity refusal proves the key and the address work
+      ElMessage({
+        type: 'warning', duration: 10000,
+        message: `Key 与地址可用（${at}），但 Google 这会儿满载、拒绝了 Flex 请求（${r.error}）——`
+          + '真正识别时程序会自动等待后重发，不需要处理；想立刻验证听音可以过几分钟再测',
+      })
     } else if (r.carried_audio === false) {
       // the reply can look perfect while the audio never arrived: only the
       // token count the server reports gives that away
@@ -300,12 +307,12 @@ async function testAsrApi() {
           + '中转多半把音频部分丢掉了，这样识别出来的内容全是编的',
       })
     } else if (r.heard_it) {
-      ElMessage.success(`语音接口可用（${at}），正确听出了测试音的音调走向（${r.asked}）`)
+      ElMessage.success(`语音接口可用（${at}${r.flex ? '，Flex' : ''}），`
+        + `正确听出了测试音的音调走向（${r.asked}）`)
     } else {
       ElMessage({
         type: 'warning', duration: 8000,
-        message: `接口通了（${at}），但模型没听出测试音是${r.asked}的，回复是「${r.reply}」——`
-          + '多半是这个模型不支持音频输入',
+        message: `接口通了（${at}），但模型没听出测试音是${r.asked}的，回复是「${r.reply}」`,
       })
     }
   } catch (e) {
@@ -399,25 +406,6 @@ async function testVision() {
                     placeholder="（可选）本地服务通常不需要" />
           <span class="hint">仅在填了上面那个地址时使用；主模型的 Key 不会被发往另一个地址</span>
         </el-form-item>
-        <el-form-item label="语音模型">
-          <el-input v-model="settings.llm.audio_model" placeholder="（可选）支持音频输入的多模态模型" />
-          <span class="hint">
-            「语音识别」的引擎选为 API 时使用；留空则用上方主模型。
-            必须是能接收音频输入的多模态模型，纯文本模型不行。
-          </span>
-        </el-form-item>
-        <el-form-item label="语音 API 地址">
-          <el-input v-model="settings.llm.audio_base_url" placeholder="（可选）http://127.0.0.1:1234/v1" />
-          <span class="hint">
-            留空＝与上方主接口相同。识别在任务开头、翻译在任务结尾，中途改不了设置，
-            所以两者可以指向不同的服务商。<strong>注意结尾的 /v1 不能少。</strong>
-          </span>
-        </el-form-item>
-        <el-form-item label="语音 API Key">
-          <el-input v-model="settings.llm.audio_api_key" type="password" show-password
-                    placeholder="（可选）本地服务通常不需要" />
-          <span class="hint">仅在填了上面那个地址时使用；主模型的 Key 不会被发往另一个地址</span>
-        </el-form-item>
         <el-form-item label="关闭思考模式">
           <el-switch v-model="settings.llm.disable_thinking" />
           <span class="hint">
@@ -425,6 +413,7 @@ async function testVision() {
             输出 token 是它需要重述内容的 5～6 倍。而且 DeepSeek 文档说明思考模式会
             <strong>使 temperature 失效</strong>，本程序给预处理设定的 temperature=0 只有关掉思考才生效。
             <br />不支持该参数的服务会被自动识别并跳过，不影响使用。
+            <br />只作用于翻译、预处理等文字环节；Gemini 语音识别固定不思考，不看这个开关。
           </span>
         </el-form-item>
         <el-form-item label="Temperature">
@@ -444,11 +433,9 @@ async function testVision() {
         <el-form-item>
           <el-button :loading="testing" @click="testLLM">测试连接</el-button>
           <el-button :loading="testingVision" @click="testVision">测试视觉模型</el-button>
-          <el-button :loading="testingAsrApi" @click="testAsrApi">测试语音模型</el-button>
           <span class="hint">
             视觉测试会发一张写着字的图片过去，要求模型读出来——纯文本模型能答完文字测试，
-            却会在第一条字幕上失败。语音测试会发一段音调变化的测试音过去要求听出方向，
-            并核对服务端收到的 token 量：中转把音频丢掉时，模型照样会答得头头是道。
+            却会在第一条字幕上失败。
           </span>
         </el-form-item>
       </el-form>
@@ -462,7 +449,7 @@ async function testVision() {
             <el-radio value="cpu">CPU</el-radio>
             <el-radio value="cuda">CUDA (GPU)</el-radio>
             <el-radio value="auto">自动</el-radio>
-            <el-radio value="api">API（多模态大模型）</el-radio>
+            <el-radio value="api">Gemini 3.8 Flash（云端）</el-radio>
           </el-radio-group>
           <el-tag v-if="cuda && asrTarget !== 'api'" :type="cuda.available ? 'success' : 'info'" class="tag">
             {{ cuda.available ? `检测到 ${cuda.device_count} 个 CUDA 设备` : '本机未检测到可用 CUDA' }}
@@ -474,16 +461,15 @@ async function testVision() {
               GPU 需安装 CUDA 运行库：pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
             </template>
             <template v-else>
-              <strong>音频会分段上传</strong>到「翻译模型」一栏里配置的「语音模型」接口——
+              <strong>音频会分段上传</strong>到 Google 的 gemini-3.8-flash——
               这是本软件唯一会上传音频的情况。不下模型、不占 GPU，按 token 计费
               （音频约 25 tokens/秒，两小时影片约 18 万输入 token）。<br />
               时间轴由本机决定：先用本地语音检测在静音处切段，模型只在每段内部计时，
               所以它的时钟就算不准也不会越走越偏。<br />
               代价：<strong>没有词级时间戳</strong>（断句精度略降），同一段音频两次识别
               结果不会完全一样，且「二次识别」对本引擎不适用。<br />
-              <strong>目前只针对 gemini-3.8-flash-high 做过调优</strong>：窗口长度、
-              时间戳格式、标点要求、失败重试都是按它的实测行为定的。换用别的模型仍然可以跑，
-              但这些参数未必合适，建议先用下方「测试语音模型」确认音频真的送达、方向题答对。
+              <strong>只适配 gemini-3.8-flash 这一个模型</strong>：窗口长度、时间戳格式、
+              标点要求、失败重试都是按它的实测行为定的，所以模型是固定的、不能换。
             </template>
           </div>
         </el-form-item>
@@ -560,6 +546,40 @@ async function testVision() {
         </el-form-item>
         </template>
         <template v-else>
+        <el-form-item label="模型">
+          <span>gemini-3.8-flash（固定），思考 none</span>
+          <span class="hint">
+            实测不思考与默认思考听写准确度一样，费用少约三分之一
+          </span>
+        </el-form-item>
+        <el-form-item label="Gemini API 地址">
+          <el-input v-model="settings.llm.audio_base_url"
+                    placeholder="https://generativelanguage.googleapis.com/v1beta/openai/" />
+          <span class="hint">
+            留空＝Google 官方地址；换用中转时才需要改。识别在任务开头、翻译在任务结尾，
+            所以它和「翻译模型」可以是两家服务商。
+          </span>
+        </el-form-item>
+        <el-form-item label="Gemini API Key">
+          <el-input v-model="settings.llm.audio_api_key" type="password" show-password
+                    placeholder="Google AI Studio 里申请的 key" />
+          <span class="hint">必填；「翻译模型」那一栏的 Key 不会被发到这里</span>
+        </el-form-item>
+        <el-form-item label="Flex 半价">
+          <el-switch v-model="settings.asr.api_flex" />
+          <span class="hint">
+            价格减半（service_tier=flex）。代价是 Google 满载时会返回 503——
+            实测 9 次里 5 次——程序会等 1～10 分钟后原样重发，直到成功或你取消任务，
+            所以一部片可能要等几十分钟甚至更久，适合放进列队慢慢跑。关掉则按标准价、更快。
+          </span>
+        </el-form-item>
+        <el-form-item>
+          <el-button :loading="testingAsrApi" @click="testAsrApi">测试语音模型</el-button>
+          <span class="hint">
+            发一段音调变化的测试音过去要求听出方向，并核对服务端收到的 token 量：
+            中转把音频丢掉时，模型照样会答得头头是道。按上面的 Flex 开关发请求（先保存不是必须的）。
+          </span>
+        </el-form-item>
         <el-form-item label="每段时长">
           <el-input-number v-model="settings.asr.api_window_seconds" :min="60" :max="420" :step="30" />
           <span class="hint">
@@ -577,7 +597,7 @@ async function testVision() {
         </el-form-item>
         <el-form-item label="同时请求数">
           <el-input-number v-model="settings.asr.api_concurrency" :min="1" :max="8" />
-          <span class="hint">几段同时发。接口限流（429）时调小；两小时影片约 24 段</span>
+          <span class="hint">几段同时发。两小时影片约 24 段；接口报额度不足（429 quota）时调小</span>
         </el-form-item>
         <el-form-item label="最短语音时长">
           <el-input-number v-model="settings.asr.vad_min_speech_ms" :min="0" :max="5000" :step="50" />
@@ -646,7 +666,7 @@ async function testVision() {
         </template>
       </el-form>
       <div class="model-notes">
-        <p>· <strong>选 API 引擎时，下面这些都不生效</strong>：模型、设备、计算精度、Beam、词级时间戳、
+        <p>· <strong>选 Gemini 3.8 Flash（云端）时，下面这些都不生效</strong>：模型、设备、计算精度、Beam、词级时间戳、
           二次识别、VAD 阈值与前后填充。本机只负责切段，识别全在服务端。</p>
         <p><strong>📌 模型选择说明</strong>（列表右侧为下载体积，模型仅在首次选用时下载一次）</p>
         <p>· <strong>为什么默认 large-v2</strong>：large-v3 在安静的基准测试中略准，但在真实影视音频中幻觉率明显更高（第三方实测约为 v2 的 4 倍）——电影中大量的配乐、音效和静默正是幻觉的高发场景，会凭空产生不存在的台词。因此默认使用更稳定的 large-v2。</p>

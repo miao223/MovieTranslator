@@ -103,6 +103,10 @@ def settings_hash(settings: Optional[AppSettings]) -> str:
         data.pop(key, None)
     for key in ("api_key", "vision_api_key", "audio_api_key"):
         data.get("llm", {}).pop(key, None)
+    # price and latency, not output: switching Flex must not turn every
+    # queued entry into "another generation of settings" or orphan a
+    # checkpoint (pipeline's checkpoint key is this same hash)
+    data.get("asr", {}).pop("api_flex", None)
     blob = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
 

@@ -205,8 +205,12 @@ def test_the_api_recognition_engine_is_named_without_its_key(logdir):
     text = w.path.read_text(encoding="utf-8")
 
     assert "sk-audio-secret-value" not in text
-    assert "识别引擎      : API 多模态模型 gemini-3.8-flash-high @" in text
+    # the model is fixed; an old settings file's audio_model is not reported
+    assert ("识别引擎      : Gemini 3.8 Flash（云端）gemini-3.8-flash @ "
+            "https://listen.example/v1") in text
+    assert "gemini-3.8-flash-high" not in text
     assert "API key: 已配置" in text
+    assert "思考=none service_tier=flex" in text
     assert "API 引擎不适用" in text  # the second pass does not apply here
 
 

@@ -513,7 +513,9 @@ def load_run(targets: Sequence[Path], label: str = "") -> Run:
         settings = run.joblog.get("settings", {}) or {}
         if run.engine == "unknown":
             engine = str(settings.get("识别引擎", ""))
-            run.engine = "api" if "API" in engine else "local" if engine else "unknown"
+            # "API 多模态模型 …" before the model was fixed, "Gemini … （云端）" after
+            run.engine = ("api" if "API" in engine or "Gemini" in engine
+                          else "local" if engine else "unknown")
 
     if run.engine == "unknown" and run.raw:
         run.engine = "api" if not any(s.words for s in run.raw) else "local"

@@ -41,8 +41,9 @@ export const api = {
     request('/api/settings/test-llm', { method: 'POST', body: JSON.stringify(llm) }),
   testVision: (llm) =>
     request('/api/settings/test-vision', { method: 'POST', body: JSON.stringify(llm) }),
-  testAsrApi: (llm) =>
-    request('/api/settings/test-asr-api', { method: 'POST', body: JSON.stringify(llm) }),
+  testAsrApi: (llm, flex = false) =>
+    request(`/api/settings/test-asr-api?flex=${flex ? 'true' : 'false'}`,
+            { method: 'POST', body: JSON.stringify(llm) }),
   // mode='disc' lists .iso images and names which folders are discs
   browse: (path, mode = '') =>
     request(`/api/fs/browse?path=${encodeURIComponent(path || '')}`

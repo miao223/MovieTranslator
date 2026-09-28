@@ -31,18 +31,24 @@ LogFn = Callable[[str], None]
 ProgressFn = Callable[[float], None]  # 0..1
 
 
-def make_openai_client(settings: LLMSettings, network: Optional[NetworkSettings] = None):
-    """OpenAI-compatible client, routed through the proxy when enabled."""
+def make_openai_client(settings: LLMSettings, network: Optional[NetworkSettings] = None,
+                       timeout: Optional[float] = None):
+    """OpenAI-compatible client, routed through the proxy when enabled.
+
+    *timeout* (seconds) replaces the SDK's default only when given.
+    """
     import httpx
     from openai import OpenAI
 
     http_client = None
     if network and network.llm_via_proxy and network.proxy_url.strip():
         http_client = httpx.Client(proxy=network.proxy_url.strip())
+    extra = {"timeout": timeout} if timeout is not None else {}
     return OpenAI(
         base_url=settings.base_url,
         api_key=settings.api_key or "EMPTY",
         http_client=http_client,
+        **extra,
     )
 
 
@@ -73,23 +79,24 @@ def make_vision_client(settings: LLMSettings, network: Optional[NetworkSettings]
 def make_audio_client(settings: LLMSettings, network: Optional[NetworkSettings] = None):
     """Client for the model that listens (ASRSettings.engine == "api").
 
-    Same shape and the same reason as the vision client above: recognition
-    happens at the start of a job and translation at the end, so a setup
-    with the listening model on one endpoint and the translator on another
-    has to work — and it cannot be reconfigured half way through.
+    Its own endpoint for the same reason as the vision client above:
+    recognition happens at the start of a job and translation at the end, so
+    the listener (Gemini) and the translator (DeepSeek, say) have to be
+    reachable inside one job. Empty = Google's own endpoint.
 
-    Its key is never inherited either: a base URL pointing somewhere else
-    is a different operator.
+    Its key is never inherited: the main key belongs to a different
+    operator. And its timeout is long, because a Flex request may sit in
+    Google's queue for up to ~15 minutes before it is answered.
     """
-    base = settings.audio_base_url.strip()
-    if not base:
-        return make_openai_client(settings, network)
+    from app.services.asr_api import AUDIO_TIMEOUT, audio_endpoint
+
     return make_openai_client(
         settings.model_copy(update={
-            "base_url": base,
+            "base_url": audio_endpoint(settings),
             "api_key": settings.audio_api_key.strip(),
         }),
         network,
+        timeout=AUDIO_TIMEOUT,
     )
 
 

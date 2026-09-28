@@ -42,11 +42,38 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from app.models.schemas import ASRSettings, LLMSettings, NetworkSettings
+from app.models.schemas import (
+    GEMINI_ASR_MODEL,
+    GEMINI_BASE_URL,
+    ASRSettings,
+    LLMSettings,
+    NetworkSettings,
+)
 from app.services import asr
 from app.services.asr import LogFn, ProgressFn, Segment
 
 SAMPLE_RATE = 16_000
+
+# The request itself, measured on Google's own endpoint (2026-09-27, 60s of
+# the densest dialogue in Slipstream against its human subtitles):
+#
+# - thinking is billed as output but not reported in completion_tokens
+#   (total − prompt − completion). Default effort thought 556 tokens a
+#   minute, "high" 1428, "low" and "none" 0; word accuracy was the same
+#   within noise at every level (96.9–98.5% hits, 1 word missed in all of
+#   them). "none" is the cheapest: ~1/3 off the bill. "low" splits lines
+#   finer and so writes more. "minimal" is a 400 on this model.
+# - the DeepSeek-style switch the text stages send (`extra_body.thinking`)
+#   is a 400 here ("Unknown name thinking"), so chat_completion's fallback
+#   quietly ran this engine at default effort. This engine asks the
+#   OpenAI-compatible way instead.
+REASONING_EFFORT = "none"
+# Flex requests queue on Google's side for up to ~15 minutes (documented);
+# the SDK's default 600s would hang up on an answer that was coming.
+AUDIO_TIMEOUT = 1200.0
+# How long to wait after a capacity refusal before resending, per window;
+# the last step repeats for as long as it takes (ASRSettings.api_flex).
+CAPACITY_BACKOFF = (60.0, 120.0, 300.0, 600.0)
 
 # Measured, exactly linear. Used to prove the audio reached the model.
 AUDIO_TOKENS_PER_SECOND = 25.0
@@ -154,6 +181,66 @@ Cue = Tuple[float, float, str]
 
 class RefusalError(RuntimeError):
     """The model answered in prose instead of transcribing, several times."""
+
+
+def audio_endpoint(llm: LLMSettings) -> str:
+    """Where the listening model lives: the configured URL, else Google's."""
+    return llm.audio_base_url.strip() or GEMINI_BASE_URL
+
+
+def request_options(flex: bool) -> dict:
+    """The fields every recognition request carries besides the content."""
+    options = {"reasoning_effort": REASONING_EFFORT}
+    if flex:
+        options["service_tier"] = "flex"
+    return options
+
+
+# a quota or a billing problem answers 429 too, and waiting does not fix it
+_NOT_CAPACITY = ("quota", "billing")
+_CAPACITY_WORDS = ("unavailable", "high demand", "overloaded", "at capacity")
+
+
+def capacity_refusal(exc: Exception) -> bool:
+    """Is this the server saying "not now" rather than "no"?
+
+    Flex runs on capacity that standard traffic takes back, and says so with
+    a 503 ("This model is currently experiencing high demand"); 429 is the
+    other documented way. Neither says anything about the audio, so neither
+    may cost the window an attempt, a split or a gap — they are waited out.
+    Except the 429 that is about money or a daily quota: waiting on that
+    would wait forever, so it takes the ordinary failure path and its words
+    reach the log.
+    """
+    status = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    if status == 429 or "resource_exhausted" in text:
+        return not any(word in text for word in _NOT_CAPACITY)
+    if status == 503:
+        return True
+    return status is None and any(word in text for word in _CAPACITY_WORDS)
+
+
+def _pause(seconds: float, should_cancel: Optional[Callable[[], bool]]) -> None:
+    """Sleep in short slices, so a cancel is honoured within a second."""
+    import time
+
+    deadline = time.monotonic() + seconds
+    while True:
+        if should_cancel and should_cancel():
+            raise InterruptedError
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(1.0, left))
+
+
+def thinking_tokens(usage) -> int:
+    """Output tokens spent thinking: billed, but outside completion_tokens."""
+    total = getattr(usage, "total_tokens", 0) or 0
+    prompt = getattr(usage, "prompt_tokens", 0) or 0
+    completion = getattr(usage, "completion_tokens", 0) or 0
+    return max(0, total - prompt - completion) if total else 0
 
 
 # ------------------------------------------------------------- audio bytes
@@ -832,12 +919,20 @@ def transcribe(
 
     from app.services.translator import make_audio_client
 
+    model = GEMINI_ASR_MODEL
+    endpoint = audio_endpoint(llm)
+    if client is None:
+        if not llm.audio_api_key.strip():
+            # Never the main key: that one belongs to the translator's
+            # provider. Said before a minute of audio is decoded for nothing.
+            raise RuntimeError(
+                "Gemini 语音识别还没有 API key：请在设置 → 语音识别里填写"
+                "（主接口的 key 不会被沿用）")
+        client = make_audio_client(llm, network)
+    options = request_options(settings.api_flex)
+
     audio = decode_audio(wav_path, sampling_rate=SAMPLE_RATE)
     duration = len(audio) / float(SAMPLE_RATE)
-    model = llm.audio_model.strip() or llm.model
-    endpoint = llm.audio_base_url.strip() or llm.base_url
-    if client is None:
-        client = make_audio_client(llm, network)
 
     cuts = cut_intervals(audio)
     windows, forced = plan_windows(cuts, duration, settings.api_window_seconds)
@@ -846,7 +941,11 @@ def transcribe(
     intervals = asr.speech_intervals_of(audio, settings)
 
     if log:
-        log(f"API 语音识别：{model} @ {endpoint}")
+        log(f"Gemini 语音识别：{model} @ {endpoint}，思考 {REASONING_EFFORT}，"
+            + ("service_tier=flex（半价；满载时等待后原样重发，"
+               "是否按 Flex 计价以账单为准，响应里不回显）"
+               if settings.api_flex else "标准价"))
+        log("注：设置里的「关闭思考模式」只作用于文字环节，本引擎固定按上面的思考档位请求")
         log(
             f"音频 {_clock(duration)}，切成 {len(windows)} 段"
             f"（目标 {settings.api_window_seconds:.0f}s，格式 {settings.api_audio_format}，"
@@ -860,7 +959,8 @@ def transcribe(
                 "并不因此跳过任何一段音频")
 
     tally = usage if usage is not None else {}
-    for key in ("calls", "prompt", "completion", "empty"):
+    for key in ("calls", "prompt", "completion", "thinking", "empty",
+                "capacity_waits", "capacity_seconds"):
         tally.setdefault(key, 0)
     tally_lock = threading.Lock()
     prose_run = 0
@@ -895,6 +995,8 @@ def transcribe(
         switched = False
         attempt = 0
         allowed = WINDOW_ATTEMPTS
+        waits = 0          # capacity refusals of this window
+        waited = 0.0
         while attempt < allowed:
             attempt += 1
             if should_cancel and should_cancel():
@@ -903,15 +1005,15 @@ def transcribe(
                                   settings.initial_prompt, complaint)
             try:
                 from app.services.translator import (
-                    EmptyReplyError, chat_completion, reply_text)
+                    EmptyReplyError, _create, reply_text)
 
-                resp, _ = chat_completion(
+                resp = _create(
                     client, model=model,
                     messages=[{"role": "user", "content": [
                         {"type": "text", "text": prompt}, part,
                     ]}],
                     temperature=0,
-                    no_thinking=llm.disable_thinking,
+                    **options,
                 )
                 reply = reply_text(resp)
             except EmptyReplyError as exc:
@@ -941,6 +1043,8 @@ def transcribe(
                     tally["calls"] += 1
                     tally["empty"] += 1 if carried is True else 0
                     tally["prompt"] += getattr(exc.usage, "prompt_tokens", 0) or 0
+                    tally["completion"] += getattr(exc.usage, "completion_tokens", 0) or 0
+                    tally["thinking"] += thinking_tokens(exc.usage)
                 if log:
                     log(f"⚠ {where} 第 {attempt} 次模型返回了空回复"
                         f"（{heard}；{fmt} {len(data) // 1024}KB）")
@@ -960,6 +1064,29 @@ def transcribe(
                                 f"（{len(data) // 1024}KB）")
                 continue
             except Exception as exc:  # noqa: BLE001 — the server's own words
+                if capacity_refusal(exc):
+                    # "Not now", not "no": the same bytes and the same prompt
+                    # go again after a pause, and this try does not count.
+                    # Splitting would only double the requests being refused,
+                    # and a gap would spend the 2% budget on Google being
+                    # busy. The one way out is a cancel (inside _pause).
+                    pause = CAPACITY_BACKOFF[min(waits, len(CAPACITY_BACKOFF) - 1)]
+                    waits += 1
+                    if log:
+                        # the server's own words once per window: a relay
+                        # answering 503 for a reason of its own has to be
+                        # recognisable from the log
+                        said = f"：{str(exc)[:200]}" if waits == 1 else ""
+                        log(f"⚠ {where} Google 满载（{getattr(exc, 'status_code', '') or '暂不可用'}"
+                            f"{said}），{pause / 60:.0f} 分钟后原样重发；"
+                            f"本段已等 {waited / 60:.0f} 分钟")
+                    _pause(pause, should_cancel)
+                    waited += pause
+                    with tally_lock:
+                        tally["capacity_waits"] += 1
+                        tally["capacity_seconds"] += pause
+                    attempt -= 1
+                    continue
                 complaint = failure = str(exc)
                 if log:
                     log(f"⚠ {where} 第 {attempt} 次请求失败：{exc}"
@@ -971,6 +1098,7 @@ def transcribe(
                 usage_obj = getattr(resp, "usage", None)
                 tally["prompt"] += getattr(usage_obj, "prompt_tokens", 0) or 0
                 tally["completion"] += getattr(usage_obj, "completion_tokens", 0) or 0
+                tally["thinking"] += thinking_tokens(usage_obj)
 
             carried = audio_reached_the_model(getattr(resp, "usage", None), seconds)
             if carried is False:
@@ -1161,7 +1289,11 @@ def transcribe(
 
     if log:
         log(f"识别完成：{len(segments)} 段，共 {tally.get('calls', 0)} 次请求"
-            f"（输入 {tally.get('prompt', 0)} tokens，输出 {tally.get('completion', 0)}）")
+            f"（输入 {tally.get('prompt', 0)} tokens，输出 {tally.get('completion', 0)}，"
+            f"思考 {tally.get('thinking', 0)}）")
+        if tally.get("capacity_waits"):
+            log(f"Google 满载共让本片等了 {tally['capacity_waits']} 次、"
+                f"约 {tally['capacity_seconds'] / 60:.0f} 分钟（各段的等待可以重叠）")
         if missing:
             # A gap that only showed up in a line scrolled past an hour ago
             # is a silent gap. It gets said again, at the end, in full.
