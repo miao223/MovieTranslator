@@ -41,6 +41,9 @@ onMounted(async () => {
         <el-tab-pane label="压制" name="encode" lazy>
           <EncodeView @goto="activeTab = $event" />
         </el-tab-pane>
+        <el-tab-pane label="修复" name="restore" lazy>
+          <EncodeView restore @goto="activeTab = $event" />
+        </el-tab-pane>
         <el-tab-pane label="音频" name="audio" lazy>
           <AudioView @goto="activeTab = $event" />
         </el-tab-pane>

@@ -50,9 +50,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 import av
 from av.sidedata.sidedata import Type as SideType
 from av.video.format import VideoFormat
+from av.video.reformatter import VideoReformatter
 
 from app.models.schemas import EncodeOptions, EncodeRequest
-from app.services import audio, mux
+from app.services import audio, mux, restore
 
 # SVT-AV1 writes a banner of a dozen lines to stderr for every encoder it
 # opens; errors are all the server console needs from it.
@@ -226,6 +227,11 @@ def wants_ten_bit(opts: EncodeOptions) -> bool:
     return opts.bit_depth == "10"
 
 
+DEINTERLACE_NAMES = {"auto": "自动反交错", "off": "不反交错", "all": "全部反交错",
+                     "ivtc": "反胶片过带", "bob": "还原 60 帧", "match": "只做场匹配",
+                     "detect": "按片源节奏自动选反交错"}
+
+
 def check_options(opts: EncodeOptions) -> None:
     """Refuse, at enqueue time, what this machine cannot encode.
 
@@ -233,7 +239,13 @@ def check_options(opts: EncodeOptions) -> None:
     the same queue entry can outlive a GPU driver.
     """
     if opts.video_codec == mux.COPY:
+        if restore.restoring(opts):
+            raise ValueError("还原 60 帧、裁边、降噪、放大都要重编码画面，不能和「保持原样」一起用")
         return
+    if opts.upscale and opts.max_height:
+        raise ValueError("「放大到」和「分辨率上限」不能同时设置")
+    if opts.ai_model and not opts.upscale:
+        raise ValueError("AI 放大要先选「放大到」多少")
     usable = {enc["id"] for enc in mux.available_encoders()}
     if opts.video_codec not in usable:
         raise ValueError(f"本机无法使用编码器 {opts.video_codec}。"
@@ -269,8 +281,21 @@ def describe_options(opts: EncodeOptions) -> str:
         if opts.max_height:
             parts.append(f"≤{opts.max_height}p")
         if opts.deinterlace != "auto":
-            parts.append({"off": "不反交错", "all": "全部反交错",
-                          "ivtc": "反胶片过带"}[opts.deinterlace])
+            parts.append(DEINTERLACE_NAMES[opts.deinterlace])
+        if opts.field_order != "auto":
+            parts.append({"tff": "上场优先", "bff": "下场优先"}[opts.field_order])
+        if opts.crop_auto:
+            parts.append("自动裁黑边")
+        if restore.cropped(opts):
+            parts.append(f"裁边 上{opts.crop_top} 下{opts.crop_bottom} "
+                         f"左{opts.crop_left} 右{opts.crop_right}")
+        if opts.aspect != "auto":
+            parts.append(f"画面 {opts.aspect}")
+        if opts.denoise != "off":
+            parts.append(restore.DENOISE_NAMES[opts.denoise])
+        if opts.upscale:
+            model = restore.AI_MODELS.get(opts.ai_model, "")
+            parts.append(f"{'用 ' + model + ' ' if model else ''}放大到 {opts.upscale}p")
     if opts.audio_codec == "copy":
         parts.append("音频原样")
     else:
@@ -292,7 +317,10 @@ def describe_options(opts: EncodeOptions) -> str:
 
 
 def options_hash(opts: EncodeOptions) -> str:
-    return hashlib.sha1(opts.model_dump_json().encode("utf-8")).hexdigest()[:12]
+    # the 修复 fields are left out while unused: an encode tagged before they
+    # existed must still read as this request's finished work
+    unused = {k for k, v in restore.RESTORE_DEFAULTS.items() if getattr(opts, k) == v}
+    return hashlib.sha1(opts.model_dump_json(exclude=unused).encode("utf-8")).hexdigest()[:12]
 
 
 def disc_key(root: str | Path) -> str:
@@ -402,6 +430,10 @@ class VideoSample:
     light: Optional[bytes] = None
     dovi: bool = False
     hdr10plus: bool = False
+    # (top-first, bottom-first) votes from the picture (restore.FieldVotes),
+    # and over how many frames; only gathered when asked for
+    fields: Tuple[int, int] = (0, 0)
+    field_frames: int = 0
 
 
 def _side(frame, kind) -> Optional[bytes]:
@@ -412,9 +444,18 @@ def _side(frame, kind) -> Optional[bytes]:
     return bytes(data) if data is not None else None
 
 
-def sample_video(path: str | Path, index: int, count: int = 90) -> VideoSample:
+def sample_video(path: str | Path, index: int, count: int = 90,
+                 fields: bool = False, at: float = 1 / 3) -> VideoSample:
     sample = VideoSample()
     steps: List[int] = []
+    votes = restore.FieldVotes() if fields else None
+    # one converter for the whole sample: frame.to_ndarray(format=…) makes a
+    # new one per frame, with this FFmpeg's swscale threads (24 on a 12-core
+    # machine), and a frame whose side data has been read sits in a reference
+    # cycle that keeps it — and them — until the garbage collector comes
+    # round. Measured: 90 sampled frames, 2,160 threads; on a GPU box capped
+    # at 512 tasks the next decoder and x264 then failed to open
+    gray = VideoReformatter() if fields else None
     last = None
     tb = None
     try:
@@ -422,15 +463,17 @@ def sample_video(path: str | Path, index: int, count: int = 90) -> VideoSample:
             stream = container.streams[index]
             stream.thread_type = "AUTO"
             tb = stream.time_base
+            clock = mux.FrameClock.of(stream)
             if container.duration and container.duration / av.time_base > 60:
-                container.seek(int(container.duration / 3))
+                container.seek(int(container.duration * at))
             for frame in container.decode(stream):
                 sample.frames += 1
                 sample.interlaced += bool(frame.interlaced_frame)
-                if frame.pts is not None:
+                pts = clock(frame)
+                if pts is not None:
                     if last is not None:
-                        steps.append(frame.pts - last)
-                    last = frame.pts
+                        steps.append(pts - last)
+                    last = pts
                 if sample.mastering is None:
                     sample.mastering = _side(frame, SideType.MASTERING_DISPLAY_METADATA)
                 if sample.light is None:
@@ -440,10 +483,14 @@ def sample_video(path: str | Path, index: int, count: int = 90) -> VideoSample:
                     or _side(frame, SideType.DOVI_METADATA))
                 sample.hdr10plus = sample.hdr10plus or bool(
                     _side(frame, SideType.DYNAMIC_HDR_PLUS))
+                if votes is not None:
+                    votes.add(gray.reformat(frame, format="gray").to_ndarray())
                 if sample.frames >= count:
                     break
     except Exception:  # noqa: BLE001 — a sample is advice, not a requirement
         return sample
+    if votes is not None:
+        sample.fields, sample.field_frames = votes.votes, sample.frames
     steps = [s for s in steps if s > 0]
     if steps:
         # soft telecine decodes as progressive frames whose steps alternate
@@ -708,10 +755,23 @@ def geometry(width: int, height: int, sar, opts: EncodeOptions) -> Tuple[int, in
     AV1 and VP9 cannot carry a sample aspect ratio into MKV — it reads back
     as 1 — so a non-square source is scaled to square pixels for them
     (720x480 at 32:27 -> 854x480) instead of being shown squashed.
+
+    *width* x *height* is the picture after any crop. With ``upscale`` the
+    picture is made square-pixelled first and then enlarged until its
+    shorter side is that long (720x480 at 32:27 -> 1920x1080): an enlarging
+    model must never see anamorphic pixels, and nothing after it should
+    have to stretch them again. A picture already that large is left to
+    the rules below — upscale never shrinks.
     """
     sar = Fraction(sar) if sar else Fraction(1)
     if sar <= 0:
         sar = Fraction(1)
+    if opts.upscale:
+        shown = width * sar
+        short = min(shown, height)
+        if short < opts.upscale:
+            factor = Fraction(opts.upscale) / short
+            return _even(shown * factor), _even(height * factor), Fraction(1)
     scale = Fraction(1)
     short = min(width, height)
     if opts.max_height and short > opts.max_height:
@@ -879,13 +939,18 @@ class VideoFilter:
         self.first_in: Optional[Fraction] = None
         self.delta: Optional[int] = None
 
+    def _time_base(self, frame):
+        # a frame from another filter graph (after bwdif, the time base is
+        # halved) states its own; a decoded one has the stream's
+        return frame.time_base or self.stream.time_base
+
     def _build(self, frame) -> None:
         graph = av.filter.Graph()
         src = graph.add(
             "buffer",
             video_size=f"{frame.width}x{frame.height}",
             pix_fmt=str(int(VideoFormat(frame.format.name))),
-            time_base=str(self.stream.time_base),
+            time_base=str(self._time_base(frame)),
             pixel_aspect=f"{self.sar.numerator}/{self.sar.denominator}",
             frame_rate=f"{self.rate.numerator}/{self.rate.denominator}",
         )
@@ -935,7 +1000,7 @@ class VideoFilter:
         if self.graph is None:
             self._build(frame)
         if self.first_in is None and frame.pts is not None:
-            self.first_in = frame.pts * self.stream.time_base
+            self.first_in = frame.pts * self._time_base(frame)
         self.src.push(frame)
         out.extend(self._pull())
         return self._fix(out)
@@ -964,11 +1029,35 @@ class _Tolerant:
 
 
 class VideoPipe(_Tolerant):
+    """decoder → filter graph → [frame stage → second filter graph] → encoder.
+
+    The bracketed part is there only when a model enlarges the picture
+    (restore.FrameStage): the first graph then ends in RGB, and the second
+    scales the model's output to the encoder's size and pixel format.
+    """
+
     def __init__(self, enc, shift: int, filt: VideoFilter, stats: Stats, index: int,
-                 step: int):
+                 step: int, stage: Optional["restore.FrameStage"] = None,
+                 post: Optional[VideoFilter] = None,
+                 clock: Optional[mux.FrameClock] = None):
         self.enc, self.shift, self.filter = enc, shift, filt
         self.stats, self.index, self.step = stats, index, step
+        self.stage, self.post = stage, post
+        self.clock = clock
         self.last: Optional[int] = None
+
+    def _staged(self, frames: list, last: bool = False) -> list:
+        if self.stage is None:
+            return frames
+        out = []
+        for frame in frames:
+            for made in self.stage.push(frame):
+                out.extend(self.post.push(made))
+        if last:
+            for made in self.stage.flush():
+                out.extend(self.post.push(made))
+            out.extend(self.post.flush())
+        return out
 
     def wants(self, packet) -> bool:
         return True  # the empty end-of-stream packet flushes the decoder
@@ -983,6 +1072,8 @@ class VideoPipe(_Tolerant):
         made = []
         for frame in self._decode(packet):
             self.stats.frames_in += 1
+            if self.clock is not None:
+                frame.pts = self.clock(frame)
             # PyAV turns a missing pts into a frame counter, which is wrong
             # in any time base but 1/fps
             if frame.pts is None:
@@ -990,13 +1081,13 @@ class VideoPipe(_Tolerant):
             self.last = frame.pts
             if self.shift:
                 frame.pts -= self.shift
-            for ready in self.filter.push(frame):
+            for ready in self._staged(self.filter.push(frame)):
                 made.extend(self._encode(ready))
         return made
 
     def flush(self) -> list:
         made = []
-        for ready in self.filter.flush():
+        for ready in self._staged(self.filter.flush(), last=True):
             made.extend(self._encode(ready))
         tail = self.enc.encode(None)
         self.stats.video_packets += len(tail)
@@ -1050,38 +1141,85 @@ class Result:
     frame_step: float                  # seconds per output frame, for tolerances
     duration: float
     lines: List[str] = field(default_factory=list)
+    # the 修复 engine's own account (frames, seconds, fps, peak VRAM), when a
+    # model ran: what the 试看 page estimates a whole film from
+    engine: Dict[str, float] = field(default_factory=dict)
 
 
 class LowDiskSpace(EncodeError):
     pass
 
 
+def _more_fields(path: Path, index: int, sample: VideoSample, duration: float) -> None:
+    """A still first window says nothing about field order; look again,
+    longer and later, before falling back to flags an analog capture often
+    does not have. A short file is sampled from its start both times, so
+    the longer look replaces the first rather than counting it twice."""
+    more = sample_video(path, index, count=300, fields=True, at=2 / 3)
+    if duration > 60:
+        sample.fields = (sample.fields[0] + more.fields[0], sample.fields[1] + more.fields[1])
+        sample.field_frames += more.field_frames
+    elif more.field_frames > sample.field_frames:
+        sample.fields, sample.field_frames = more.fields, more.field_frames
+
+
 def _deinterlace_chain(opts: EncodeOptions, stream, sample: VideoSample,
-                       log: LogFn) -> Tuple[List[Tuple[str, str]], bool]:
-    """(filter chain, is it an IVTC) for the chosen deinterlace mode."""
-    bwdif = ("bwdif", "mode=send_frame:parity=auto:deint=interlaced")
+                       log: LogFn) -> Tuple[List[Tuple[str, str]], Fraction]:
+    """(filter chain, how many output frames per source frame) for the
+    chosen deinterlace mode: 1, 4/5 for an IVTC, 2 for bob."""
+    parity = opts.field_order if opts.field_order != "auto" else "auto"
+    bwdif = ("bwdif", f"mode=send_frame:parity={parity}:deint=interlaced")
     if opts.deinterlace == "off":
-        return [], False
+        return [], Fraction(1)
     if opts.deinterlace == "all":
-        return [("bwdif", "mode=send_frame:parity=auto:deint=all")], False
+        return [("bwdif", f"mode=send_frame:parity={parity}:deint=all")], Fraction(1)
     if opts.deinterlace == "ivtc":
         ntsc = abs(float(nominal_rate(stream, sample)) - 30000 / 1001) < 0.01
         if ntsc and sample.regular:
             if sample.frames and sample.interlaced * 2 < sample.frames:
                 log("⚠ 抽样里大部分帧没有标记为隔行，反胶片过带仍会按 5 取 4 删帧")
-            return [("fieldmatch", "order=auto:combmatch=full"), bwdif,
-                    ("decimate", "")], True
+            return [("fieldmatch", f"order={parity}:combmatch=full"), bwdif,
+                    ("decimate", "")], Fraction(4, 5)
         why = ("帧率不是 29.97" if not ntsc else
                "时间戳步长不均（软电视电影：画面本来就是逐行的）")
         log(f"⚠ 这个片源不适合反胶片过带（{why}），改为自动反交错")
-    return [bwdif], False
+    if opts.deinterlace == "match":
+        # field matching alone: 30p pictures a field out of step come back
+        # whole; what it cannot match is left combed and bwdif takes it
+        return [("fieldmatch", f"order={parity}:combmatch=full"), bwdif], Fraction(1)
+    if opts.deinterlace == "bob":
+        rate = float(nominal_rate(stream, sample))
+        if rate > restore.BOB_MAX_RATE:
+            log(f"⚠ 片源已经是每秒 {rate:.2f} 帧，不需要还原 60 帧，改为自动反交错")
+            return [bwdif], Fraction(1)
+        measured = restore.field_order(sample.fields)
+        tff, bff = sample.fields
+        if opts.field_order == "auto":
+            if measured:
+                parity = measured
+                log(f"场序：从画面测得{'上场' if measured == 'tff' else '下场'}优先"
+                    f"（抽样 {sample.field_frames} 帧，投票 上场 {tff} : 下场 {bff}）")
+            else:
+                log(f"⚠ 场序：画面里测不出（抽样 {sample.field_frames} 帧，投票 上场 {tff} : "
+                    f"下场 {bff}，多半是画面太静），按片源的标记——没有标记的帧按上场优先处理。"
+                    f"成品里动作若一前一后地抖，请在「场序」里改选下场优先重压")
+        elif measured and measured != opts.field_order:
+            log(f"⚠ 指定的是{'上场' if opts.field_order == 'tff' else '下场'}优先，"
+                f"但画面测得的是{'上场' if measured == 'tff' else '下场'}优先"
+                f"（投票 上场 {tff} : 下场 {bff}）：动作若前后抖动，请改选另一种")
+        if not measured and sample.frames and sample.interlaced * 2 < sample.frames:
+            log("⚠ 抽样里画面看不出隔行、多数帧也没有隔行标记：片源可能本来就是逐行的，"
+                "还原出的相邻两帧会几乎一样")
+        return [("bwdif", f"mode=send_field:parity={parity}:deint=all")], Fraction(2)
+    return [bwdif], Fraction(1)
 
 
 def encode_file(source_path: str | Path, part: str | Path, request: EncodeRequest, *,
                 log: Optional[LogFn] = None,
                 progress: Optional[Callable[[float, float, float], None]] = None,
                 should_cancel: Optional[Callable[[], bool]] = None,
-                pace: Optional[Callable[[], None]] = None) -> Result:
+                pace: Optional[Callable[[], None]] = None,
+                engine=None) -> Result:
     """Encode *source_path* into *part* as *request* says.
 
     The file is left at *part* for verify() and the caller's rename;
@@ -1094,7 +1232,9 @@ def encode_file(source_path: str | Path, part: str | Path, request: EncodeReques
     log = log or (lambda _m: None)
     should_cancel = should_cancel or (lambda: False)
     source_path, part = Path(source_path), Path(part)
-    opts = request.options
+    # the pipeline has already done this (the name depends on it); a direct
+    # caller gets the same measurement here
+    opts = restore.resolve(source_path, request.options, log)
     if part.exists():
         stale = part.stat().st_size
         log(f"⚠ 发现上次未写完的残留文件（{stale / 1e9:.1f} GB），已删除：{part.name}")
@@ -1117,7 +1257,11 @@ def encode_file(source_path: str | Path, part: str | Path, request: EncodeReques
             encoding = video_plan.action == "encode"
             sample = VideoSample()
             if encoding:
-                sample = sample_video(source_path, real.index)
+                sample = sample_video(source_path, real.index,
+                                      fields=opts.deinterlace == "bob")
+                if (opts.deinterlace == "bob" and opts.field_order == "auto"
+                        and not restore.field_order(sample.fields)):
+                    _more_fields(source_path, real.index, sample, duration)
                 cc = real.codec_context
                 trc = getattr(cc, "color_trc", 0)
                 if sample.dovi and trc not in (PQ, HLG):
@@ -1160,7 +1304,7 @@ def encode_file(source_path: str | Path, part: str | Path, request: EncodeReques
                         continue
                     if plan.kind == "video" and plan.action == "encode":
                         enc, step_seconds, line = _video_encoder(
-                            out, stream, opts, sample, rate, stats, shift, log, pipes)
+                            out, stream, opts, sample, rate, stats, shift, log, pipes, engine)
                         lines.append(f"{_describe_stream(stream)} → {line}")
                         enc.metadata.update(_clean_tags(dict(stream.metadata)))
                         enc.disposition = stream.disposition
@@ -1234,17 +1378,34 @@ def encode_file(source_path: str | Path, part: str | Path, request: EncodeReques
 
                 mux.pump(source, out, pipes, should_cancel, on_packet)
                 _check_bad(stats)
+                engine_stats: Dict[str, float] = {}
+                for pipe in pipes.values():
+                    stage = getattr(pipe, "stage", None)
+                    summary = getattr(stage, "summary", None)
+                    if summary is not None and summary():
+                        log(summary())
+                    engine_stats.update(getattr(stage, "stats", None) or {})
                 for index, dropped in stats.dropped.items():
                     if dropped:
                         log(f"流 #{index} 开头是从 GOP 中间切开的：丢掉 {dropped} 个解不出来的前导帧"
                             f"（它们参照的是被切掉的上一段）")
         stats.seconds = time.monotonic() - stats.started
+    except restore.EngineError as exc:
+        part.unlink(missing_ok=True)
+        raise EncodeError(str(exc)) from exc
     except BaseException:
         part.unlink(missing_ok=True)
         raise
+    finally:
+        # an engine process must not outlive its encode, cancelled or not
+        for pipe in locals().get("pipes", {}).values():
+            close = getattr(getattr(pipe, "stage", None), "close", None)
+            if close is not None:
+                close()
     return Result(stats=stats, plans=plans, mapping=mapping, chapters=chapters,
                   video_index=video_index, video_encoded=encoding,
-                  frame_step=step_seconds, duration=duration, lines=lines)
+                  frame_step=step_seconds, duration=duration, lines=lines,
+                  engine=engine_stats)
 
 
 def _version() -> str:
@@ -1272,7 +1433,7 @@ def _check_bad(stats: Stats) -> None:
 
 
 def _video_encoder(out, stream, opts: EncodeOptions, sample: VideoSample, rate,
-                   stats: Stats, shift: int, log: LogFn, pipes: dict):
+                   stats: Stats, shift: int, log: LogFn, pipes: dict, engine=None):
     """Open the picture's encoder and its pipe; returns (stream, seconds per
     output frame, the log line)."""
     cc = stream.codec_context
@@ -1283,13 +1444,36 @@ def _video_encoder(out, stream, opts: EncodeOptions, sample: VideoSample, rate,
     pix_fmt, note = pixel_format(codec, opts, hdr)
     if note:
         log(note)
-    sar = stream.sample_aspect_ratio or Fraction(1)
-    width, height, out_sar = geometry(cc.width, cc.height, sar, opts)
-    chain, ivtc = _deinterlace_chain(opts, stream, sample, log)
-    out_rate = rate * Fraction(4, 5) if ivtc else rate
-    if (width, height) != (cc.width, cc.height):
+    sar = (restore.aspect_sar(opts.aspect, cc.width, cc.height)
+           or stream.sample_aspect_ratio or Fraction(1))
+    chain, per_frame = _deinterlace_chain(opts, stream, sample, log)
+    ivtc, bob = per_frame == Fraction(4, 5), per_frame == 2
+    out_rate = rate * per_frame
+    try:
+        picture, in_w, in_h = restore.picture_chain(opts, cc.width, cc.height)
+    except ValueError as exc:
+        raise EncodeError(str(exc)) from exc
+    chain.extend(picture)
+    width, height, out_sar = geometry(in_w, in_h, sar, opts)
+    resized = (width, height) != (in_w, in_h)
+    stage = restore.make_stage(opts, log, engine) if opts.upscale and resized else None
+    post = None
+    if stage is not None:
+        # a model must never see stretched pixels: square them first, never
+        # by shrinking (720x480 at 32:27 -> 854x480, at 8:9 -> 720x540)
+        if sar != 1:
+            sq_w, sq_h = ((_even(in_w * sar), in_h) if sar > 1
+                          else (in_w, _even(in_h / sar)))
+            chain.append(("scale", f"{sq_w}:{sq_h}:flags=lanczos"))
+            chain.append(("setsar", "1"))
+        # the model works in RGB at the depth it is given; the second graph
+        # takes its output to the encoder's size and format
+        chain.append(("format", "rgb48le" if _bit_depth(pix_fmt) > 8 else "rgb24"))
+        post = VideoFilter(stream, [("scale", f"{width}:{height}:flags=lanczos"),
+                                    ("format", pix_fmt)], sar, out_rate)
+    elif resized:
         chain.append(("scale", f"{width}:{height}:flags=lanczos"))
-    if chain:
+    if chain and stage is None:
         chain.append(("format", pix_fmt))
     options, bit_rate = video_options(codec, opts, hdr_params(codec, sample, trc))
     tag = "hvc1" if opts.container == "mp4" and _family(codec) == "H.265" else ""
@@ -1297,12 +1481,17 @@ def _video_encoder(out, stream, opts: EncodeOptions, sample: VideoSample, rate,
         out, codec, stream, width=width, height=height, pix_fmt=pix_fmt,
         rate=out_rate, options=options, sar=out_sar if out_sar != 1 else None,
         bit_rate=bit_rate, codec_tag=tag,
+        # a field per frame needs a clock twice as fine: an AVI capture's
+        # time base is 1001/30000, one tick per source frame, and the second
+        # field of each would land on the first's timestamp
+        time_base=stream.time_base / 2 if bob and stream.time_base else None,
         # frame threads: x264 runs ~40% faster than with PyAV's default
         # slice threading; the others ignore it
         thread_type="AUTO" if not _hardware(codec) else "", log=log)
     step = max(1, round(1 / (rate * stream.time_base))) if stream.time_base else 1
     pipes[stream.index] = VideoPipe(
-        enc, shift, VideoFilter(stream, chain, sar, rate, ivtc), stats, stream.index, step)
+        enc, shift, VideoFilter(stream, chain, sar, rate, ivtc), stats, stream.index, step,
+        stage=stage, post=post, clock=mux.FrameClock.of(stream))
     depth = "10bit" if _bit_depth(pix_fmt) > 8 else "8bit"
     low, high, _default, scale_name = quality_scale(codec)
     what = [f"{mux.encoder_label(codec)} {depth}",
@@ -1312,9 +1501,20 @@ def _video_encoder(out, stream, opts: EncodeOptions, sample: VideoSample, rate,
             opts.preset]
     if ivtc:
         what.append(f"反胶片过带 → {float(out_rate):.3f}fps")
+    elif bob:
+        what.append(f"还原 60 帧（每一场一帧）→ {float(out_rate):.3f}fps")
+    elif opts.deinterlace == "match":
+        what.append("只做场匹配（30p 错场还原成逐行）")
     elif chain and chain[0][0] == "bwdif":
         what.append("自动反交错（只处理标记为隔行的帧）" if "deint=interlaced" in chain[0][1]
                     else "每一帧都反交错")
+    if restore.cropped(opts):
+        what.append(f"裁边后 {in_w}x{in_h}")
+    if opts.denoise != "off":
+        what.append(restore.DENOISE_NAMES[opts.denoise])
+    if opts.upscale:
+        what.append((f"用 {stage.name} 放大" if stage is not None else "Lanczos 放大")
+                    if resized else f"已不小于 {opts.upscale}p，不放大")
     if "tune" in options:
         what.append(f"tune {options['tune']}")
     if hdr:
@@ -1435,12 +1635,27 @@ def verify(part: str | Path, result: Result) -> List[str]:
 # ------------------------------------------------------------ names, files
 
 
+def _header_rate(source: Path) -> Optional[float]:
+    """The picture's frame rate as the file's header states it, for a name."""
+    try:
+        with av.open(str(source)) as container:
+            picture = audio.picture_stream(container)
+            rate = picture and (picture.guessed_rate or picture.average_rate)
+            return float(rate) if rate else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _base_target(source: Path, request: EncodeRequest) -> Path:
-    ext = request.options.container
+    opts = request.options
+    ext = opts.container
     if request.output_mode == "custom" and request.output_dir.strip():
         folder = Path(request.output_dir.strip().strip('"').strip("'")).expanduser()
         return folder / f"{source.stem}.{ext}"
-    return source.parent / f"{source.stem}.{name_tag(request.options.video_codec)}.{ext}"
+    # 片名.1080p.60fps.HEVC.mkv: a restore says what it did to the picture
+    rate = _header_rate(source) if opts.deinterlace == "bob" else None
+    tags = restore.name_tags(opts, rate) + [name_tag(opts.video_codec)]
+    return source.parent / f"{source.stem}.{'.'.join(tags)}.{ext}"
 
 
 def output_target(source: Path, request: EncodeRequest) -> Path:

@@ -393,7 +393,8 @@ def _mov_text_cues(subs_in, sub_in) -> List[Tuple[float, float, str]]:
 def open_video_encoder(out, codec: str, stream, *, width: int, height: int,
                        pix_fmt: Optional[str], rate, options: dict,
                        sar=None, bit_rate: int = 0, codec_tag: str = "",
-                       thread_type: str = "", log: Optional[LogFn] = None):
+                       thread_type: str = "", log: Optional[LogFn] = None,
+                       time_base=None):
     """Add an encoding stream for *stream*'s picture to *out*, and open it.
 
     Everything the caller has decided — size, pixel format, quality knobs —
@@ -414,7 +415,8 @@ def open_video_encoder(out, codec: str, stream, *, width: int, height: int,
     # screen captures, some WEB-DL) gets its timestamps quantised. Measured:
     # source pts 0,10,12,40,41,100… came back 0,0,0,42,42,83…, which drifts
     # the audio and slides every cue.
-    ctx.time_base = stream.time_base
+    # *time_base* only ever refines the source's (bob: half of it)
+    ctx.time_base = time_base or stream.time_base
     if sar:  # assigning None raises inside PyAV
         ctx.sample_aspect_ratio = sar
     cc = stream.codec_context
@@ -564,6 +566,54 @@ def _add_audio_encoder(out, stream, codec: str, *, bit_rate: int = 0,
     return enc, resampler
 
 
+# Containers that store no presentation times. FFmpeg's AVI demuxer labels
+# every packet pts = dts + 1, a frame counter, so an H.264 stream with
+# B-frames comes out of the decoder in display order but labelled in decode
+# order — measured on a VHS capture: 1,2,3,4,5,8,7,6,11,10,9… — and the
+# encode then read its rate as 6.56 fps.
+NO_PTS_FORMATS = {"avi"}
+
+
+class FrameClock:
+    """Display timestamps for decoded pictures, from a container that has none.
+
+    Only the labels are wrong, not the order: the dts a decoded frame
+    carries (that of the packet that released it) is monotonic, and moved
+    by the first frame's pts - dts it lands exactly on the display timeline
+    (dts 2,3,4… → 1,2,3…, also right after a seek). Off for every other
+    container, whose decoder pts are used untouched.
+    """
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.delta: Optional[int] = None
+        self.last: Optional[int] = None
+
+    @classmethod
+    def of(cls, stream) -> "FrameClock":
+        try:
+            name = stream.container.format.name
+        except Exception:  # noqa: BLE001
+            name = ""
+        return cls(name in NO_PTS_FORMATS)
+
+    def __call__(self, frame) -> Optional[int]:
+        if not self.enabled:
+            return frame.pts
+        if frame.dts is None:
+            # the decoder's last frames, flushed at the end, carry no dts:
+            # they follow on (their labels would run backwards: 151, 150)
+            pts = frame.pts if self.last is None else self.last + 1
+        else:
+            if self.delta is None:
+                self.delta = frame.pts - frame.dts if frame.pts is not None else 0
+            pts = frame.dts + self.delta
+        if self.last is not None and pts is not None and pts <= self.last:
+            pts = self.last + 1
+        self.last = pts
+        return pts
+
+
 def _encode(enc, frame, shift: int, resampler) -> list:
     if frame.pts is not None and shift:
         frame.pts -= shift
@@ -687,10 +737,11 @@ class CopyPipe:
 class TranscodePipe:
     """A source stream decoded, and encoded again by *enc*."""
 
-    def __init__(self, enc, shift: int = 0, resampler=None):
+    def __init__(self, enc, shift: int = 0, resampler=None, clock: Optional[FrameClock] = None):
         self.enc = enc
         self.shift = shift
         self.resampler = resampler
+        self.clock = clock
 
     def wants(self, packet) -> bool:
         # The empty end-of-stream packet is deliberately NOT filtered out
@@ -702,6 +753,8 @@ class TranscodePipe:
     def feed(self, packet) -> list:
         made = []
         for frame in packet.decode():
+            if self.clock is not None:
+                frame.pts = self.clock(frame)
             made.extend(_encode(self.enc, frame, self.shift, self.resampler))
         return made
 
@@ -989,7 +1042,8 @@ def embed(
                 if stream.index in encoders:
                     pipes[stream.index] = TranscodePipe(
                         encoders[stream.index], shifts.get(stream.index, 0),
-                        resamplers.get(stream.index))
+                        resamplers.get(stream.index),
+                        FrameClock.of(stream) if stream.type == "video" else None)
                 elif stream.index in copies:
                     pipes[stream.index] = CopyPipe(
                         copies[stream.index], shifts.get(stream.index, 0))

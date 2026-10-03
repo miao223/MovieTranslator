@@ -971,6 +971,42 @@ async function testVision() {
       </div>
     </el-card>
 
+    <el-card v-if="settings.restore" shadow="never" class="section">
+      <template #header>🧪 修复引擎（AI 放大）</template>
+      <el-form label-width="140px">
+        <el-form-item label="引擎的 Python">
+          <el-input
+            v-model="settings.restore.engine_python" style="max-width: 560px"
+            placeholder="修复引擎环境里的 python，例如 C:\MovieTranslator\restore-env\Scripts\python.exe"
+          />
+          <div class="hint" style="margin: 4px 0 0; display: block; line-height: 1.6">
+            AI 放大模型（RealViformer / RealBasicVSR / LiveActionV1）在一个单独的 Python 环境里运行：
+            50 系显卡要用的新版 PyTorch 会带一份 CUDA 13 的 cuDNN，和语音识别用的那份装在同一个文件夹里、互相覆盖，
+            所以不能装进本程序自己的环境。留空就只能用 Lanczos 放大。
+          </div>
+        </el-form-item>
+        <el-form-item label="设备">
+          <el-radio-group v-model="settings.restore.device">
+            <el-radio value="auto">自动（有显卡就用显卡）</el-radio>
+            <el-radio value="cuda">显卡</el-radio>
+            <el-radio value="cpu">CPU（极慢，只用于试跑）</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="计算精度">
+          <el-radio-group v-model="settings.restore.precision">
+            <el-radio value="auto">自动（显卡 fp16，CPU fp32）</el-radio>
+            <el-radio value="fp16">fp16</el-radio>
+            <el-radio value="bf16">bf16</el-radio>
+            <el-radio value="fp32">fp32</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="模型文件夹">
+          <el-input v-model="settings.restore.models_dir" style="max-width: 560px" placeholder="留空：模型缓存目录下的 restore 文件夹" />
+          <div class="hint" style="margin: 4px 0 0; display: block; line-height: 1.6">模型第一次用到时自动下载并校验（几十到一百多 MB）。</div>
+        </el-form-item>
+      </el-form>
+    </el-card>
+
     <el-card shadow="never" class="section">
       <template #header>📝 字幕</template>
       <el-form label-width="150px">

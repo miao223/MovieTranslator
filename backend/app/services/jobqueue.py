@@ -91,7 +91,7 @@ def snapshot() -> AppSettings:
 # not relabel every later entry as a different generation of settings.
 # `encode` is only what the 压制 forms start from: every encode entry carries
 # its own options, so changing the defaults changes no queued work.
-_NOT_OUTPUT_AFFECTING = ("server", "mcp", "work_dir", "model_cache_dir", "encode")
+_NOT_OUTPUT_AFFECTING = ("server", "mcp", "work_dir", "model_cache_dir", "encode", "restore")
 
 
 def settings_hash(settings: Optional[AppSettings]) -> str:

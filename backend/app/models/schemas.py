@@ -276,6 +276,19 @@ class DiscSettings(BaseModel):
     output_dir: str = ""             # for "custom"
 
 
+class RestoreSettings(BaseModel):
+    """The 修复 engine: the AI models run in their own Python environment
+    (restore_engine/), because the PyTorch a Blackwell card needs brings a
+    CUDA 13 cuDNN that overwrites the CUDA 12 one whisper loads."""
+
+    # that environment's python (…/restore-env/bin/python, or
+    # …\restore-env\Scripts\python.exe); empty: Lanczos only
+    engine_python: str = ""
+    device: Literal["auto", "cuda", "cpu"] = "auto"
+    precision: Literal["auto", "fp16", "bf16", "fp32"] = "auto"
+    models_dir: str = ""        # empty: <模型缓存目录>/restore
+
+
 class EncodeOptions(BaseModel):
     """What a 压制 (re-encode) job does to a video (services/encode.py).
 
@@ -307,8 +320,49 @@ class EncodeOptions(BaseModel):
     # a limit on the shorter side; 0 keeps the size. Never upscales.
     max_height: Literal[0, 2160, 1440, 1080, 720, 576, 480] = 0
     # auto: only frames the source flags as interlaced (bwdif); all: every
-    # frame; ivtc: undo 3:2 pulldown (NTSC film on DVD) back to 23.976
-    deinterlace: Literal["auto", "off", "all", "ivtc"] = "auto"
+    # frame; ivtc: undo 3:2 pulldown (NTSC film on DVD) back to 23.976;
+    # bob: one frame per field (bwdif send_field) — a camera-shot interlaced
+    # recording (VHS, TV) back to the 59.94 / 50 real pictures a second it
+    # was shot at. No frame is made up: each one is a field the tape holds.
+    # match: field matching alone — 30p progressive pictures stored a field
+    # out of step (every frame combed, every one recoverable), back to
+    # 29.97p with no frame dropped and none doubled.
+    # detect: measured from the picture when the encode starts
+    # (restore.analyze_cadence) and turned into one of the above — the only
+    # way a folder of mixed discs gets each one right.
+    deinterlace: Literal["auto", "off", "all", "ivtc", "bob", "match", "detect"] = "auto"
+    # ---- 修复 (the restore page; services/restore.py). Every one of these
+    # is left out of options_hash at its default, so an encode tagged before
+    # they existed is still recognised as finished.
+    # Which field was shot first. auto: for bob, measured from the picture
+    # (which field pair is nearer in time) — an analog capture's flags are
+    # often missing or wrong, and bwdif takes a frame with no flag as
+    # top-first;
+    # for the other modes, the source's flags as before.
+    field_order: Literal["auto", "tff", "bff"] = "auto"
+    # pixels cut off each edge after deinterlacing, before anything else: a
+    # VHS capture's head-switching noise at the bottom, a DVD's black bars.
+    # Even numbers, so 4:2:0 chroma lines up.
+    crop_top: int = Field(0, ge=0, le=1000, multiple_of=2)
+    crop_bottom: int = Field(0, ge=0, le=1000, multiple_of=2)
+    crop_left: int = Field(0, ge=0, le=1000, multiple_of=2)
+    crop_right: int = Field(0, ge=0, le=1000, multiple_of=2)
+    # find black bars (letterbox, a capture's dark edge) when the encode
+    # starts and cut them, on top of the crop_* above
+    crop_auto: bool = False
+    # the whole coded frame's display shape, overriding what the file says:
+    # a capture re-encoded into AVI often says nothing (720x576 shown 5:4)
+    aspect: Literal["auto", "4:3", "16:9"] = "auto"
+    # temporal / FFT denoise before the picture is enlarged (ffmpeg's own
+    # filters, fast enough for a whole film at 480p; nlmeans is not)
+    denoise: Literal["off", "light", "strong"] = "off"
+    # enlarge so the shorter side is this many pixels, in square pixels
+    # (720x480 at 32:27 -> 1920x1080); 0 keeps the size. Never shrinks —
+    # that is max_height's job, and the two cannot be set together.
+    upscale: Literal[0, 720, 1080, 1440, 2160] = 0
+    # the model that does the enlarging (restore.AI_MODELS), run by the 修复
+    # engine (RestoreSettings); "" = Lanczos. Needs upscale.
+    ai_model: Literal["", "realviformer", "realbasicvsr", "liveaction_span"] = ""
     audio_codec: Literal["copy", "aac", "libopus", "ac3", "eac3", "flac"] = "eac3"
     # which tracks audio_codec applies to. "lossless": TrueHD, DTS-HD MA,
     # PCM, FLAC… only — re-encoding an AC-3 or DTS core into another lossy
@@ -359,6 +413,7 @@ class AppSettings(BaseModel):
     disc: DiscSettings = DiscSettings()
     # what the 压制 page and the 原盘 page's full pipeline start from
     encode: EncodeOptions = EncodeOptions()
+    restore: RestoreSettings = RestoreSettings()
 
 
 # ---------------------------------------------------------------- jobs

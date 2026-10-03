@@ -18,8 +18,8 @@ import numpy as np
 import pytest
 
 from app.models.schemas import EncodeOptions, EncodeRequest
-from app.services import encode
-from tests.mediagen import make_source
+from app.services import encode, mux
+from tests.mediagen import make_avi, make_source
 
 
 def run(source: Path, **options) -> tuple[Path, encode.Result, list]:
@@ -137,14 +137,14 @@ def test_ivtc_is_not_run_where_it_would_delete_real_frames():
         average_rate = Fraction(30000, 1001)
         guessed_rate = None
     notes: list = []
-    chain, ivtc = encode._deinterlace_chain(
+    chain, per_frame = encode._deinterlace_chain(
         EncodeOptions(deinterlace="ivtc"), Stream(),
         encode.VideoSample(frames=90, interlaced=0, regular=False), notes.append)
-    assert not ivtc and chain[0][0] == "bwdif" and "步长不均" in notes[0]
+    assert per_frame == 1 and chain[0][0] == "bwdif" and "步长不均" in notes[0]
     Stream.average_rate = Fraction(25)
-    chain, ivtc = encode._deinterlace_chain(
+    chain, per_frame = encode._deinterlace_chain(
         EncodeOptions(deinterlace="ivtc"), Stream(), encode.VideoSample(), notes.append)
-    assert not ivtc and "29.97" in notes[1]
+    assert per_frame == 1 and "29.97" in notes[1]
 
 
 def test_bit_depth_follows_the_format_and_what_the_encoder_can_do():
@@ -530,3 +530,28 @@ def test_the_summary_line_says_what_will_happen():
         video_codec="libx264", rate_control="bitrate", bitrate_kbps=8000, max_height=720,
         deinterlace="ivtc", audio_codec="copy", container="mp4"))
     assert line == "H.264 8bit（x264） · 8000 kbps · medium · ≤720p · 反胶片过带 · 音频原样 · MP4"
+
+
+def test_an_avi_with_b_frames_keeps_its_frame_rate_and_every_frame(tmp_path):
+    """AVI stores no presentation times; the decoder hands H.264 B-frames
+    back labelled in decode order (1,3,4,2,6,7,5…). Read as they are, the
+    sampled rate came out as 6.56 fps on a real VHS capture and the encoder
+    was fed timestamps that run backwards."""
+    source = make_avi(tmp_path / "capture.avi", frames=30, rate=25)
+    with av.open(str(source)) as c:
+        labels = [f.pts for f in c.decode(c.streams.video[0])]
+    assert labels != sorted(labels)                     # the defect is really there
+    with av.open(str(source)) as c:
+        clock = mux.FrameClock.of(c.streams.video[0])
+        fixed = [clock(f) for f in c.decode(c.streams.video[0])]
+    # every one in order, the decoder's flushed last frames (no dts) included
+    assert fixed == sorted(fixed) and len(set(fixed)) == 30
+    sample = encode.sample_video(source, 0)
+    assert abs(1 / sample.step - 25) < 0.01 and sample.regular
+    out, result, _lines = run(source, video_codec="libx264")
+    assert result.stats.frames_out == frames_of(out) == 30
+    times = pts_of(out)
+    steps = {round(b - a, 3) for a, b in zip(times, times[1:])}
+    assert steps == {0.04}
+    with av.open(str(out)) as c:
+        assert abs(float(c.streams.video[0].average_rate) - 25) < 0.01

@@ -20,6 +20,9 @@ const props = defineProps({
   source: { type: Object, default: null },
   // what 按画面选 means where this form is shown (settings / one file / batch)
   autoHint: { type: String, default: '' },
+  // on the 修复 page, which has its own deinterlace and size fields
+  // (RestoreFields): these two are not shown here twice
+  restore: { type: Boolean, default: false },
 })
 
 const encoders = ref([])
@@ -218,7 +221,11 @@ const ntscInterlaced = computed(() => video.value && video.value.interlaced >= 0
     </template>
 
     <el-collapse class="more">
-      <el-collapse-item name="more" title="更多选项：位深、分辨率、反交错、内容类型、保留哪些音轨和字幕">
+      <el-collapse-item
+        name="more"
+        :title="restore ? '更多选项：位深、内容类型、保留哪些音轨和字幕'
+          : '更多选项：位深、分辨率、反交错、内容类型、保留哪些音轨和字幕'"
+      >
         <template v-if="reencoding">
           <el-form-item label="位深">
             <el-radio-group v-model="opts.bit_depth">
@@ -231,21 +238,33 @@ const ntscInterlaced = computed(() => video.value && video.value.interlaced >= 0
               H.265 / AV1 用 10bit 能减少色带；H.264 10bit 很多设备放不了。HDR 片源总是 10bit
             </span>
           </el-form-item>
-          <el-form-item label="分辨率">
+          <el-form-item v-if="!restore" label="分辨率">
             <el-select v-model="opts.max_height" style="width: 200px">
               <el-option v-for="h in HEIGHTS" :key="h.value" :value="h.value" :label="h.label" />
             </el-select>
             <span class="hint">只缩小、不放大，画面比例不变</span>
           </el-form-item>
-          <el-form-item label="反交错">
+          <el-form-item v-if="!restore" label="反交错">
             <el-select v-model="opts.deinterlace" style="width: 340px" :disabled="!deinterlaceOk">
               <el-option value="auto" label="自动：只处理标记为隔行的帧（推荐）" />
               <el-option value="off" label="关闭" />
               <el-option value="all" label="每一帧都反交错" />
               <el-option value="ivtc" label="反胶片过带（IVTC）" />
+              <el-option value="bob" label="还原 60 帧（仅隔行录像，见「修复」页）" />
+              <el-option value="match" label="只做场匹配（30 帧逐行、两场错开）" />
+              <el-option value="detect" label="按画面自动判断（开压前分析，约 20 秒）" />
             </el-select>
             <div class="hint block">
-              <template v-if="opts.deinterlace === 'ivtc'">
+              <template v-if="opts.deinterlace === 'bob'">
+                一个场还原成一帧：隔行的 VHS、电视录像变成每秒 59.94（PAL 50）帧。胶片拍的电影不要用这个。
+              </template>
+              <template v-else-if="opts.deinterlace === 'match'">
+                30 帧逐行拍摄、存进 DVD 时两个场错开了一场的片子：重新配对还原成 29.97 帧逐行，不删帧也不加倍。
+              </template>
+              <template v-else-if="opts.deinterlace === 'detect'">
+                开压前看画面判断是胶片过带、30 帧错场、真隔行还是逐行，各用各的方式；判断结果写在任务日志里。
+              </template>
+              <template v-else-if="opts.deinterlace === 'ivtc'">
                 把 NTSC DVD 上胶片转制的电影、动画还原成每秒 23.976 帧（5 帧里去掉 1 帧）。
                 只对帧率 29.97、时间戳均匀的片源生效，其余的自动改用普通反交错。
               </template>
@@ -296,7 +315,8 @@ const ntscInterlaced = computed(() => video.value && video.value.interlaced >= 0
         想原封不动请选「保持原样」。
       </el-alert>
       <el-alert
-        v-if="ntscInterlaced && opts.deinterlace !== 'ivtc'" type="info" :closable="false"
+        v-if="ntscInterlaced && !restore && !['ivtc', 'bob', 'match', 'detect'].includes(opts.deinterlace)"
+        type="info" :closable="false"
         show-icon class="source-hint" title="片源是隔行的 NTSC（29.97）"
       >
         如果这是电影或动画（胶片转制的 DVD），「更多选项 → 反交错」选「反胶片过带」画质更好。

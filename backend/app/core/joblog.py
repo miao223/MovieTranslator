@@ -292,6 +292,7 @@ class JobLogWriter:
                  + ("，降为立体声" if o.audio_mixdown == "stereo" else ""))
         subs = {"all": "全部保留", "none": "不保留",
                 "languages": "只保留 " + ("/".join(o.subtitle_languages) or "（无）")}[o.subtitles]
+        from app.services import restore
         lines = [
             "任务类型      : 视频压制（重编码）",
             f"概要          : {describe_options(o)}",
@@ -304,6 +305,12 @@ class JobLogWriter:
             f"字幕轨        : {subs}",
             f"输出位置      : {where}",
         ]
+        if restore.restoring(o) or o.field_order != "auto":
+            lines.insert(4, f"修复          : 场序 {o.field_order}，裁边 上{o.crop_top}/"
+                            f"下{o.crop_bottom}/左{o.crop_left}/右{o.crop_right}"
+                            + ("（另自动裁黑边）" if o.crop_auto else "")
+                            + f"，画面比例 {o.aspect}，降噪 {o.denoise}，"
+                            f"放大到 {o.upscale or '不放大'}")
         if request.replace_source:
             lines.append("完成后        : 校验通过就用压制版替换这份无损 MKV（原盘全流程）")
         self.section("任务参数", lines)

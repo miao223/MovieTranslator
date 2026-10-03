@@ -167,6 +167,9 @@ def with_live_keys(frozen: AppSettings, live: AppSettings) -> AppSettings:
     return frozen.model_copy(update={
         "llm": frozen.llm.model_copy(
             update={f: getattr(live.llm, f) for f in LIVE_KEY_FIELDS}),
+        # where the 修复 engine is installed is this machine's business, not
+        # the job's: an engine set up after a job was queued must be used
+        "restore": live.restore,
     })
 
 
@@ -906,7 +909,7 @@ class JobManager:
         been reopened and checked (encode.verify). Anything short of that
         keeps both files and says why.
         """
-        from app.services import cpuyield, encode, encodepick, memguard
+        from app.services import cpuyield, encode, encodepick, memguard, restore
 
         settings = _settings_for(job)
         source = Path(req.source)
@@ -926,6 +929,12 @@ class JobManager:
             job.publish("encoding", 0, message="视觉模型正在看画面，选编码…")
             req = req.model_copy(update={"options": encodepick.decide(
                 source, req.options, settings, log=note)})
+
+        if req.options.deinterlace == "detect" or req.options.crop_auto:
+            # 修复: what the disc is (cadence, black bars) decides the mode,
+            # and the mode the name (片名.1080p.60fps.HEVC.mkv)
+            job.publish("encoding", 0, message="分析片源：节奏、黑边…")
+            req = req.model_copy(update={"options": restore.resolve(source, req.options, note)})
 
         finished = encode.existing_encode(source, req)
         if finished is not None:
@@ -979,7 +988,8 @@ class JobManager:
                 guard.check()
 
             result = encode.encode_file(source, part, req, log=note, progress=progress,
-                                        should_cancel=job.cancel_event.is_set, pace=pace)
+                                        should_cancel=job.cancel_event.is_set, pace=pace,
+                                        engine=settings.restore)
         finally:
             guard.close()
             governor.close()

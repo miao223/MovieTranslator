@@ -1413,6 +1413,71 @@ def encode_probe(path: str) -> dict:
     return info
 
 
+@router.get("/restore/analyze")
+def restore_analyze(path: str) -> dict:
+    """One file for the 修复 page: what its picture is (cadence, from the
+    frames, not the flags every DVD sets), its black bars, and whether its
+    pixel shape is missing — what the encode would measure when it starts
+    with 自动判断, shown before it is queued."""
+    from app.services import restore
+
+    source = _clean_path(path)
+    if not source.is_file():
+        raise HTTPException(status_code=400, detail=f"文件不存在：{source}")
+    try:
+        return restore.analyze(source)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"分析不了这个文件：{exc}") from exc
+
+
+@router.post("/restore/preview")
+def restore_preview_start(body: dict) -> dict:
+    """试看: a few moments of *source* through Lanczos and every AI model,
+    with *options* (the 修复 form) — in the background, on the heavy-job
+    slot; poll GET /restore/preview. Starting one cancels the one running."""
+    from app.services import restore_preview
+
+    source = _clean_path(str(body.get("source", "")))
+    try:
+        options = EncodeOptions(**(body.get("options") or {}))
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        preview = restore_preview.start(source, options, config.load_settings().restore)
+    except restore_preview.PreviewError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return preview.view()
+
+
+@router.get("/restore/preview")
+def restore_preview_status() -> dict:
+    from app.services import restore_preview
+
+    preview = restore_preview.current()
+    return preview.view() if preview else {"status": "idle"}
+
+
+@router.delete("/restore/preview")
+def restore_preview_cancel() -> dict:
+    from app.services import restore_preview
+
+    preview = restore_preview.cancel()
+    return preview.view() if preview else {"status": "idle"}
+
+
+@router.get("/restore/preview/files/{name}")
+def restore_preview_file(name: str):
+    """The preview's video and sheet, inline (no filename: a <video> plays
+    it, with Range requests, instead of the browser downloading it)."""
+    from app.services import restore_preview
+
+    path = restore_preview.file_path(name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="试看的文件已经不在了")
+    media = "video/mp4" if path.suffix == ".mp4" else "image/jpeg"
+    return FileResponse(path, media_type=media)
+
+
 @router.post("/encode/pick")
 def encode_pick(body: dict) -> dict:
     """按画面自动选编码, previewed: the 压制 page asks as soon as a file is

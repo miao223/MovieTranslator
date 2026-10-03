@@ -104,6 +104,15 @@ export const api = {
   // ------------------------------------------------------------- 压制
   // one file: its streams, plus a few decoded frames' worth of detail
   encodeProbe: (path) => request(`/api/encode/probe?path=${encodeURIComponent(path)}`),
+  restoreAnalyze: (path) => request(`/api/restore/analyze?path=${encodeURIComponent(path)}`),
+  // 试看: a few moments through every model, in the background — poll the status
+  restorePreview: (source, options) =>
+    request('/api/restore/preview', { method: 'POST', body: JSON.stringify({ source, options }) }),
+  restorePreviewStatus: () => request('/api/restore/preview'),
+  restorePreviewCancel: () => request('/api/restore/preview', { method: 'DELETE' }),
+  // a URL, not a request: <video>/<img> fetch it themselves (the id busts the cache)
+  restorePreviewFile: (name, id) =>
+    `/api/restore/preview/files/${encodeURIComponent(name)}?v=${encodeURIComponent(id)}`,
   // a folder: every video in it (headers only), never the insides of a disc
   encodeScan: (payload) =>
     request('/api/encode/scan', { method: 'POST', body: JSON.stringify(payload) }),

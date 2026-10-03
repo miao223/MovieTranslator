@@ -38,7 +38,32 @@ export function defaultEncodeOptions() {
     deinterlace: 'auto', audio_codec: 'eac3', audio_scope: 'lossless',
     audio_bitrate_kbps: 0, audio_mixdown: 'keep', audio_languages: [],
     subtitles: 'all', subtitle_languages: [], auto_pick: false,
+    ...RESTORE_OFF,
   }
+}
+
+// the 修复 fields of EncodeOptions as a plain encode leaves them
+export const RESTORE_OFF = {
+  field_order: 'auto', crop_top: 0, crop_bottom: 0, crop_left: 0, crop_right: 0,
+  crop_auto: false, aspect: 'auto', denoise: 'off', upscale: 0, ai_model: '',
+}
+
+// the deinterlace mode an encode will really use: 自动判断 is decided by
+// what the picture is (GET /api/restore/analyze), when that is known
+export function effectiveDeinterlace(options, analysis) {
+  if (options.deinterlace !== 'detect') return options.deinterlace
+  return analysis?.cadence?.mode || ''
+}
+
+// 片名.1080p.60fps.HEVC.mkv: what a restore did to the picture, as the server
+// names it (restore.name_tags). *fps* is the source's, from its probe.
+export function restoreTags(options, fps, analysis = null) {
+  const tags = []
+  if (options.upscale) tags.push(`${options.upscale}p`)
+  if (effectiveDeinterlace(options, analysis) === 'bob' && fps && fps <= 31) {
+    tags.push(`${Math.round(fps * 2)}fps`)
+  }
+  return tags
 }
 
 export function familyOf(encoders, codec) {
@@ -47,11 +72,11 @@ export function familyOf(encoders, codec) {
 }
 
 // 片名.HEVC.mkv next to the source, 片名.mkv in a chosen folder
-export function encodedName(stem, encoders, options, custom) {
+export function encodedName(stem, encoders, options, custom, fps = 0, analysis = null) {
   const ext = options.container || 'mkv'
   if (custom) return `${stem}.${ext}`
   const family = familyOf(encoders, options.video_codec)
   const tag = family === 'copy' ? 'remux'
     : FAMILIES.find((f) => f.value === family)?.tag || options.video_codec
-  return `${stem}.${tag}.${ext}`
+  return [stem, ...restoreTags(options, fps, analysis), tag, ext].join('.')
 }
