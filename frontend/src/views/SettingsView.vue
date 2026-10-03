@@ -1001,7 +1001,7 @@ async function testVision() {
           </el-radio-group>
         </el-form-item>
         <el-form-item label="模型文件夹">
-          <el-input v-model="settings.restore.models_dir" style="max-width: 560px" placeholder="留空：模型缓存目录下的 restore 文件夹" />
+          <el-input v-model="settings.restore.models_dir" style="max-width: 560px" placeholder="留空：「模型缓存目录」下的 restore；那里也没设时是用户目录下的 .cache/MovieTranslator/restore" />
           <div class="hint" style="margin: 4px 0 0; display: block; line-height: 1.6">模型第一次用到时自动下载并校验（几十到一百多 MB）。</div>
         </el-form-item>
       </el-form>
