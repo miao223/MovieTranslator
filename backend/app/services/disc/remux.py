@@ -362,18 +362,32 @@ def remux_title(disc: Disc, title: Title, out_path: Path, *, lpcm: str = "flac",
             # recognising this file as the remux of this title later
             # (encode.REMUX_TAG)
             out.metadata.update(tags or {})
-            reader, first = _open(pieces[0])
-            if _unprobed(first, wants):
-                first.close()
-                reader.close()
-                log("部分音轨的参数在片段开头读不出来，扩大探测范围重读一次…")
-                reader, first = _open(pieces[0], deep=True)
+            # Tracks are built from the first piece, and from later ones for
+            # whatever it does not hold: a play item's clip need not carry
+            # every stream of the title (a logo clip ahead of the film has
+            # the picture alone), and a track only ever met in a later
+            # piece would otherwise have no output to go to.
+            opened = []
             try:
-                routes, tracks = _build_outputs(out, first, wants, disc.kind, lpcm, log, notes)
-                lead = _lead(first, pieces[0])
+                for n, piece in enumerate(pieces):
+                    if n and not _missing(opened, wants, disc.kind):
+                        break
+                    reader, container = _open(piece)
+                    if _unprobed(container, wants):
+                        container.close()
+                        reader.close()
+                        log(f"{piece.label}：部分音轨的参数在片段开头读不出来，扩大探测范围重读一次…")
+                        reader, container = _open(piece, deep=True)
+                    opened.append((reader, container))
+                    if n:
+                        log(f"第一个片段里没有的轨道到 {piece.label} 里找")
+                routes, tracks = _build_outputs(out, [c for _r, c in opened], wants,
+                                                disc.kind, lpcm, log, notes)
+                lead = _lead(opened[0][1], pieces[0])
             finally:
-                first.close()
-                reader.close()
+                for reader, container in opened:
+                    container.close()
+                    reader.close()
             if not any(r.kind == "video" for r in routes.values()):
                 raise DiscError("第一个片段里找不到视频流")
             chapters = [c + lead for c in title.chapters if c < title.duration]
@@ -502,6 +516,13 @@ def remux_title(disc: Disc, title: Title, out_path: Path, *, lpcm: str = "flac",
                     for made in route.out.encode(None):
                         out.mux(made)
                         route.packets += 1
+            # The disc says this title has sound; a file without any is not
+            # a remux of it, however cleanly it was written. A ⚠ in the log
+            # under a job marked done is how a silent film once got through.
+            if any(w.kind == "audio" for w in wants) and not any(
+                    r.kind == "audio" and r.packets for r in routes.values()):
+                raise DiscError("光盘流表里有音轨，但一条音轨都没有写进去"
+                                "（这部片的片段里找不到它们），不交出一个没有声音的文件")
         os.replace(part, out_path)
     except BaseException:
         part.unlink(missing_ok=True)
@@ -581,15 +602,37 @@ def _lead(container, piece: Piece) -> float:
     return round(max(0.0, origin - lowest), 6)
 
 
-def _build_outputs(out, first, wants: List[Want], kind: str, lpcm: str,
+def _streams_by_id(containers, kind_of_want: Dict[int, str]) -> Dict[int, list]:
+    """Each stream id's streams, from the first container that has it as
+    the kind the disc says it is (a TrueHD PID holds two streams: both
+    come from the same container)."""
+    by_id: Dict[int, list] = {}
+    for container in containers:
+        found: Dict[int, list] = {}
+        for s in container.streams:
+            if s.id not in by_id and kind_of_want.get(s.id, s.type) == s.type:
+                found.setdefault(s.id, []).append(s)
+        by_id.update(found)
+    return by_id
+
+
+def _missing(opened, wants: List[Want], kind: str) -> bool:
+    """Does some wanted track appear in none of the pieces opened so far?
+    (A DVD's VobSub is made from a template when absent, so it never is.)"""
+    if not opened:
+        return True
+    by_id = _streams_by_id([c for _r, c in opened], {w.key: w.kind for w in wants})
+    return any(w.key not in by_id for w in wants
+               if not (w.kind == "subtitle" and kind == "dvd"))
+
+
+def _build_outputs(out, containers, wants: List[Want], kind: str, lpcm: str,
                    log: LogFn, notes: List[str]):
     routes: Dict[Tuple[int, str], Route] = {}
     tracks: List[str] = []
     firsts = {"video": True, "audio": True, "subtitle": True}
     template_box = None
-    by_id: Dict[int, list] = {}
-    for s in first.streams:
-        by_id.setdefault(s.id, []).append(s)
+    by_id = _streams_by_id(containers, {w.key: w.kind for w in wants})
     try:
         for want in wants:
             matches = [s for s in by_id.get(want.key, []) if s.type == want.kind]

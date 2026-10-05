@@ -590,6 +590,36 @@ def split_title(title: Title) -> List[Title]:
     return out
 
 
+_GROUP_ORDER = {"video": 0, "audio": 1, "pg": 2, "textst": 2, "ig": 3}
+
+
+def _title_streams(pl: Playlist, clip_info) -> List[Stream]:
+    """The title's stream table: every play item's STN, merged.
+
+    Each play item carries its own table, and they need not agree. Measured
+    on a real disc (Nighty Night, 1986): the film's playlist opens with a
+    7-second studio logo whose table lists the picture alone, and its LPCM
+    and PGS are only in the second item's — reading the first item's table
+    remuxed a 74-minute film with no sound and no subtitles, and called it
+    done. So the longest item (the film itself) sets the order, which is
+    the disc's own (its first audio track is the default one), and anything
+    another item lists that it does not is added after its own kind."""
+    order = sorted(range(len(pl.items)), key=lambda n: (-pl.items[n].seconds, n))
+    seen: Set[Tuple[str, int]] = set()
+    picked: List[Tuple[int, int, Stream]] = []
+    for rank, n in enumerate(order):
+        item = pl.items[n]
+        clip = clip_info(item.clip)
+        for k, entry in enumerate(item.streams):
+            if (entry.group, entry.pid) in seen:
+                continue
+            seen.add((entry.group, entry.pid))
+            picked.append((_GROUP_ORDER.get(entry.group, 9), rank * 1000 + k,
+                           _stream_of(entry, clip)))
+    picked.sort(key=lambda p: (p[0], p[1]))
+    return [s for _g, _k, s in picked]
+
+
 def _title(pl: Playlist, clip_info, stream_file, fs: DiscFS, analysis_only: bool) -> Title:
     segments, items, problems, notes = [], [], [], []
     size: Optional[int] = 0
@@ -610,16 +640,15 @@ def _title(pl: Playlist, clip_info, stream_file, fs: DiscFS, analysis_only: bool
     if missing:
         problems.append("缺少片段文件：" + "、".join(f"{c}.m2ts" for c in sorted(set(missing))[:5]))
 
-    first = pl.items[0]
-    first_clip = clip_info(first.clip)
-    streams = [_stream_of(e, first_clip) for e in first.streams]
+    streams = _title_streams(pl, clip_info)
     if not any(s.kind == "video" for s in streams):
         problems.append("播放列表里没有视频流")
     if any(s.kind == "video" and s.codec == "VC-1" for s in streams):
         problems.append("VC-1 视频：PyAV 不允许把它写进 MKV，暂不支持（以后可以转码）")
-    if first.secondary:
-        notes.append(f"另有 {first.secondary} 条画中画/副音轨，MKV 里不保留")
-    if first.dolby_vision:
+    secondary = max(i.secondary for i in pl.items)
+    if secondary:
+        notes.append(f"另有 {secondary} 条画中画/副音轨，MKV 里不保留")
+    if any(i.dolby_vision for i in pl.items):
         notes.append("杜比视界增强层不保留（保留基础层和 HDR10）")
     angles = max((len(i.angles) + 1 for i in pl.items), default=1)
     if angles > 1:

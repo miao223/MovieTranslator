@@ -436,13 +436,13 @@ def _probe(data: bytes, fmt: str, fps: int) -> Tuple[int, int, int, Dict[str, Li
     return min(pts) // 2, (max(pts) + step) // 2, len(pts), pids, keys
 
 
-def make_m2ts(seconds: float = 2.0, *, fps: int = 24, audio: str = "ac3",
+def make_m2ts(seconds: float = 2.0, *, fps: int = 24, audio: Optional[str] = "ac3",
               channels: int = 2, wide: bool = False, start: float = 0.0,
               cues: Sequence[Tuple[float, float, str]] = (),
               tmp: Optional[Path] = None) -> Clip:
     """A short Blu-ray m2ts: H.264 with B-frames, one audio track (ac3 or
-    pcm_bluray), and PGS subtitles when *cues* are given (times relative to
-    the clip). *start* moves the clip's own timeline, as authoring does."""
+    pcm_bluray; None = picture only, like a studio logo clip), and PGS
+    subtitles when *cues* are given (times relative to the clip). *start* moves the clip's own timeline, as authoring does."""
     import io
 
     import av
@@ -463,14 +463,15 @@ def make_m2ts(seconds: float = 2.0, *, fps: int = 24, audio: str = "ac3",
             v = out.add_stream("libx264", rate=fps)
             v.width, v.height, v.pix_fmt = 128, 96, "yuv420p"
             v.options = {"bf": "3", "g": str(fps)}
-            a = out.add_stream(audio, rate=48000)
-            a.layout = "stereo" if channels == 2 else "5.1(side)" if channels == 6 else "mono"
+            a = out.add_stream(audio, rate=48000) if audio else None
             fmt = "fltp" if audio == "ac3" else ("s32" if wide else "s16")
-            a.format = fmt
+            if a is not None:
+                a.layout = "stereo" if channels == 2 else "5.1(side)" if channels == 6 else "mono"
+                a.format = fmt
             s = out.add_stream_from_template(sup.streams[0]) if sup else None
             base = int(start * fps)
             per = 1536 if audio == "ac3" else 240
-            total = int(seconds * 48000)
+            total = int(seconds * 48000) if a is not None else 0
             offset = int(start * 48000)
             sent = 0
 
@@ -500,7 +501,7 @@ def make_m2ts(seconds: float = 2.0, *, fps: int = 24, audio: str = "ac3",
             for p in v.encode(None):
                 out.mux(p)
             audio_until(seconds + 1)
-            for p in a.encode(None):
+            for p in (a.encode(None) if a is not None else ()):
                 out.mux(p)
             if sup:
                 for p in sup.demux(sup.streams[0]):

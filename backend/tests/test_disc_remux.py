@@ -120,6 +120,68 @@ def test_lpcm_becomes_flac_without_losing_a_bit(tmp_path):
     assert stream_langs(pcm.path)[1][1] == "pcm_s24le"
 
 
+VIDEO_ONLY = (S("video", 0x1011, 0x1B, fmt=6, rate=1),)
+FILM_STREAMS = (S("video", 0x1011, 0x1B, fmt=6, rate=1),
+                S("audio", 0x1100, 0x80, "jpn", fmt=3, rate=1),
+                S("pg", 0x1200, 0x90, "eng"))
+
+
+def logo_then_film(tmp_path, *, film_audio="pcm_bluray"):
+    """The shape of a real disc (Nighty Night, 1986): the film's playlist
+    opens with a picture-only studio logo clip and ends with half a second
+    of picture, and each play item's own stream table says just that."""
+    clips = {"00010": g.make_m2ts(1.0, audio=None, tmp=tmp_path),
+             "00006": g.make_m2ts(3.0, audio=film_audio, start=100.0,
+                                  cues=[(0.5, 1.5, "字幕")], tmp=tmp_path),
+             "00003": g.make_m2ts(0.5, audio=None, start=50.0, tmp=tmp_path)}
+    tables = {"00010": VIDEO_ONLY, "00006": FILM_STREAMS, "00003": VIDEO_ONLY}
+    items = [Item(cid, c.start, c.end, connection=1, streams=tables[cid])
+             for cid, c in clips.items()]
+    pls = {"00002": g.mpls(items, marks=[(1, i, it.in_time) for i, it in enumerate(items)])}
+    info = {cid: g.clpi(c.start, c.end, streams=tables[cid], packets=len(c.data) // 192)
+            for cid, c in clips.items()}
+    root = g.write_bd(tmp_path / "Nighty", pls, info,
+                      streams={k: c.data for k, c in clips.items()})
+    return open_disc(str(root)), clips
+
+
+def test_a_film_after_a_picture_only_logo_keeps_its_sound_and_subtitles(tmp_path):
+    """The title's stream table was the first play item's, and the output
+    tracks were made from the first clip's streams: the logo's. The film
+    came out with picture alone, and the job said done."""
+    disc, clips = logo_then_film(tmp_path)
+    title = disc.titles[0]
+    assert [(s.kind, s.codec, s.language) for s in title.streams] == [
+        ("video", "H.264", ""), ("audio", "LPCM", "jpn"), ("subtitle", "PGS", "eng")]
+
+    result = remux_title(disc, title, tmp_path / "Nighty.mkv")
+    assert stream_langs(result.path) == [
+        ("video", "h264", ""), ("audio", "flac", "jpn"), ("subtitle", "pgssub", "eng")]
+    assert _frames(result.path) == sum(c.frames for c in clips.values())
+    seconds = decoded_samples(result.path).shape[1] / 2 / 48000   # stereo, interleaved
+    assert 2.9 < seconds < 3.1                                      # the film's three seconds
+    with av.open(str(result.path)) as out:
+        assert abs(out.duration / av.time_base - title.duration) < 0.2
+        first_audio = next(float(p.pts * p.time_base) for p in out.demux(out.streams.audio[0])
+                           if p.pts is not None)
+        out.seek(0)
+        subs = [float(p.pts * p.time_base) for p in out.demux(out.streams.subtitles[0])
+                if p.pts is not None and p.size]
+    # the sound starts where the film does, after the one-second logo
+    assert abs(first_audio - 1.0) < 0.1
+    assert subs and abs(subs[0] - 1.5) < 0.1
+
+
+def test_a_title_whose_sound_is_in_no_clip_fails_instead_of_going_silent(tmp_path):
+    from app.services.disc.binary import DiscError
+
+    disc, _ = logo_then_film(tmp_path, film_audio=None)
+    with pytest.raises(DiscError, match="音轨"):
+        remux_title(disc, disc.titles[0], tmp_path / "silent.mkv")
+    assert not (tmp_path / "silent.mkv").exists()
+    assert not (tmp_path / "silent.mkv.part").exists()
+
+
 def test_cancelling_leaves_nothing_behind(tmp_path):
     clip = g.make_m2ts(2.0, tmp=tmp_path)
     disc = bd_disc(tmp_path, {"00001": clip}, [("00001", clip.start, clip.end, 1)])
