@@ -10,7 +10,12 @@ dependencies = [
     # 17.0 is the floor for add_mux_stream (the mov_text track in mux.py);
     # add_stream_from_template, used since the first embed release, needs 14.0 —
     # the old >=12.0 floor was never actually satisfiable by this code.
-    "av>=17.0",
+    # Below 19: PyAV 19 dropped av.open(metadata_errors=…), which
+    # faster-whisper 1.2.1's decode_audio still passes — every recognition
+    # (API engine and local whisper alike) failed on its first call on a
+    # fresh install. Everything here is measured on 18; lift the cap once
+    # faster-whisper no longer passes it.
+    "av>=17.0,<19",
     # 1.1 is the floor for WhisperModel.detect_language, used to choose the
     # source-language sample sentence when the language is set to auto
     # (asr._pick_exemplar).
