@@ -1835,6 +1835,13 @@ def queue_entry_result(entry_id: str, part: str = "translation"):
     part="original" 取双文件模式的原文那一份，它**永远**是字幕文件：内嵌模式
     下另一个按钮给的是视频，而原文那一份仍然在工作目录里躺着。
     """
+    path = queue_result_path(entry_id, part)
+    return FileResponse(str(path), filename=path.name)
+
+
+def queue_result_path(entry_id: str, part: str = "translation") -> Path:
+    """Where the file queue_entry_result serves lies — shared with the MCP
+    tool that hands back the same subtitle as text."""
     entry = queue_manager.store.get(entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="列队里没有这条任务")
@@ -1844,7 +1851,7 @@ def queue_entry_result(entry_id: str, part: str = "translation"):
             raise HTTPException(status_code=404, detail="这条任务没有单独的原文字幕")
         if not original.is_file():
             raise HTTPException(status_code=404, detail=f"文件已不在原位置：{original}")
-        return FileResponse(str(original), filename=original.name)
+        return original
     if part != "translation":
         raise HTTPException(status_code=400, detail="part 只能是 translation 或 original")
     name = entry.result_video or entry.result_srt
@@ -1856,7 +1863,7 @@ def queue_entry_result(entry_id: str, part: str = "translation"):
         path = Path(job_dir(entry.job_id)) / name
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"文件已不在原位置：{path}")
-    return FileResponse(str(path), filename=path.name)
+    return path
 
 
 @router.delete("/queue/{entry_id}")

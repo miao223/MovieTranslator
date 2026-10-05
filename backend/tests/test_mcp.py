@@ -46,15 +46,31 @@ class FakeJob:
 
 @pytest.mark.anyio
 async def test_the_advertised_tools_are_the_agreed_set(mcp):
-    """Settings are deliberately absent: a client that could rewrite the
-    ASR model or the LLM key from a sentence of prose is a far larger
-    blast radius than one that can only run jobs."""
+    """Everything the pages do, minus the settings page: a client that could
+    rewrite the ASR model or the LLM key from a sentence of prose is a far
+    larger blast radius than one that can only run jobs."""
     names = {t.name for t in await mcp.list_tools()}
     assert names == {
-        "list_videos", "list_audio_tracks", "list_subtitle_tracks",
-        "get_server_status", "translate_video", "translate_directory",
+        # discovery
+        "list_videos", "browse_files", "list_audio_tracks", "list_subtitle_tracks",
+        "list_encoders", "get_server_status",
+        # translating now, and following it
+        "translate_video", "translate_directory",
         "get_job", "get_batch", "cancel_job", "cancel_batch",
-        "get_subtitle", "get_job_log",
+        "get_subtitle", "get_job_log", "list_logs", "get_log_file",
+        # the queue
+        "get_queue", "get_queue_entry_snapshot", "get_queue_subtitle",
+        "cancel_queue_entry", "retry_queue_entry", "remove_queue_entry",
+        "clear_finished_queue", "reorder_queue", "set_queue_options",
+        "queue_translate_video", "queue_translate_directory",
+        # 原盘
+        "analyze_disc", "analyze_disc_folder", "queue_disc", "queue_disc_folder",
+        # 压制 / 修复
+        "probe_video", "scan_encode_folder", "pick_encode", "queue_encode",
+        "queue_encode_batch", "analyze_restore", "start_restore_preview",
+        "get_restore_preview", "cancel_restore_preview",
+        # 音频
+        "probe_audio", "scan_audio_folder", "queue_audio", "queue_audio_batch",
     }
     assert not any("setting" in n for n in names)
 
@@ -74,7 +90,7 @@ async def test_translate_video_returns_at_once_with_a_job_id(mcp, monkeypatch):
     """A film takes hours; the tool must hand back a handle, not block."""
     seen = {}
 
-    def fake_create(request):
+    def fake_create(request, settings=None):
         seen["request"] = request
         return FakeJob(stage="pending")
 
@@ -91,7 +107,7 @@ async def test_translate_video_returns_at_once_with_a_job_id(mcp, monkeypatch):
 
 @pytest.mark.anyio
 async def test_a_missing_file_comes_back_as_a_message_not_a_crash(mcp, monkeypatch):
-    def boom(request):
+    def boom(request, settings=None):
         raise FileNotFoundError("视频文件不存在: /v/gone.mkv")
 
     monkeypatch.setattr(mcp_server.manager, "create", boom)
@@ -101,7 +117,7 @@ async def test_a_missing_file_comes_back_as_a_message_not_a_crash(mcp, monkeypat
 
 @pytest.mark.anyio
 async def test_a_bad_output_mode_is_rejected_before_a_job_starts(mcp, monkeypatch):
-    def fail(request):  # pragma: no cover — must not be reached
+    def fail(request, settings=None):  # pragma: no cover — must not be reached
         raise AssertionError("job should not have been created")
 
     monkeypatch.setattr(mcp_server.manager, "create", fail)
@@ -114,7 +130,7 @@ async def test_the_pure_original_mode_reaches_the_job_request(mcp, monkeypatch):
     """白名单是手写的元组，加了 Literal 值忘了改这里，MCP 客户端就用不上。"""
     seen = {}
 
-    def capture(request):
+    def capture(request, settings=None):
         seen["mode"] = request.output_mode
         return FakeJob()
 
@@ -131,7 +147,7 @@ async def test_the_two_file_mode_reaches_the_job_request(mcp, monkeypatch):
     MCP 客户端就用不上这个模式。"""
     seen = {}
 
-    def capture(request):
+    def capture(request, settings=None):
         seen["mode"] = request.output_mode
         return FakeJob()
 
@@ -228,7 +244,7 @@ async def test_translate_directory_accepts_the_container_it_documents(
     but were missing from the signature — every call raised NameError."""
     seen = {}
 
-    def fake_create(request):
+    def fake_create(request, settings=None):
         seen["request"] = request
         return BatchStatus(id="b1", directory=request.directory, total=0)
 
@@ -247,7 +263,7 @@ async def test_an_audio_source_is_not_turned_away_over_embedding(mcp, monkeypatc
     what the other door accepts."""
     seen = {}
 
-    def fake_create(request):
+    def fake_create(request, settings=None):
         seen["request"] = request
         return FakeJob(stage="pending")
 
@@ -331,3 +347,187 @@ def test_a_web_page_cannot_reach_the_tools(settings_file):
     with local_client(app) as client:
         r = client.post("/mcp", headers={"Origin": "https://evil.example"})
     assert r.status_code == 403
+
+
+# --------------------------------------------------------------- the queue
+#
+# The queue tools call the route functions themselves, so these go through a
+# real (temp) queue store: what the web refuses, MCP refuses in its words.
+
+
+@pytest.fixture
+def queue(settings_file, monkeypatch):
+    import app.api.routes as routes_mod
+    from app.services.jobqueue import QueueManager
+
+    settings_file(disc__min_title_seconds=0)
+    fresh = QueueManager()
+    fresh.store.load()
+    monkeypatch.setattr(routes_mod, "queue_manager", fresh)
+    return fresh
+
+
+@pytest.mark.anyio
+async def test_translating_now_freezes_the_settings_of_this_moment(mcp, monkeypatch):
+    """The page's 开始翻译 snapshots the settings when pressed
+    (routes.create_job); the MCP door used to skip it, so a job started
+    remotely ran with whatever the settings said when its turn came."""
+    seen = {}
+
+    def capture(request, settings=None):
+        seen["settings"] = settings
+        return FakeJob(stage="pending")
+
+    monkeypatch.setattr(mcp_server.manager, "create", capture)
+    await call(mcp, "translate_video", video_path="/v/f.mkv")
+    assert seen["settings"] is not None
+
+
+@pytest.mark.anyio
+async def test_a_film_queued_over_mcp_is_an_ordinary_queue_entry(mcp, queue, tmp_path):
+    film = tmp_path / "a.mkv"
+    film.write_bytes(b"")
+    out = await call(mcp, "queue_translate_video", video_path=str(film),
+                     source_language="ja", output_mode="translation_only")
+    assert out["position"] == 1 and out["entry"]["kind"] == "job"
+    entry = queue.store.entries[0]
+    assert entry.request.source_language == "ja" and entry.settings is not None
+
+    listed = await call(mcp, "get_queue", status="queued")
+    assert [e["id"] for e in listed["entries"]] == [entry.id]
+    assert (await call(mcp, "get_queue", status="done"))["entries"] == []
+    assert "status" in (await call(mcp, "get_queue", status="finished"))["error"]
+    frozen = await call(mcp, "get_queue_entry_snapshot", entry_id=entry.id)
+    assert frozen["same_as_current"] is True and frozen["lines"]
+
+    assert (await call(mcp, "remove_queue_entry", entry_id=entry.id)) == {"ok": True}
+    assert queue.store.entries == []
+
+
+@pytest.mark.anyio
+async def test_a_route_refusal_comes_back_in_its_own_words(mcp, queue, tmp_path):
+    out = await call(mcp, "queue_translate_video", video_path=str(tmp_path / "gone.mkv"))
+    assert "不存在" in out["error"]
+    out = await call(mcp, "remove_queue_entry", entry_id="nope")
+    assert "没有这条任务" in out["error"]
+    out = await call(mcp, "reorder_queue", ids=["x"])
+    assert "刷新" in out["error"]
+
+
+@pytest.mark.anyio
+async def test_a_finished_entry_hands_back_its_subtitle(mcp, queue, tmp_path):
+    film = tmp_path / "a.mkv"
+    film.write_bytes(b"")
+    (tmp_path / "a.zh.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n",
+                                       encoding="utf-8")
+    await call(mcp, "queue_translate_video", video_path=str(film))
+    entry = queue.store.entries[0]
+    entry.status, entry.result_srt, entry.result_in_place = "done", "a.zh.srt", True
+    out = await call(mcp, "get_queue_subtitle", entry_id=entry.id)
+    assert "你好" in out["content"] and out["path"].endswith("a.zh.srt")
+    assert "原文" in (await call(mcp, "get_queue_subtitle", entry_id=entry.id,
+                                 part="original"))["error"]
+
+
+@pytest.mark.anyio
+async def test_queue_switches_change_only_what_was_given(mcp, queue):
+    out = await call(mcp, "set_queue_options", paused=True)
+    assert out["paused"] is True and queue.store.paused
+    out = await call(mcp, "set_queue_options", cpu_yield=True)
+    assert out == {"paused": True, "cpu_yield": True, "memory_limit_gb": 0.0}
+    assert "GB" in (await call(mcp, "set_queue_options", memory_limit_gb=0.5))["error"]
+    await call(mcp, "set_queue_options", paused=False, cpu_yield=False)
+
+
+@pytest.mark.anyio
+async def test_an_encode_starts_from_the_settings_defaults(mcp, queue, settings_file, tmp_path):
+    """The 压制 form starts from AppSettings.encode; a client naming two
+    fields gets those two on top of the user's defaults, not on top of the
+    model's."""
+    from tests.mediagen import make_source
+
+    settings_file(encode__preset="slow", encode__quality=18)
+    source = make_source(tmp_path / "f.mkv")
+    out = await call(mcp, "queue_encode", source=str(source),
+                     options={"video_codec": "libx264", "quality": 20})
+    assert out["entry"]["kind"] == "encode", out
+    options = queue.store.entries[0].encode.options
+    assert (options.video_codec, options.quality, options.preset) == ("libx264", 20, "slow")
+
+
+@pytest.mark.anyio
+async def test_an_encode_the_web_would_refuse_is_refused(mcp, queue, tmp_path):
+    from tests.mediagen import make_source
+
+    source = make_source(tmp_path / "f.mkv")
+    out = await call(mcp, "queue_encode", source=str(source),
+                     options={"video_codec": "h264_nvenc"})
+    assert out["error"] and queue.store.entries == []
+    out = await call(mcp, "queue_encode", source=str(source), output_mode="custom")
+    assert "哪个文件夹" in out["error"]
+
+
+@pytest.mark.anyio
+async def test_a_mistyped_option_is_answered_with_what_is_allowed(mcp, queue, tmp_path):
+    """The option models are typed, so a client sees their fields and
+    allowed values in the schema — and a wrong one is refused by name."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    with pytest.raises(ToolError, match="preset"):
+        await mcp.call_tool("queue_encode", {"source": str(tmp_path / "f.mkv"),
+                                             "options": {"preset": "turbo"}})
+    tool = next(t for t in await mcp.list_tools() if t.name == "queue_encode")
+    assert "upscale" in json.dumps(tool.inputSchema)
+
+
+@pytest.mark.anyio
+async def test_a_disc_goes_in_with_its_encode_and_subtitles(mcp, queue, settings_file, tmp_path):
+    from tests.test_disc_api import film_disc
+
+    settings_file(disc__min_title_seconds=0, encode__preset="slow")
+    root, _ = film_disc(tmp_path)
+    report = await call(mcp, "analyze_disc", path=str(root))
+    assert report["name"] == "Film (2001)" and report["titles"]
+
+    out = await call(mcp, "queue_disc", path=str(root), encode={"video_codec": "libx264"},
+                     subtitles={"target_language": "简体中文"})
+    assert out["entry"]["kind"] == "disc", out
+    entry = queue.store.entries[0]
+    assert entry.then_encode.options.video_codec == "libx264"
+    assert entry.then_encode.options.preset == "slow"
+    assert entry.then_encode.replace_source is True      # the page's default
+    assert entry.then.target_language == "简体中文"
+
+
+@pytest.mark.anyio
+async def test_audio_is_queued_like_the_page_queues_it(mcp, queue, tmp_path):
+    from tests.mediagen import make_source
+
+    source = make_source(tmp_path / "f.mkv", audio=[{"codec": "aac", "language": "jpn"}])
+    probe = await call(mcp, "probe_audio", path=str(source))
+    assert probe["tracks"] and probe["extracted"] == ""
+    out = await call(mcp, "queue_audio", source=str(source), options={"format": "opus"})
+    assert out["entry"]["kind"] == "audio", out
+    assert queue.store.entries[0].audio.options.format == "opus"
+    assert "没有音轨" in (await call(mcp, "queue_audio", source=str(source), track=99))["error"]
+
+
+@pytest.mark.anyio
+async def test_the_encode_pick_leaves_its_picture_behind(mcp, monkeypatch, settings_file, tmp_path):
+    """A base64 contact sheet is close to a megabyte of tokens."""
+    from app.services import encodepick
+
+    settings_file()
+    film = tmp_path / "f.mkv"
+    film.write_bytes(b"")
+
+    class Verdict:
+        content, grain, reason = "animation", "none", "线条干净"
+
+        def describe(self):
+            return "动画"
+
+    monkeypatch.setattr(encodepick, "analyze", lambda path, settings: (Verdict(), b"jpeg"))
+    out = await call(mcp, "pick_encode", path=str(film))
+    assert out["content"] == "animation" and "image" not in out
+    assert out["options"]["video_codec"]
