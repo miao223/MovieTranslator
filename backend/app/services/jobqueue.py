@@ -50,10 +50,12 @@ from app.models.schemas import (
 # Terminal states, the same three the rest of the app uses (batch.TERMINAL).
 TERMINAL = {"done", "failed", "cancelled"}
 
-# Finished entries are history; they are kept, but not forever. Mirrors
-# joblog.KEEP_LOGS — the newest N by finish time, queued and running
-# entries never pruned.
-KEEP_FINISHED = 50
+# Finished entries are history; they are kept, but not forever: the newest
+# N by finish time, queued and running entries never pruned. 200, not 50:
+# one 95-film batch pruned its own first 44 entries while it was still
+# running, and the list read as if the rest of the batch had gone missing
+# — and whether any of those had failed could no longer be told from it.
+KEEP_FINISHED = 200
 # A cap so that a client in a loop cannot grow the file without bound.
 MAX_QUEUED = 500
 
