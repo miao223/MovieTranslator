@@ -40,7 +40,7 @@ import threading
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.models.schemas import (
     GEMINI_ASR_MODEL,
@@ -93,6 +93,13 @@ WINDOW_MIN_RATIO = 0.4  # do not shorten a window just because a gap appeared
 WINDOW_MAX_RATIO = 1.4  # ...and never run past this without one
 WINDOW_HARD_MAX = 420.0  # whatever the target, no window runs longer than this
 WINDOW_FLOOR = 30.0     # halving stops here
+# ...except for a stretch Google's content filter refused: it is halved on
+# down to pieces of 5–10 s. Measured on three films (2026-10-06): the
+# refusal sits on about ten seconds — split into quarters, a refused 50 s
+# window gave three quarters of ordinary dialogue and one refused quarter —
+# while stopping at 30 s wrote off 25–50 s around each one, and two films
+# failed on gaps that were mostly dialogue the model would have given.
+FILTER_FLOOR = 5.0
 
 WINDOW_ATTEMPTS = 2     # one retry, as in ocr._read_sheet
 MAX_CALL_FACTOR = 4     # total requests cap = this × number of windows
@@ -140,7 +147,13 @@ OTHER_FORMAT = {"mp3": "wav", "wav": "mp3"}
 TIME_SLACK = 1.0            # seconds past the window end that get clamped
 MIN_CUE_SECONDS = 0.2       # subtitle.py must never see a zero-length cue
 MAX_INVERSION_SHARE = 0.05  # more out-of-order lines than this = unusable
-MAX_REPEAT_SHARE = 0.30     # identical neighbours: a decode loop
+MAX_REPEAT_SHARE = 0.30     # identical neighbours: a decode loop...
+# ...but only with at least this many repeats. A song's chorus is identical
+# lines too: a closing song sung "Hey yo, watch your back" four times made
+# 3 repeats in 6 lines, failed the window twice, was split, failed again
+# and took the film over the 2% line — with the model right every time. A
+# loop runs to dozens or thousands of lines; a chorus to a handful.
+MIN_LOOP_REPEATS = 5
 MIN_SPEECH_FOR_TEXT = 3.0   # below this, "nothing here" needs no defence
 DISPUTE_SPEECH = 10.0       # ...above this, disagreeing with the model is worth a log line
 PROSE_MIN_CHARS = 20        # a paragraph where a transcript was asked for
@@ -199,6 +212,30 @@ def request_options(flex: bool) -> dict:
 # a quota or a billing problem answers 429 too, and waiting does not fix it
 _NOT_CAPACITY = ("quota", "billing")
 _CAPACITY_WORDS = ("unavailable", "high demand", "overloaded", "at capacity")
+
+
+def content_filtered(resp) -> str:
+    """The finish reason, when Google's filter refused this stretch; else "".
+
+    Measured on the official endpoint (2026-10-06): a choice with
+    `message: null`, `finish_reason: "content_filter: OTHER"`, no output
+    tokens, and the audio billed. It was read as an empty transcript —
+    "silero heard speech but not one line came back" — so it was neither
+    named nor treated as what it is, and neither a resend in another
+    container (refused three times out of three) nor a 30 s split reaches
+    it. A choice with no message at all is counted too, whatever its
+    reason: there is no answer in it to judge.
+    """
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        return ""
+    choice = choices[0]
+    reason = str(getattr(choice, "finish_reason", "") or "")
+    if "content_filter" in reason.lower():
+        return reason
+    if getattr(choice, "message", None) is None:
+        return reason or "没有返回消息"
+    return ""
 
 
 def capacity_refusal(exc: Exception) -> bool:
@@ -388,7 +425,8 @@ def speech_inside(
 
 
 def split_point(
-    intervals: Sequence[tuple[float, float]], start: float, end: float
+    intervals: Sequence[tuple[float, float]], start: float, end: float,
+    floor: float = WINDOW_FLOOR,
 ) -> float:
     """Where to halve a window that will not verify — the best silence near
     the middle, or the middle itself."""
@@ -396,7 +434,7 @@ def split_point(
     gaps = [
         ((before[1] + after[0]) / 2, after[0] - before[1])
         for before, after in zip(intervals, list(intervals)[1:])
-        if before[1] > start + WINDOW_FLOOR / 2 and after[0] < end - WINDOW_FLOOR / 2
+        if before[1] > start + floor / 2 and after[0] < end - floor / 2
     ]
     if not gaps:
         return middle
@@ -771,7 +809,7 @@ def validate(
         notes.append(f"{outside} 行落在本段之外，已丢弃")
 
     repeats = sum(1 for a, b in zip(kept, kept[1:]) if a[2] == b[2])
-    if kept and repeats / len(kept) > MAX_REPEAT_SHARE:
+    if kept and repeats >= MIN_LOOP_REPEATS and repeats / len(kept) > MAX_REPEAT_SHARE:
         fatal.append(f"{repeats}/{len(kept)} 行与上一行完全相同（疑似解码陷环）")
         return [], fatal, notes
 
@@ -898,6 +936,27 @@ def _clock(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
 
+# Why a stretch went untranscribed, in the words the job's error uses. The
+# error used to say "the endpoint keeps refusing" whatever happened; of the
+# three films that first failed on it, one was Google's content filter, one
+# our own repeat check rejecting a chorus, and none the endpoint refusing.
+GAP_CAUSES = {
+    "filter": "Google 内容过滤拒绝",
+    "empty": "模型反复返回空回复",
+    "budget": "请求数用完",
+    "other": "转写没通过校验或请求出错",
+}
+
+
+def gap_summary(missing: Sequence[tuple[float, float]], causes: Sequence[str]) -> str:
+    """'Google 内容过滤拒绝 3 段 41s；转写没通过校验或请求出错 1 段 56s'."""
+    totals: Dict[str, List[float]] = {}
+    for (a, b), cause in zip(missing, causes):
+        totals.setdefault(cause, []).append(b - a)
+    return "；".join(f"{GAP_CAUSES.get(c, c)} {len(v)} 段 {sum(v):.0f}s"
+                    for c, v in totals.items())
+
+
 # ------------------------------------------------------------- entry point
 
 
@@ -992,6 +1051,7 @@ def transcribe(
         complaint = ""
         failure = ""
         empty_billed = 0
+        filtered = 0       # attempts Google's content filter refused
         switched = False
         attempt = 0
         allowed = WINDOW_ATTEMPTS
@@ -1100,6 +1160,20 @@ def transcribe(
                 tally["completion"] += getattr(usage_obj, "completion_tokens", 0) or 0
                 tally["thinking"] += thinking_tokens(usage_obj)
 
+            refused = content_filtered(resp)
+            if refused:
+                # Not a reply to fault, so no complaint for the model: the
+                # same request goes again once (one of four refused windows
+                # answered on its third try), then the ladder splits it far
+                # finer than usual (FILTER_FLOOR). Not the other container:
+                # refused in both, three times out of three.
+                filtered += 1
+                failure = f"Google 内容过滤拒绝了这一段（finish_reason={refused}）"
+                if log:
+                    log(f"⚠ {where} 第 {attempt} 次被 Google 内容过滤拒绝"
+                        f"（finish_reason={refused}；音频已计费，没有返回文字）")
+                continue
+
             carried = audio_reached_the_model(getattr(resp, "usage", None), seconds)
             if carried is False:
                 complaint = failure = "请求里似乎没有音频"
@@ -1177,6 +1251,8 @@ def transcribe(
                 "cues": [(start + a, start + b, text) for a, b, text in kept],
             }
         return {"window": window, "fatal": failure or "校验未通过",
+                # the last word was the filter's: split this one fine
+                "filtered": bool(filtered) and failure.startswith("Google 内容过滤"),
                 "attempts": attempt, "reply": "",
                 "empty_billed": empty_billed}
 
@@ -1186,10 +1262,11 @@ def transcribe(
     budget = MAX_CALL_FACTOR * max(1, len(windows))
     collected: List[Cue] = []
     missing: List[tuple[float, float]] = []   # stretches nothing got through
+    causes: List[str] = []                     # ...and why, one per stretch (GAP_CAUSES)
     allowed_missing = MAX_MISSING_SHARE * duration if duration else 0.0
     last_failure = ""   # the server's own words, for whichever exit fires
 
-    def give_up(start: float, end: float, why: str) -> None:
+    def give_up(start: float, end: float, why: str, cause: str = "other") -> None:
         """Record a stretch as untranscribed, or stop the stage.
 
         Raises once the gaps outgrow `allowed_missing` — immediately, so a
@@ -1197,6 +1274,7 @@ def transcribe(
         it is recognised rather than after the whole budget is spent.
         """
         missing.append((start, end))
+        causes.append(cause)
         lost = sum(b - a for a, b in missing)
         if log:
             log(f"⚠ [{_clock(start)}–{_clock(end)}] 放弃这一段（{why}）；"
@@ -1206,9 +1284,10 @@ def transcribe(
             ranges = "、".join(f"{_clock(a)}–{_clock(b)}" for a, b in missing)
             raise RuntimeError(
                 f"语音识别有 {lost:.0f}s 没能转出来（{ranges}），"
-                f"超过全片的 {MAX_MISSING_SHARE:.0%}——接口在持续拒绝，"
+                f"超过全片的 {MAX_MISSING_SHARE:.0%}（{gap_summary(missing, causes)}），"
                 f"这份转写已经不值得交付（最后一次失败：{why}）；"
-                "可稍后重试或改用本地识别引擎"
+                + ("这是 Google 对本片部分内容的拒绝，重试多半同样被拒，可改用本地识别引擎"
+                   if set(causes) == {"filter"} else "可稍后重试或改用本地识别引擎")
             )
     pool = ThreadPoolExecutor(max_workers=max(1, settings.api_concurrency))
     inflight: dict = {}
@@ -1229,7 +1308,7 @@ def transcribe(
                     if log:
                         log(f"⚠ 请求数已达上限（{budget} 次），仍有 {len(pending)} 段未完成")
                     while pending:
-                        give_up(*pending.popleft(), why)
+                        give_up(*pending.popleft(), why, "budget")
                     break
                 window = pending.popleft()
                 inflight[pool.submit(one_window, window)] = window
@@ -1240,20 +1319,29 @@ def transcribe(
                 start, end = window
                 if "fatal" in result:
                     last_failure = result["fatal"]
-                    if end - start > WINDOW_FLOOR * 2:
-                        middle = split_point(cuts, start, end)
+                    filtered = result.get("filtered", False)
+                    floor = FILTER_FLOOR if filtered else WINDOW_FLOOR
+                    if end - start > floor * 2:
+                        middle = split_point(cuts, start, end, floor)
                         pending.appendleft((middle, end))
                         pending.appendleft((start, middle))
+                        if filtered:
+                            # the finer ladder pays for itself in requests,
+                            # not out of the other windows' share
+                            budget += 2 * WINDOW_ATTEMPTS
                         if log:
-                            log(f"  [{_clock(start)}–{_clock(end)}] 拆成两段再试")
+                            log(f"  [{_clock(start)}–{_clock(end)}] 拆成两段再试"
+                                + ("（被内容过滤拒绝的段一直拆到 10 秒以内）"
+                                   if filtered else ""))
                         continue
                     # Out of ladder on a stretch this short. Let the film
                     # keep its other ninety minutes; give_up decides whether
                     # the gaps have grown past what is worth delivering.
+                    empty = result.get("empty_billed", 0) >= result.get("attempts", 1)
                     give_up(start, end,
                             "连续收到空回复，换音频格式与拆短窗口都没能绕开"
-                            if result.get("empty_billed", 0) >= result.get("attempts", 1)
-                            else result["fatal"])
+                            if empty else result["fatal"],
+                            "filter" if filtered else "empty" if empty else "other")
                     done_seconds += end - start
                     if progress:
                         progress(min(done_seconds / duration, 1.0) if duration else 1.0)
@@ -1302,8 +1390,8 @@ def transcribe(
                 f"（占全片 {(lost / duration if duration else 0):.1%}，"
                 f"在容许的 {MAX_MISSING_SHARE:.0%} 以内）——"
                 "这些时间段的字幕是空的，不是那里没有人说话：")
-            for a, b in missing:
-                log(f"    {_clock(a)}–{_clock(b)}（{b - a:.0f}s）")
+            for (a, b), cause in zip(missing, causes):
+                log(f"    {_clock(a)}–{_clock(b)}（{b - a:.0f}s，{GAP_CAUSES.get(cause, cause)}）")
         log("注：本引擎没有词级时间戳，下面的覆盖率按 segment 区间计量，"
             "读数偏乐观，与本地引擎的数字不可直接比较")
     # Coverage first, diagnostics second — deliberately. Every check in

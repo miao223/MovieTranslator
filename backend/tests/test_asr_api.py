@@ -1233,3 +1233,100 @@ def test_thinking_tokens_are_counted_from_the_total(run):
     _, _, logged = run(FakeAudio(thinking=50), usage=usage)
     assert usage["thinking"] == 50 * usage["calls"]
     assert any(f"思考 {usage['thinking']}" in line for line in logged)
+
+
+# ------------------------------------------- what failed three films (2026-10-06)
+
+
+def test_a_chorus_is_not_a_decode_loop():
+    """The closing song of 琉球ホラー 2017: four identical lines of chorus,
+    transcribed right every time and rejected as a loop every time."""
+    cues = [(0.0, 4.1, "No way out if you scream loud"),
+            (4.1, 10.5, "They're gonna take you into the night."),
+            (10.5, 16.8, "Hey yo, hey yo, watch your back."),
+            (16.8, 23.0, "Hey yo, hey yo, watch your back."),
+            (23.0, 29.2, "Hey yo, hey yo, watch your back."),
+            (29.2, 35.3, "Hey yo, hey yo, watch your back.")]
+    kept, fatal, _ = A.validate(cues, 55.0, 0.0)
+    assert not fatal and len(kept) == 6
+
+
+def test_a_short_loop_is_still_a_loop():
+    cues = [(float(i), float(i) + 1.0, "同じ台詞") for i in range(6)]
+    kept, fatal, _ = A.validate(cues, 60.0, 30.0)
+    assert fatal and "陷环" in fatal[0]
+
+
+def _filtered_response():
+    class Obj:
+        pass
+
+    choice, resp, usage = Obj(), Obj(), Obj()
+    choice.message = None
+    choice.finish_reason = "content_filter: OTHER"
+    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens = 1700, 0, 1700
+    resp.choices, resp.usage = [choice], usage
+    return resp
+
+
+def test_the_filter_is_recognised_by_its_finish_reason():
+    assert A.content_filtered(_filtered_response()) == "content_filter: OTHER"
+
+    class Obj:
+        pass
+
+    ok, msg = Obj(), Obj()
+    msg.content = "[00:01.000 --> 00:02.000] はい"
+    ok.choices = [Obj()]
+    ok.choices[0].message, ok.choices[0].finish_reason = msg, "stop"
+    assert A.content_filtered(ok) == ""
+
+
+class FilteredSpot(FakeAudio):
+    """Google's filter as measured: every request whose audio holds one
+    spot of the film is refused, in any container, however often it is
+    asked; everything around it answers normally."""
+
+    def __init__(self, spots, monkeypatch, **kw):
+        super().__init__(**kw)
+        self.spots = spots
+        self.windows = []
+        real = A.encode_window
+
+        def recording(audio, start, end, fmt="mp3"):
+            self.windows.append((start, end))
+            return real(audio, start, end, fmt)
+
+        monkeypatch.setattr(A, "encode_window", recording)
+
+    def create(self, model, messages, temperature, **kw):
+        resp = super().create(model, messages, temperature, **kw)
+        start, end = self.windows[-1]
+        if any(start <= spot < end for spot in self.spots):
+            return _filtered_response()
+        return resp
+
+
+def test_a_filtered_stretch_is_split_down_to_ten_seconds(run, monkeypatch):
+    """Before: one 2 s refusal cost a 25–50 s window, and two films failed
+    on the 2% line. Now the gap is the refused piece and no more."""
+    # a line every 3 s: a 10 s piece of real dialogue is not one line
+    client = FilteredSpot([437.0], monkeypatch, replies=[lambda s: cue_lines(s, step=3.0)])
+    segments, _, logged = run(client)
+    text = "\n".join(logged)
+    assert "Google 内容过滤拒绝" in text and "content_filter: OTHER" in text
+    assert "换成" not in text                 # the other container is never tried
+    gap = next(line for line in logged if line.startswith("    ") and "内容过滤" in line)
+    seconds = int(re.search(r"（(\d+)s", gap).group(1))
+    assert seconds <= 10
+    assert segments
+
+
+def test_too_much_filtered_says_so_instead_of_blaming_the_endpoint(run, monkeypatch):
+    client = FilteredSpot([float(t) for t in range(5, 600, 20)], monkeypatch,
+                          replies=[lambda s: cue_lines(s, step=3.0)])
+    with pytest.raises(RuntimeError) as caught:
+        run(client)
+    message = str(caught.value)
+    assert "Google 内容过滤拒绝" in message and "重试多半同样被拒" in message
+    assert "接口在持续拒绝" not in message
