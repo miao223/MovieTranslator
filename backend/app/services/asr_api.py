@@ -67,7 +67,17 @@ SAMPLE_RATE = 16_000
 #   is a 400 here ("Unknown name thinking"), so chat_completion's fallback
 #   quietly ran this engine at default effort. This engine asks the
 #   OpenAI-compatible way instead.
+#
+# Google's notice of 2026-10-06: on its upcoming models thinking_budget is a
+# 400 rather than being remapped, and temperature/top_p/top_k are a 400 too
+# (ignored since 3.6 Flash). 3.8 Flash's documented levels are low/medium/
+# high and "minimal" is already a 400 — yet "none" measures 0 thinking
+# tokens (2026-10-07: none 0, low 83, default 98 on the same one-line ask).
+# So "none" is honoured through exactly the budget-0 fallback the notice
+# says is ending. It is kept while it works — a third off the bill — and
+# FALLBACK_EFFORT takes over the moment Google refuses it.
 REASONING_EFFORT = "none"
+FALLBACK_EFFORT = "low"
 # Flex requests queue on Google's side for up to ~15 minutes (documented);
 # the SDK's default 600s would hang up on an answer that was coming.
 AUDIO_TIMEOUT = 1200.0
@@ -207,6 +217,49 @@ def request_options(flex: bool) -> dict:
     if flex:
         options["service_tier"] = "flex"
     return options
+
+
+def thinking_refused(exc: Exception) -> bool:
+    """A 400 about the thinking setting, in Google's wording. Measured:
+    "Thinking level MINIMAL is not supported for this model" and "Invalid
+    reasoning_effort: zzz", both INVALID_ARGUMENT."""
+    text = str(exc).lower()
+    return ("400" in text or "invalid_argument" in text) and any(
+        word in text for word in ("thinking", "reasoning_effort", "budget"))
+
+
+_FALLBACK_LOCK = threading.Lock()
+
+
+def create(client, options: dict, log=None, **kwargs):
+    """One recognition request, carrying ``options``.
+
+    No temperature: Gemini has ignored it since 3.6 Flash and its upcoming
+    models answer it with a 400 — and so far no other model is accepted.
+
+    If the endpoint refuses the thinking level this run asks for, it is
+    asked once more at FALLBACK_EFFORT, and ``options`` (shared by every
+    window of the run) is switched so that no later window pays for the
+    refusal. That retry is inside this call: it spends none of a window's
+    attempts and is never taken for a capacity refusal.
+    """
+    from app.services.translator import _create
+
+    sent = options.get("reasoning_effort")
+    try:
+        return _create(client, **kwargs, **options)
+    except Exception as exc:  # noqa: BLE001 — anything else is the caller's
+        if sent != REASONING_EFFORT or not thinking_refused(exc):
+            raise
+        reason = str(exc)
+    with _FALLBACK_LOCK:
+        first = options.get("reasoning_effort") == REASONING_EFFORT
+        options["reasoning_effort"] = FALLBACK_EFFORT
+    if first and log:
+        log(f"⚠ 接口拒绝了思考档位 {REASONING_EFFORT}（{reason[:200]}），"
+            f"本次识别改用 {FALLBACK_EFFORT}：费用会高一些，识别结果不受影响")
+    return _create(client, **kwargs, **{**options,
+                                        "reasoning_effort": FALLBACK_EFFORT})
 
 
 # a quota or a billing problem answers 429 too, and waiting does not fix it
@@ -1064,16 +1117,13 @@ def transcribe(
             prompt = build_prompt(seconds, language or "",
                                   settings.initial_prompt, complaint)
             try:
-                from app.services.translator import (
-                    EmptyReplyError, _create, reply_text)
+                from app.services.translator import EmptyReplyError, reply_text
 
-                resp = _create(
-                    client, model=model,
+                resp = create(
+                    client, options, log, model=model,
                     messages=[{"role": "user", "content": [
                         {"type": "text", "text": prompt}, part,
                     ]}],
-                    temperature=0,
-                    **options,
                 )
                 reply = reply_text(resp)
             except EmptyReplyError as exc:

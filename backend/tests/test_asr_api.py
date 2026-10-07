@@ -81,7 +81,7 @@ class FakeAudio:
         self.chat = self
         self.completions = self
 
-    def create(self, model, messages, temperature, **kw):
+    def create(self, model, messages, **kw):
         content = messages[0]["content"]
         prompt = content[0]["text"]
         part = content[1]
@@ -436,8 +436,8 @@ def test_one_bad_stretch_does_not_lose_the_rest_of_the_film(run):
     """The whole point: ninety good minutes are not thrown away because
     one stretch is unreadable."""
     class OneBadStretch(FakeAudio):
-        def create(self, model, messages, temperature, **kw):
-            resp = super().create(model, messages, temperature, **kw)
+        def create(self, model, messages, **kw):
+            resp = super().create(model, messages, **kw)
             # the window planner puts a seam at 300s; refuse only what
             # starts inside the last stretch of the film
             if "这段音频长" in messages[0]["content"][0]["text"]:
@@ -461,8 +461,8 @@ def test_three_prose_replies_in_a_row_are_called_a_refusal(run):
 
 def test_a_server_that_answers_without_any_choices_says_what_it_said(run):
     class NoChoices(FakeAudio):
-        def create(self, model, messages, temperature, **kw):
-            super().create(model, messages, temperature, **kw)
+        def create(self, model, messages, **kw):
+            super().create(model, messages, **kw)
 
             class Resp:
                 choices = None
@@ -638,7 +638,7 @@ def probe(monkeypatch, reply, settings_file, prompt_tokens=None, seconds=4.0,
             self.model = None
             self.options = None
 
-        def create(self, model, messages, temperature, **kw):
+        def create(self, model, messages, **kw):
             self.sent = messages
             self.model = model
             self.options = kw
@@ -1031,8 +1031,8 @@ class FormatPicky(FakeAudio):
         self.billed = billed
         self.formats: list[str] = []
 
-    def create(self, model, messages, temperature, **kw):
-        resp = super().create(model, messages, temperature, **kw)
+    def create(self, model, messages, **kw):
+        resp = super().create(model, messages, **kw)
         fmt = messages[0]["content"][1]["input_audio"]["format"]
         self.formats.append(fmt)
         if self.refuses in (fmt, "both"):
@@ -1153,6 +1153,83 @@ def test_flex_off_sends_no_service_tier(run):
                                    api_concurrency=1, api_audio_format="wav",
                                    api_flex=False))
     assert all(o == {"reasoning_effort": "none"} for o in fake.options)
+
+
+def test_no_sampling_parameter_is_ever_sent(run):
+    """Google, 2026-10-06: temperature/top_p/top_k have been ignored since
+    3.6 Flash and are a 400 on its upcoming models."""
+    fake = FakeAudio()
+    run(fake)
+    assert fake.options and not any(
+        key in o for o in fake.options for key in ("temperature", "top_p", "top_k"))
+
+
+THINKING_400 = RuntimeError(
+    "Error code: 400 - [{'error': {'code': 400, 'message': 'Thinking budget "
+    "is not supported for this model.', 'status': 'INVALID_ARGUMENT'}}]")
+
+
+def test_a_refused_thinking_level_falls_back_once_for_the_whole_run(run):
+    """The notice says the budget-0 fallback behind "none" is ending. When
+    it does, the run carries on at "low" — the retry spends no attempt and
+    later windows do not pay for the refusal again."""
+    class NoNone(FakeAudio):
+        def create(self, model, messages, **kw):
+            if kw.get("reasoning_effort") == "none":
+                self.options.append(kw)
+                raise THINKING_400
+            return super().create(model, messages, **kw)
+
+    fake = NoNone()
+    segments, _, logged = run(fake)
+    assert segments
+    refused = [o for o in fake.options if o["reasoning_effort"] == "none"]
+    assert 1 <= len(refused) <= 2          # windows run concurrently
+    assert fake.options[-1]["reasoning_effort"] == "low"
+    text = "\n".join(logged)
+    assert text.count("改用 low") == 1
+    assert "字幕是空的" not in text
+
+
+def test_other_400s_are_not_taken_for_a_thinking_refusal():
+    class Client:
+        chat = completions = None
+
+        def __init__(self):
+            self.chat = self.completions = self
+            self.calls = 0
+
+        def create(self, **kw):
+            self.calls += 1
+            raise RuntimeError("Error code: 400 - INVALID_ARGUMENT: bad audio")
+
+    client, options = Client(), A.request_options(False)
+    with pytest.raises(RuntimeError):
+        A.create(client, options, model="m", messages=[])
+    assert client.calls == 1 and options["reasoning_effort"] == "none"
+
+
+def test_the_probe_reports_the_level_it_fell_back_to(monkeypatch, settings_file):
+    monkeypatch.setattr("random.choice", lambda options: True)
+    real = A.create
+
+    def refusing(client, options, log=None, **kw):
+        calls = []
+        orig = client.create
+
+        def once(**k):
+            if not calls:
+                calls.append(1)
+                raise THINKING_400
+            return orig(**k)
+
+        client.create = once
+        return real(client, options, log, **kw)
+
+    monkeypatch.setattr(A, "create", refusing)
+    body, client = probe(monkeypatch, "升高", settings_file)
+    assert body["heard_it"] and body["thinking"] == "low"
+    assert client.options == {"reasoning_effort": "low"}
 
 
 def test_flex_is_on_by_default():
@@ -1299,8 +1376,8 @@ class FilteredSpot(FakeAudio):
 
         monkeypatch.setattr(A, "encode_window", recording)
 
-    def create(self, model, messages, temperature, **kw):
-        resp = super().create(model, messages, temperature, **kw)
+    def create(self, model, messages, **kw):
+        resp = super().create(model, messages, **kw)
         start, end = self.windows[-1]
         if any(start <= spot < end for spot in self.spots):
             return _filtered_response()

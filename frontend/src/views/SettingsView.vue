@@ -308,11 +308,18 @@ async function testAsrApi() {
       })
     } else if (r.heard_it) {
       ElMessage.success(`语音接口可用（${at}${r.flex ? '，Flex' : ''}），`
-        + `正确听出了测试音的音调走向（${r.asked}）`)
+        + `正确听出了测试音的音调走向（${r.asked}）`
+        + (r.thinking && r.thinking !== 'none'
+          ? `；注意：接口不再接受「不思考」，已改用思考档位 ${r.thinking}，费用会高一些` : ''))
     } else {
       ElMessage({
         type: 'warning', duration: 8000,
-        message: `接口通了（${at}），但模型没听出测试音是${r.asked}的，回复是「${r.reply}」`,
+        message: `接口通了（${at}），但模型没听出测试音是${r.asked}的，回复是「${r.reply}」`
+          // measured 2026-10-07: with thinking on, this model is unsteady on
+          // the sweep direction (low: 2 of 6 rising sweeps; none: 8 of 8)
+          + (r.carried_audio && r.thinking && r.thinking !== 'none'
+            ? `——接口已不接受「不思考」、改用了 ${r.thinking}，开思考时这道题实测答不稳；`
+              + '服务端按音频计了 token，说明音频是到了的' : ''),
       })
     }
   } catch (e) {

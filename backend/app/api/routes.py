@@ -480,7 +480,7 @@ def test_asr_api(llm: LLMSettings, flex: bool = False):
     import numpy as np
 
     from app.services import asr_api
-    from app.services.translator import _create, make_audio_client, reply_text
+    from app.services.translator import make_audio_client, reply_text
 
     model = GEMINI_ASR_MODEL
     endpoint = asr_api.audio_endpoint(llm)
@@ -495,17 +495,16 @@ def test_asr_api(llm: LLMSettings, flex: bool = False):
     clip = (0.5 * np.sin(2 * np.pi * np.cumsum(
         sweep if rising else sweep[::-1]) / rate)).astype("float32")
 
+    options = asr_api.request_options(flex)
     try:
         client = make_audio_client(llm, config.load_settings().network)
-        resp = _create(
-            client,
+        resp = asr_api.create(
+            client, options,
             model=model,
             messages=[{"role": "user", "content": [
                 {"type": "text", "text": PROBE_QUESTION},
                 asr_api.audio_part(asr_api.encode_samples(clip, "mp3"), "mp3"),
             ]}],
-            temperature=0,
-            **asr_api.request_options(flex),
         )
         reply = reply_text(resp)
     except Exception as exc:  # noqa: BLE001 — report connectivity errors verbatim
@@ -529,6 +528,8 @@ def test_asr_api(llm: LLMSettings, flex: bool = False):
         "expected_tokens": int(asr_api.AUDIO_TOKENS_PER_SECOND * PROBE_SECONDS),
         # None when the server reports no usage at all
         "carried_audio": asr_api.audio_reached_the_model(usage, PROBE_SECONDS),
+        # FALLBACK_EFFORT when the endpoint refused the usual level
+        "thinking": options["reasoning_effort"],
     }
 
 
