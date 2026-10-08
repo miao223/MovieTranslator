@@ -128,7 +128,12 @@ MAX_CALL_FACTOR = 4     # total requests cap = this × number of windows
 # carries on, up to this share of it; past that the endpoint is refusing
 # systematically and a holed transcript is not worth delivering. Silence
 # is never an option either way: every missing range is printed.
-MAX_MISSING_SHARE = 0.02
+#
+# 5%, raised from 2% on 2026-10-08 at the user's call: with the content
+# filter split down to seconds and the containers swapped, what still
+# reaches this line is a stretch nobody will get through, and a film
+# losing a minute of it is still worth delivering with the minute named.
+MAX_MISSING_SHARE = 0.05
 PROSE_RUN = 3           # this many prose replies in a row = a refusal, not a format error
 # An empty reply buys one extra attempt, spent on the other container.
 #
@@ -164,6 +169,21 @@ MAX_REPEAT_SHARE = 0.30     # identical neighbours: a decode loop...
 # and took the film over the 2% line — with the model right every time. A
 # loop runs to dozens or thousands of lines; a chorus to a handful.
 MIN_LOOP_REPEATS = 5
+# ...and a run of identical lines that comes back when the window is asked
+# again is speech, not a loop. A chant or a cry repeated twenty times is
+# what the audio holds, so every request hears it at the same moments; a
+# decode loop is a fault of one reply. Measured on the five films that
+# tripped the check on 2026-10-08: every run of real repeats came back on
+# every resend at the same times (「見ざる言わざる聞かざる」×24 in
+# ツキモノ, 「もしもし」×18 in MINIMA9, 「助けて」×7 in 賃走談 — 13 resends,
+# all agreeing line for line), while the two real loops (EGG 50/141,
+# TOKYO VAMPIRE HOTEL 9/20) did not come back once in 16 resends. The
+# minimum count did not help: ツキモノ lost 81 s of a chant to it, twice
+# the 5-repeat floor and failed the film. The retry is the one the ladder
+# already makes, so this costs no request.
+LOOP_FAULT = "疑似解码陷环"
+REPEAT_SLACK = 0.5     # seconds two attempts' lines may miss each other by
+REPEAT_AGREEMENT = 0.6  # share of each side's repeats the other must have
 MIN_SPEECH_FOR_TEXT = 3.0   # below this, "nothing here" needs no defence
 DISPUTE_SPEECH = 10.0       # ...above this, disagreeing with the model is worth a log line
 PROSE_MIN_CHARS = 20        # a paragraph where a transcript was asked for
@@ -806,13 +826,51 @@ def snap_starts(cues: Sequence[Cue], audio) -> tuple[List[Cue], SnapStats]:
     return out, stats
 
 
+def _repeat_key(text: str) -> str:
+    # 「見ざる、言わざる、聞かざる。」 and 「見ざる 言わざる 聞かざる」 are
+    # the same line written twice; punctuation is the part that varies
+    return re.sub(r"[\W_]+", "", text).casefold()
+
+
+def repeated_lines(cues: Sequence[Cue]) -> List[Cue]:
+    """Every line that says what the line before it said."""
+    return [b for a, b in zip(cues, cues[1:])
+            if _repeat_key(a[2]) == _repeat_key(b[2])]
+
+
+def repeats_agree(before: Sequence[Cue], now: Sequence[Cue]) -> bool:
+    """Did two answers for one window repeat the same line at the same times?
+
+    Checked both ways, so a loop of hundreds of lines that happens to
+    contain an earlier answer's handful does not pass. A line matches
+    when the other side has the same words overlapping it in time: one
+    reply may write two chants as one cue, the other as two.
+    """
+    if not before or not now:
+        return False
+
+    def share(a, b):
+        hits = sum(
+            any(_repeat_key(t) == _repeat_key(u)
+                and s < f2 + REPEAT_SLACK and s2 < f + REPEAT_SLACK
+                for s2, f2, u in b)
+            for s, f, t in a
+        )
+        return hits / len(a)
+
+    return min(share(before, now), share(now, before)) >= REPEAT_AGREEMENT
+
+
 def validate(
-    cues: Sequence[Cue], seconds: float, speech: float
+    cues: Sequence[Cue], seconds: float, speech: float,
+    confirmed: Sequence[Cue] = (),
 ) -> tuple[List[Cue], List[str], List[str]]:
     """(kept, fatal, notes) for one window's cues, times still relative.
 
     *fatal* non-empty means the window has to be retried or split; *notes*
-    are repairs worth recording but not worth another request.
+    are repairs worth recording but not worth another request. *confirmed*
+    is the previous attempt's repeated lines when that attempt was turned
+    away as a loop: the same run again is believed (see LOOP_FAULT).
     """
     fatal: List[str] = []
     notes: List[str] = []
@@ -863,8 +921,11 @@ def validate(
 
     repeats = sum(1 for a, b in zip(kept, kept[1:]) if a[2] == b[2])
     if kept and repeats >= MIN_LOOP_REPEATS and repeats / len(kept) > MAX_REPEAT_SHARE:
-        fatal.append(f"{repeats}/{len(kept)} 行与上一行完全相同（疑似解码陷环）")
-        return [], fatal, notes
+        if not repeats_agree(confirmed, repeated_lines(kept)):
+            fatal.append(f"{repeats}/{len(kept)} 行与上一行完全相同（{LOOP_FAULT}）")
+            return [], fatal, notes
+        notes.append(f"{repeats}/{len(kept)} 行与上一行相同，重问后在同样的时间又出现——"
+                     "按真实台词（反复念诵、呼喊）采信")
 
     if not kept and speech >= MIN_SPEECH_FOR_TEXT:
         fatal.append(f"本段 silero 认定有 {speech:.0f}s 语音，却一行都没转出")
@@ -1106,6 +1167,7 @@ def transcribe(
         empty_billed = 0
         filtered = 0       # attempts Google's content filter refused
         switched = False
+        looped: List[Cue] = []  # last attempt's repeats, if turned away as a loop
         attempt = 0
         allowed = WINDOW_ATTEMPTS
         waits = 0          # capacity refusals of this window
@@ -1178,8 +1240,8 @@ def transcribe(
                     # "Not now", not "no": the same bytes and the same prompt
                     # go again after a pause, and this try does not count.
                     # Splitting would only double the requests being refused,
-                    # and a gap would spend the 2% budget on Google being
-                    # busy. The one way out is a cancel (inside _pause).
+                    # and a gap would spend MAX_MISSING_SHARE on Google
+                    # being busy. The one way out is a cancel (inside _pause).
                     pause = CAPACITY_BACKOFF[min(waits, len(CAPACITY_BACKOFF) - 1)]
                     waits += 1
                     if log:
@@ -1270,7 +1332,9 @@ def transcribe(
                         "reply": reply, "speech": speech, "no_speech": True,
                         "disputed": speech >= DISPUTE_SPEECH}
 
-            kept, fatal, notes = validate(cues, seconds, speech)
+            kept, fatal, notes = validate(cues, seconds, speech, looped)
+            looped = (repeated_lines(cues)
+                      if any(LOOP_FAULT in f for f in fatal) else [])
             if kept and not fatal:
                 tail = unclaimed_tail(intervals, window, kept[-1][1])
                 if looks_truncated(tail, speech):

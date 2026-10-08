@@ -1334,6 +1334,99 @@ def test_a_short_loop_is_still_a_loop():
     assert fatal and "陷环" in fatal[0]
 
 
+# ------------------------------------- repeats that come back (2026-10-08)
+
+
+def _chant(start=0.7, step=3.4, count=12, text="見ざる 言わざる 聞かざる"):
+    return [(start + i * step, start + i * step + 3.2, text) for i in range(count)]
+
+
+def test_a_chant_heard_again_at_the_same_times_is_kept():
+    """ツキモノ 26:03–27:25: a chant the model wrote right on every resend,
+    turned away as a loop every time, and the film failed on the gap."""
+    first = _chant(text="見ざる、言わざる、聞かざる。")
+    again = _chant()
+    _, fatal, _ = A.validate(first, 42.0, 30.0)
+    assert fatal and A.LOOP_FAULT in fatal[0]
+    kept, fatal, notes = A.validate(again, 42.0, 30.0, A.repeated_lines(first))
+    assert not fatal and len(kept) == 12
+    assert any("采信" in n for n in notes)
+
+
+def test_two_chants_per_cue_still_agree_with_one_per_cue():
+    """One reply wrote two chants per cue, the next one per cue (both seen
+    on ツキモノ): overlap in time, not equal start times, is the match."""
+    pairs = [(0.7 + i * 6.8, 0.7 + i * 6.8 + 6.4, "見ざる言わざる聞かざる")
+             for i in range(6)]
+    singles = _chant(count=12)
+    assert A.repeats_agree(A.repeated_lines(pairs), A.repeated_lines(singles))
+
+
+def test_a_loop_is_not_confirmed_by_repeats_somewhere_else():
+    first = _chant()
+    elsewhere = _chant(start=60.0)
+    _, fatal, _ = A.validate(elsewhere, 120.0, 60.0, A.repeated_lines(first))
+    assert fatal and A.LOOP_FAULT in fatal[0]
+
+
+def test_a_loop_is_not_confirmed_by_different_words():
+    """ツキモノ 45:07: one resend heard the chant as 「満ちる 威張る 威張る」.
+    The two do not vouch for each other, and the window goes on to be split."""
+    first = _chant()
+    misheard = _chant(text="満ちる 威張る 威張る")
+    _, fatal, _ = A.validate(misheard, 42.0, 30.0, A.repeated_lines(first))
+    assert fatal
+
+
+def test_a_long_loop_does_not_pass_on_an_earlier_handful():
+    """Agreement is checked both ways: a reply that ran away for a hundred
+    lines contains the earlier six, but the earlier six are not most of it."""
+    handful = _chant(count=7)
+    runaway = _chant(count=7) + _chant(start=7 * 3.4 + 0.7, step=0.4, count=100)
+    _, fatal, _ = A.validate(runaway, 300.0, 60.0, A.repeated_lines(handful))
+    assert fatal and A.LOOP_FAULT in fatal[0]
+
+
+def _chant_reply(seconds):
+    return "\n".join(f"[{_clock(s)} --> {_clock(min(e, seconds))}] {t}"
+                      for s, e, t in _chant(count=int((seconds - 4) // 3.4)))
+
+
+def test_a_window_of_chanting_is_kept_on_the_retry_without_a_split(run):
+    client = FakeAudio(replies=[_chant_reply])
+    segments, _, logged = run(client, intervals=[(0.0, 50.0)],
+                              settings=ASRSettings(engine="api", api_window_seconds=60.0,
+                                                   api_concurrency=1,
+                                                   api_audio_format="wav"))
+    assert not any("拆成两段" in line for line in logged)
+    assert any("采信" in line for line in logged)
+    assert sum("見ざる" in seg.text for seg in segments) >= 10
+
+
+def test_a_loop_that_does_not_come_back_is_still_split(run):
+    """The other side of the rule: a run of repeats the resend does not
+    repeat (EGG, TOKYO VAMPIRE HOTEL) is handled as before — here the
+    resend loops too, but over another part of the window."""
+    flip = iter(range(10_000))
+
+    def wandering(seconds):
+        at = 0.7 if next(flip) % 2 == 0 else seconds / 2
+        return "\n".join(f"[{_clock(s)} --> {_clock(e)}] {t}"
+                          for s, e, t in _chant(start=at, step=1.5, count=6))
+
+    logged = []
+    client = FakeAudio(replies=[wandering])
+    try:
+        logged = run(client, intervals=[(0.0, 50.0)],
+                     settings=ASRSettings(engine="api", api_window_seconds=60.0,
+                                          api_concurrency=1,
+                                          api_audio_format="wav"))[2]
+    except RuntimeError as exc:   # nothing got through: the film fails on the gap
+        assert "没能转出来" in str(exc)
+    assert not any("采信" in line for line in logged)
+    assert len(client.calls) > 2   # not accepted on the retry
+
+
 def _filtered_response():
     class Obj:
         pass
